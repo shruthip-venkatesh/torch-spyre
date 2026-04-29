@@ -49,6 +49,8 @@ class SDSCArgs:
     allocation: dict[str, Any]
     start_address: int | Symbol
     backGap: dict[Symbol, int]
+    is_index_tensor: bool = False
+    related_value_tensor_idx: int = -1
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -86,6 +88,7 @@ class SDSCSpec:
     args: list[SDSCArgs]
     constants: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
+    indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -333,8 +336,24 @@ def _create_sdsc_tensors(
                 allocation=arg.allocation,
                 start_address=addr,
                 backGap=backGap,
+                is_index_tensor=arg.is_index_tensor,
+                related_value_tensor_idx=arg.related_value_tensor_idx,
             )
         )
+
+    # Add KERNEL_IDX layout for index tensors
+    has_index_tensor = any(arg.is_index_tensor for arg in sdsc_args)
+    if has_index_tensor and "KERNEL_IDX" not in layouts:
+        # Find an index tensor to get its layout info
+        index_tensor = next(arg for arg in sdsc_args if arg.is_index_tensor)
+        index_layout = layouts[index_tensor.layout]
+        
+        # Add KERNEL_IDX layout (same as index tensor's layout)
+        layouts["KERNEL_IDX"] = {
+            "dim_order": index_layout["dim_order"],
+            "stick_dim_order": index_layout["stick_dim_order"],
+            "stick_size": index_layout["stick_size"],
+        }
 
     return sdsc_args, layouts, missing_dim
 
@@ -441,6 +460,12 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
 
     num_inputs = len(args[:-1]) if is_matmul or not op_spec.is_reduction else len(args)
 
+    # Collect indices of index tensors for indirect access
+    indirect_access_indices = [
+        i for i, arg in enumerate(op_spec.args)
+        if arg.is_index_tensor
+    ]
+
     return SDSCSpec(
         opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
         execution_unit="pt" if is_matmul else "sfp",
@@ -459,6 +484,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         args=args,
         constants=constants,
         coordinate_masking=coordinate_masking,
+        indirect_access_indices=indirect_access_indices,
     )
 
 

@@ -33,6 +33,8 @@ class TensorArg:
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
+        is_index_tensor: If True, this tensor contains indices for indirect access (KERNEL_IDX type).
+        related_value_tensor_idx: If this is an index tensor, the index of the value tensor it accesses.
     """
 
     is_input: bool
@@ -41,7 +43,8 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
-
+    is_index_tensor: bool = False
+    related_value_tensor_idx: int = -1
 
 @dataclasses.dataclass
 class OpSpec:

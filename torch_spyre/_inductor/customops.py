@@ -255,3 +255,44 @@ def restickify(  # type: ignore[empty-body]
     x: torch.Tensor,
 ) -> torch.Tensor:
     pass
+
+
+@torch.library.custom_op("spyre::indices_to_address", mutates_args=(), device_types="spyre")
+def indices_to_address(
+    indices: torch.Tensor,
+    virtual_offset: int,
+    device_size: Sequence[int],
+    device_stride: Sequence[int],
+    element_size: int,
+) -> torch.Tensor:
+    import torch_spyre._C as _C
+    return _C.compute_addresses_from_indices(
+        indices, virtual_offset, list(device_size), list(device_stride), element_size
+    )
+
+
+@indices_to_address.register_fake
+def _(
+    indices: torch.Tensor,
+    virtual_offset: int,
+    device_size: Sequence[int],
+    device_stride: Sequence[int],
+    element_size: int,
+):
+    output_shape = indices.shape[:-1]
+    return torch.empty(output_shape, dtype=torch.float32, device=indices.device)
+
+@torch.library.custom_op("spyre::gather_indirect", mutates_args=(), device_types="spyre")
+def gather_indirect(
+    input: torch.Tensor,
+    addresses: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+
+@gather_indirect.register_fake
+def _(
+    input: torch.Tensor,
+    addresses: torch.Tensor,
+):
+    return input.new_empty(addresses.shape)

@@ -47,6 +47,7 @@
 #include "spyre_stream.h"
 #include "spyre_views.h"
 #include "types_mapping.h"
+#include "spyre_address_computation.h"
 
 namespace spyre {
 
@@ -409,4 +410,8 @@ PYBIND11_MODULE(_C, m) {
         .index();
   });
   m.def("device_count", &spyre::device_count);
+  m.def("compute_addresses_from_indices", &spyre::compute_addresses_from_indices,
+        "Convert logical indices to Spyre HBM byte addresses",
+        py::arg("indices"), py::arg("virtual_offset"), py::arg("device_size"),
+        py::arg("device_stride"), py::arg("element_size"));
 }
