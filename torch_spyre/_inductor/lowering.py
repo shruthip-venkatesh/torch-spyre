@@ -587,3 +587,27 @@ def lower_restickify(x):
 def lower_slice(x, dim=0, start=None, end=None, step=1):
     result = lowering.slice_(x, dim=dim, start=start, end=end, step=step)
     return clone(result, memory_format=torch.contiguous_format)
+
+
+@register_spyre_lowering(torch.ops.spyre.indirect_add)
+def lower_indirect_add(input_a, index_a, input_b, index_b):
+    fn = lowering.ops_wrapper(torch.ops.spyre.indirect_add.__name__)
+
+    def inner_fn(index):
+        return fn(
+            input_a.make_loader()(index),
+            index_a.make_loader()(index),
+            input_b.make_loader()(index),
+            index_b.make_loader()(index),
+        )  
+
+    pw = Pointwise.create(  
+        device=input_a.get_device(),
+        dtype=input_a.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=index_a.get_size(),
+        origin_node=input_a.get_origin_node(),
+        traceback=input_a.get_traceback(),
+    )
+    pw.realize()
+    return pw

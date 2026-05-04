@@ -663,6 +663,15 @@ def pad_decomp(
         input=input, output=output, dims=dims, offsets=offsets
     )
 
+@register_spyre_decomposition([torch.ops.spyre.paged_attention.default])
+def paged_attention_decomp(
+    input1: torch.Tensor,
+    index1: torch.Tensor,
+    input2: torch.Tensor,
+    index2: torch.Tensor,
+) -> torch.Tensor:
+    # TODO : Proper Implementation required
+    return torch.ops.spyre.indirect_add(input1, index1, index1, index2)
 
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##

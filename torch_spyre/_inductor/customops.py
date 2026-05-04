@@ -296,3 +296,38 @@ def _(
     addresses: torch.Tensor,
 ):
     return input.new_empty(addresses.shape)
+
+
+@torch.library.custom_op("spyre::paged_attention", mutates_args=(), device_types="spyre")
+def paged_attention(
+    input1: torch.Tensor,
+    index1: torch.Tensor,
+    input2: torch.Tensor,
+    index2: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+@paged_attention.register_fake
+def _(
+    input1: torch.Tensor,
+    index1: torch.Tensor,
+    input2: torch.Tensor,
+    index2: torch.Tensor,
+) -> torch.Tensor:
+    # Output shape is typically based on the index tensors
+    # For now, return a tensor with the same shape as input1
+    return input1.new_empty(input1.size())
+
+
+@torch.library.custom_op("spyre::indirect_add", mutates_args=(), device_types="spyre")
+def indirect_add(
+    input_a: torch.Tensor,
+    index_a: torch.Tensor,
+    input_b: torch.Tensor,
+    index_b: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+@indirect_add.register_fake
+def _(input_a, index_a, input_b, index_b):
+    return input_a.new_empty(index_a.size())

@@ -260,10 +260,12 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
+    index_args = set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
+
     missing_dim = None
     adjusted_output_size = op_spec.args[-1].device_size.copy()
     sdsc_args: list[SDSCArgs] = []
-    for arg in op_spec.args:
+    for i, arg in enumerate(op_spec.args):
         addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
@@ -318,13 +320,27 @@ def _create_sdsc_tensors(
             max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
-        label = _get_layout_label(
-            layouts,
-            dim_order,
-            effective_stick,
-            arg.device_dtype.elems_per_stick(),
-            MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
-        )
+
+        # Check if this argument is an index tensor
+        if i in index_args:
+            # Force KERNEL_IDX layout for index tensors
+            label = "KERNEL_IDX"
+            if "KERNEL_IDX" not in layouts:
+                layouts["KERNEL_IDX"] = {
+                    "dim_order": dim_order,
+                    "stick_dim_order": effective_stick,
+                    "stick_size": arg.device_dtype.elems_per_stick(),
+                }
+        else:
+            # Use normal layout assignment for data tensors
+            label = _get_layout_label(
+                layouts,
+                dim_order,
+                effective_stick,
+                arg.device_dtype.elems_per_stick(),
+                MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
+            )
+
         sdsc_args.append(
             SDSCArgs(
                 layout=label,
