@@ -272,7 +272,15 @@ class SpyreOpFuncs:
 
     @staticmethod
     def indirect_add(input_a, index_a, input_b, index_b):
-        op_info = {"index_args": [1, 3]}  # positions of index tensors in args list
+        # index_args: positions of index tensors
+        # index_value_pairs: mapping of index tensor position to value tensor position
+        op_info = {
+            "index_args": [1, 3],  # positions of index tensors in args list
+            "index_value_pairs": [
+                {"index_arg": 1, "value_arg": 0},  # index_a (pos 1) accesses input_a (pos 0)
+                {"index_arg": 3, "value_arg": 2},  # index_b (pos 3) accesses input_b (pos 2)
+            ]
+        }
         return PointwiseOp("add", [input_a, index_a, input_b, index_b], op_info)
 
 
@@ -405,7 +413,8 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         for idx, arg in enumerate(args):
             # Allow INT32 for index tensors in indirect operations
-            is_index_tensor = idx in index_args
+            # Check both the position in index_args AND the arg.is_index_tensor flag
+            is_index_tensor = idx in index_args or arg.is_index_tensor
 
             if arg.device_dtype == DataFormats.IEEE_FP32 and op not in SPYRE_FP32_OPS:
                 raise Unsupported(f"{op} on {arg.device_dtype}")
@@ -510,51 +519,125 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if isinstance(value, UnimplementedOp):
             self.op_specs.append(value)
+        elif op_info and "index_args" in op_info and "tensor_names" in op_info:
+            # Handle indirect access operations where op_info specifies tensor names and index positions
+            args: list[TensorArg] = []
+            index_args = set(op_info.get("index_args", []))
+            index_to_value_map = {}
+            if "index_value_pairs" in op_info:
+                for pair in op_info["index_value_pairs"]:
+                    index_to_value_map[pair["index_arg"]] = pair["value_arg"]
+
+            # Use tensor_names from op_info (includes both value and index tensors)
+            tensor_names = op_info["tensor_names"]
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Indirect access op: tensor_names={tensor_names}, index_args={index_args}, op_info={op_info}")
+
+            for arg_idx, tensor_name in enumerate(tensor_names):
+                # Load the tensor to get its TensorAccess
+                tensor = self.load(tensor_name, sympy.Integer(0))
+                is_index_tensor = arg_idx in index_args
+                related_value_idx = index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
+
+                args.append(self.create_tensor_arg(
+                    True,
+                    tensor_name,
+                    tensor,
+                    is_index_tensor=is_index_tensor,
+                    related_value_tensor_idx=related_value_idx
+                ))
+
+            # Add output tensor
+            args.append(self.create_tensor_arg(False, real_dst_name, dst))
+
+            # Create the op spec - for indirect add, the operation is still "add"
+            op_name = op_info.get("op", "add")
+            self.op_specs.append(self.create_op_spec(op_name, False, args, op_info))
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
             args: list[TensorArg] = []
-            # Get index_args positions if this is an indirect operation
-            index_args = set(value.op_info.get("index_args", []))
 
-            for arg_idx, input in enumerate(value.arguments):
-                # Unwrap nested PointwiseOp (e.g., to_dtype) to get the underlying TensorAccess
-                unwrapped_input = input
-                while isinstance(unwrapped_input, PointwiseOp):
-                    # For ops like to_dtype, the first argument is the tensor
-                    if unwrapped_input.arguments and isinstance(unwrapped_input.arguments[0], (TensorAccess, PointwiseOp)):
-                        unwrapped_input = unwrapped_input.arguments[0]
-                    else:
-                        break
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"PointwiseOp check: op_info keys={list(op_info.keys()) if op_info else 'None'}, has tensor_names={'tensor_names' in op_info if op_info else False}")
 
-                if isinstance(unwrapped_input, TensorAccess):
-                    # Mark this tensor as an index tensor if its position is in index_args
-                    is_index_tensor = arg_idx in index_args
-                    args.append(self.create_tensor_arg(True, unwrapped_input.name, unwrapped_input, is_index_tensor=is_index_tensor))
-                else:
-                    raise Unsupported(f"unexpected argument {input} to {value.op}")
-            args.append(self.create_tensor_arg(False, real_dst_name, dst))
-            op_info.update(value.op_info)
-            op_name = op_info.pop("op", value.op)
-            if "tensor_names" in op_info and "index_value_pairs" in op_info:
-                metadata_args: list[TensorArg] = []
-                index_arg_to_value_arg = {
-                    pair["index_arg"]: pair["value_arg"]
-                    for pair in op_info["index_value_pairs"]
-                }
-                for arg_index, tensor_name in enumerate(op_info["tensor_names"]):
+            # Check if op_info has tensor_names (from IR node) - use that path instead
+            if op_info and "tensor_names" in op_info and "index_args" in op_info:
+                # Use tensor_names from op_info (includes both value and index tensors)
+                index_args = set(op_info.get("index_args", []))
+                index_to_value_map = {}
+                if "index_value_pairs" in op_info:
+                    for pair in op_info["index_value_pairs"]:
+                        index_to_value_map[pair["index_arg"]] = pair["value_arg"]
+
+                tensor_names = op_info["tensor_names"]
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"PointwiseOp with tensor_names: op={value.op}, tensor_names={tensor_names}, index_args={index_args}")
+
+                for arg_idx, tensor_name in enumerate(tensor_names):
+                    # Load the tensor to get its TensorAccess
                     tensor = self.load(tensor_name, sympy.Integer(0))
-                    metadata_args.append(
-                        self.create_tensor_arg(
-                            True,
-                            tensor_name,
-                            tensor,
-                            arg_index in index_arg_to_value_arg,
-                            index_arg_to_value_arg.get(arg_index, -1),
-                        )
-                    )
-                metadata_args.append(self.create_tensor_arg(False, real_dst_name, dst))
-                args = metadata_args
-            self.op_specs.append(self.create_op_spec(op_name, False, args, op_info))
+                    is_index_tensor = arg_idx in index_args
+                    related_value_idx = index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
+
+                    args.append(self.create_tensor_arg(
+                        True,
+                        tensor_name,
+                        tensor,
+                        is_index_tensor=is_index_tensor,
+                        related_value_tensor_idx=related_value_idx
+                    ))
+
+                # Add output tensor
+                args.append(self.create_tensor_arg(False, real_dst_name, dst))
+                op_info.update(value.op_info)
+                op_name = op_info.pop("op", value.op)
+                self.op_specs.append(self.create_op_spec(op_name, False, args, op_info))
+            else:
+                # Original PointwiseOp path - extract from value.arguments
+                # Get index_args positions if this is an indirect operation
+                index_args = set(value.op_info.get("index_args", []))
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"PointwiseOp: op={value.op}, op_info={value.op_info}, index_args={index_args}")
+
+                # Build mapping from index tensor position to value tensor position
+                index_to_value_map = {}
+                if "index_value_pairs" in value.op_info:
+                    for pair in value.op_info["index_value_pairs"]:
+                        index_to_value_map[pair["index_arg"]] = pair["value_arg"]
+
+                for arg_idx, input in enumerate(value.arguments):
+                    # Unwrap nested PointwiseOp (e.g., to_dtype) to get the underlying TensorAccess
+                    unwrapped_input = input
+                    while isinstance(unwrapped_input, PointwiseOp):
+                        # For ops like to_dtype, the first argument is the tensor
+                        if unwrapped_input.arguments and isinstance(unwrapped_input.arguments[0], (TensorAccess, PointwiseOp)):
+                            unwrapped_input = unwrapped_input.arguments[0]
+                        else:
+                            break
+
+                    if isinstance(unwrapped_input, TensorAccess):
+                        # Mark this tensor as an index tensor if its position is in index_args
+                        is_index_tensor = arg_idx in index_args
+                        # Get the related value tensor index if this is an index tensor
+                        related_value_idx = index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
+
+                        # DEBUG: Log tensor marking
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"Creating TensorArg: arg_idx={arg_idx}, name={unwrapped_input.name}, is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}")
+
+                        args.append(self.create_tensor_arg(True, unwrapped_input.name, unwrapped_input,
+                                                          is_index_tensor=is_index_tensor,
+                                                          related_value_tensor_idx=related_value_idx))
+                    else:
+                        raise Unsupported(f"unexpected argument {input} to {value.op}")
+
+                args.append(self.create_tensor_arg(False, real_dst_name, dst))
+                op_info.update(value.op_info)
+                op_name = op_info.pop("op", value.op)
+                self.op_specs.append(self.create_op_spec(op_name, False, args, op_info))
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
             args = [
@@ -703,6 +786,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                                         + "],"
                                     )
                                     buf.writeline(f"allocation={arg.allocation!r},")
+                                    buf.writeline(f"is_index_tensor={arg.is_index_tensor},")
+                                    buf.writeline(f"related_value_tensor_idx={arg.related_value_tensor_idx},")
                                 buf.writeline("),")
                         buf.writeline("]")
                     buf.writeline("),")

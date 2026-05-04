@@ -360,7 +360,9 @@ def generate_sdsc(sdsc_spec):
                                     else {}
                                 ),
                                 "coordinates_": {
-                                    "coordInfo": {
+                                    "coordInfo": {}
+                                    if tensor.is_index_tensor
+                                    else {
                                         str(dim): gen_coord_info_value(
                                             size=sdsc_spec.iteration_space[dim]
                                             // sdsc_spec.work_slices[dim]

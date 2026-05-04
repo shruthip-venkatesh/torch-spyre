@@ -671,7 +671,7 @@ def paged_attention_decomp(
     index2: torch.Tensor,
 ) -> torch.Tensor:
     # TODO : Proper Implementation required
-    return torch.ops.spyre.indirect_add(input1, index1, index1, index2)
+    return torch.ops.spyre.indirect_add(input1, index1, input2, index2)
 
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
