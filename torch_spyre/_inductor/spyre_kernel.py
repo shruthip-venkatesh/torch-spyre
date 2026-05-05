@@ -180,6 +180,31 @@ class SpyreOpFuncs:
         return PointwiseOp("greaterthan", [a, b])
 
     @staticmethod
+    def indirect_add(input_a, index_a, input_b, index_b):
+        # index_args: positions of index tensors
+        # index_value_pairs: mapping of index tensor position to value tensor position
+        op_info = {
+            "index_args": [1, 3],  # positions of index tensors in args list
+            "index_value_pairs": [
+                {"index_arg": 1, "value_arg": 0},  # index_a (pos 1) accesses input_a (pos 0)
+                {"index_arg": 3, "value_arg": 2},  # index_b (pos 3) accesses input_b (pos 2)
+            ]
+        }
+        return PointwiseOp("add", [input_a, index_a, input_b, index_b], op_info)
+
+    @staticmethod
+    def indirect_gather(input, addresses):
+        # index_args: positions of index tensors (address tensors)
+        # index_value_pairs: mapping of index tensor position to value tensor position
+        op_info = {
+            "index_args": [1],  # position of addresses tensor in args list
+            "index_value_pairs": [
+                {"index_arg": 1, "value_arg": 0},  # addresses (pos 1) accesses input (pos 0)
+            ]
+        }
+        return PointwiseOp("identity", [input, addresses], op_info)
+
+    @staticmethod
     def layernormnorm(*args):
         return PointwiseOp("layernormnorm", list(args))
 
@@ -269,19 +294,6 @@ class SpyreOpFuncs:
     @staticmethod
     def where(x, y, z):
         return PointwiseOp("where3", [x, y, z])
-
-    @staticmethod
-    def indirect_add(input_a, index_a, input_b, index_b):
-        # index_args: positions of index tensors
-        # index_value_pairs: mapping of index tensor position to value tensor position
-        op_info = {
-            "index_args": [1, 3],  # positions of index tensors in args list
-            "index_value_pairs": [
-                {"index_arg": 1, "value_arg": 0},  # index_a (pos 1) accesses input_a (pos 0)
-                {"index_arg": 3, "value_arg": 2},  # index_b (pos 3) accesses input_b (pos 2)
-            ]
-        }
-        return PointwiseOp("add", [input_a, index_a, input_b, index_b], op_info)
 
 
 class SpyreKernelOpsHandler(DefaultHandler):

@@ -48,6 +48,7 @@ SPYRE_FP32_OPS = [
     "identity",
     "overwrite",
     "indirect_add",
+    "indirect_gather",
 ]
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]

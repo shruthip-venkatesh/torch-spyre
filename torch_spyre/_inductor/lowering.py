@@ -611,3 +611,25 @@ def lower_indirect_add(input_a, index_a, input_b, index_b):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.indirect_gather)
+def lower_indirect_gather(input, addresses):
+    fn = lowering.ops_wrapper(torch.ops.spyre.indirect_gather.__name__)
+
+    def inner_fn(index):
+        return fn(
+            input.make_loader()(index),
+            addresses.make_loader()(index),
+        )
+
+    pw = Pointwise.create(
+        device=input.get_device(),
+        dtype=input.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=addresses.get_size(),
+        origin_node=input.get_origin_node(),
+        traceback=input.get_traceback(),
+    )
+    pw.realize()
+    return pw

@@ -282,15 +282,15 @@ def _(
     output_shape = indices.shape[:-1]
     return torch.empty(output_shape, dtype=torch.float32, device=indices.device)
 
-@torch.library.custom_op("spyre::gather_indirect", mutates_args=(), device_types="spyre")
-def gather_indirect(
+@torch.library.custom_op("spyre::indirect_gather", mutates_args=(), device_types="spyre")
+def indirect_gather(
     input: torch.Tensor,
     addresses: torch.Tensor,
 ) -> torch.Tensor:
     pass
 
 
-@gather_indirect.register_fake
+@indirect_gather.register_fake
 def _(
     input: torch.Tensor,
     addresses: torch.Tensor,
