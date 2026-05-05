@@ -24,7 +24,10 @@ at::Tensor compute_addresses_from_indices(
     const std::vector<int64_t>& device_size,
     const std::vector<int64_t>& device_stride,
     int64_t element_size) {
-  
+
+  // Store the original device for later
+  auto original_device = indices.device();
+
   // Ensure indices tensor is on CPU
   auto indices_cpu = indices.cpu();
   
@@ -84,7 +87,10 @@ at::Tensor compute_addresses_from_indices(
   // Reshape back to original shape (without the last dimension)
   std::vector<int64_t> output_shape(
       indices_shape.begin(), indices_shape.end() - 1);
-  return addresses.reshape(output_shape);
+  auto reshaped_addresses = addresses.reshape(output_shape);
+
+  // Move the result back to the original device (spyre)
+  return reshaped_addresses.to(original_device);
 }
 
 } // namespace spyre

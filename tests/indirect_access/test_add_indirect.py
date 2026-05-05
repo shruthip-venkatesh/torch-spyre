@@ -5,8 +5,8 @@ def test_indirect_add_address():
         return torch.ops.spyre.indirect_add(input_a, index_a, input_b, index_b)
 
     # Data tensors (100 elements)
-    input_a = torch.randn(100, dtype=torch.float16, device="spyre")
-    input_b = torch.randn(100, dtype=torch.float16, device="spyre")
+    input_a = torch.randn(128, dtype=torch.float16, device="spyre")
+    input_b = torch.randn(128, dtype=torch.float16, device="spyre")
 
     # Logical indices (which elements to access)
     index1 = torch.tensor([0, 10, 20, 30], dtype=torch.int64)
@@ -28,7 +28,7 @@ def test_indirect_add_address():
         device_size=[2, 64],
         device_stride=[64, 1],
         element_size=2  # FP16 = 2 bytes
-    ).to("spyre")
+    )
     print("Address Tensor for Index 1 : ", address_a )
     
     address_b = torch.ops.spyre.indices_to_address(
@@ -37,7 +37,7 @@ def test_indirect_add_address():
         device_size=[2, 64],
         device_stride=[64, 1],
         element_size=2  # FP16 = 2 bytes
-    ).to("spyre")
+    )
     print("Address Tensor for Index 2 : ", address_b )
 
     compiled_fn = torch.compile(indirect_add_fn)
