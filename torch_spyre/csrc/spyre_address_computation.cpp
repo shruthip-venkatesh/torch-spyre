@@ -58,11 +58,14 @@ at::Tensor compute_addresses_from_indices(
   auto flat_indices_accessor = flat_indices.accessor<int64_t, 2>();
   auto addresses_accessor = addresses.accessor<float, 1>();
   
+  // DeepTools stick size (128 bytes for Sen1.0)
+  constexpr int64_t STICK_SIZE_BYTES = 128;
+
   // Compute address for each index tuple
   for (int64_t i = 0; i < num_indices; ++i) {
     // Start with virtual offset (in bytes)
-    int64_t address = virtual_offset;
-    
+    int64_t byte_address = virtual_offset;
+
     // Compute element offset using strides (in elements)
     int64_t element_offset = 0;
     for (int64_t dim = 0; dim < ndim; ++dim) {
@@ -78,10 +81,19 @@ at::Tensor compute_addresses_from_indices(
     }
     
     // Convert element offset to byte offset and add to base address
-    address += element_offset * element_size;
+    byte_address += element_offset * element_size;
     
-    // Store as float32 (bits will represent the address)
-    addresses_accessor[i] = static_cast<float>(address);
+    // DeepTools expects stick addresses (not byte addresses)
+    // Convert from bytes to sticks (128-byte units)
+    TORCH_CHECK(
+        byte_address % STICK_SIZE_BYTES == 0,
+        "Address ", byte_address, " is not stick-aligned (must be multiple of ",
+        STICK_SIZE_BYTES, " bytes)");
+
+    int64_t stick_address = byte_address / STICK_SIZE_BYTES;
+    
+    // Store as float32 (bits will represent the stick address)
+    addresses_accessor[i] = static_cast<float>(stick_address);
   }
   
   // Reshape back to original shape (without the last dimension)

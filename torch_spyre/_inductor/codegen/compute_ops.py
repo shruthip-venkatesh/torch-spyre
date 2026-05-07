@@ -403,12 +403,34 @@ def generate_sdsc(sdsc_spec):
                                 ],
                                 "wordLength": num_bytes(tensor.data_format),
                                 "dataFormat_": tensor.data_format.name,
-                                "memOrg_": {
-                                    "hbm": {"isPresent": 1},
-                                    "lx": {"isPresent": 1},
-                                }
-                                if not tensor.allocation
-                                else {"lx": {"isPresent": 1}},
+                                "memOrg_": (
+                                    # Index tensors: only HBM and L3LUIBR, NO LX
+                                    # This prevents them from being processed in the loop at line 4476
+                                    # that expects transfer nodes (line 4599 skips index tensors without LX)
+                                    {
+                                        "hbm": {
+                                            "isPresent": 1,
+                                            "allocateNode_": f"allocate-Tensor{i}_hbm",
+                                        },
+                                    }
+                                    if tensor.is_index_tensor
+                                    # Regular tensors with allocation: only in LX
+                                    else {
+                                        "lx": {
+                                            "isPresent": 1,
+                                            "allocateNode_": f"allocate-Tensor{i}_lx",
+                                        }
+                                    }
+                                    if tensor.allocation
+                                    # Regular tensors without allocation: in both HBM and LX
+                                    else {
+                                        "hbm": {
+                                            "isPresent": 1,
+                                            "allocateNode_": f"allocate-Tensor{i}_hbm",
+                                        },
+                                        "lx": {"isPresent": 1},
+                                    }
+                                ),
                             }
                             for i, tensor in enumerate(sdsc_spec.args)
                         ],
@@ -429,6 +451,7 @@ def generate_sdsc(sdsc_spec):
                                 "inputLabeledDs": [
                                     f"Tensor{i}-idx{i}"
                                     for i in range(sdsc_spec.num_inputs)
+                                    if i not in sdsc_spec.indirect_access_indices
                                 ],
                                 "outputLabeledDs": [f"Tensor{out_idx}-idx{out_idx}"],
                                 **(

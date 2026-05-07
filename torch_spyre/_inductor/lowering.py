@@ -603,7 +603,7 @@ def lower_indirect_add(input_a, index_a, input_b, index_b):
 
     pw = Pointwise.create(  
         device=input_a.get_device(),
-        dtype=input_a.get_dtype(),
+        dtype= torch.float16, #input_a.get_dtype(),
         inner_fn=inner_fn,
         ranges=index_a.get_size(),
         origin_node=input_a.get_origin_node(),

@@ -330,4 +330,7 @@ def indirect_add(
 
 @indirect_add.register_fake
 def _(input_a, index_a, input_b, index_b):
-    return input_a.new_empty(index_a.size())
+    print(f"[DEBUG] indirect_add.register_fake called: input_a.dtype={input_a.dtype}, index_a.dtype={index_a.dtype}, output dtype will be {input_a.dtype}")
+    result = torch.empty(index_a.size(), dtype=input_a.dtype, device=input_a.device)
+    print(f"[DEBUG] indirect_add.register_fake returning tensor with dtype={result.dtype}")
+    return result

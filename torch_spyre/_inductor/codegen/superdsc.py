@@ -325,6 +325,7 @@ def _create_sdsc_tensors(
         if i in index_args:
             # Force KERNEL_IDX layout for index tensors
             label = "KERNEL_IDX"
+            logger.debug(f"Tensor {i}: Assigned KERNEL_IDX layout (in index_args)")
             if "KERNEL_IDX" not in layouts:
                 layouts["KERNEL_IDX"] = {
                     "dim_order": dim_order,
@@ -340,6 +341,7 @@ def _create_sdsc_tensors(
                 arg.device_dtype.elems_per_stick(),
                 MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS,
             )
+            logger.debug(f"Tensor {i}: Assigned {label} layout (not in index_args), dtype={arg.device_dtype.name}, stick_size={arg.device_dtype.elems_per_stick()}")
 
         sdsc_args.append(
             SDSCArgs(
@@ -465,7 +467,15 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     elif op_spec.is_reduction or op_spec.op == "overwrite":
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
     else:
-        pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
+        # For indirect access operations, we need to pad based on ALL tensors
+        # (including index tensors), not just the output tensor
+        has_index_tensors = any(arg.is_index_tensor for arg in op_spec.args)
+        if has_index_tensors:
+            # Include all tensors for padding calculation
+            pad_args, pad_sdsc_args = list(op_spec.args), args
+        else:
+            # Normal case: only pad based on output tensor
+            pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
     padding = _get_padded_iteration_space(
         pad_args, pad_sdsc_args, sdsc_iteration_space, layouts
     )
