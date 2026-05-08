@@ -414,4 +414,8 @@ PYBIND11_MODULE(_C, m) {
         "Convert logical indices to Spyre HBM byte addresses",
         py::arg("indices"), py::arg("virtual_offset"), py::arg("device_size"),
         py::arg("device_stride"), py::arg("element_size"));
+  m.def("compute_stick_addresses_from_rows", &spyre::compute_stick_addresses_from_rows,
+        "Convert 2D row indices to stick addresses for gather operations",
+        py::arg("row_indices"), py::arg("virtual_offset"), py::arg("rows_per_group"),
+        py::arg("cols_per_row"), py::arg("element_size"));
 }

@@ -45,7 +45,7 @@ def test_indirect_add_address():
         element_size=2  # FP16 = 2 bytes
     )
     print(f"Stick addresses for input_a: {address_a}")
-    
+
     address_b = torch.ops.spyre.indices_to_address(
         indices2_2d,
         virtual_offset=34359738368,  # Base address for input_b (in bytes, will be converted to sticks)

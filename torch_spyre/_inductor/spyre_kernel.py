@@ -424,16 +424,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         index_args = set(op_info.get("index_args", [])) if op_info else set()
 
         for idx, arg in enumerate(args):
-            # Allow INT32 for index tensors in indirect operations
             # Check both the position in index_args AND the arg.is_index_tensor flag
             is_index_tensor = idx in index_args or arg.is_index_tensor
 
-            if arg.device_dtype == DataFormats.IEEE_FP32 and op not in SPYRE_FP32_OPS:
-                raise Unsupported(f"{op} on {arg.device_dtype}")
-            elif arg.device_dtype == DataFormats.IEEE_INT32:
-                # INT32 is only allowed for index tensors in indirect operations
-                if not is_index_tensor:
-                    raise Unsupported(f"operation on {arg.device_dtype} (INT32 only allowed for index tensors)")
+            # Index tensors use IEEE_FP32 but are interpreted as SENUINT32 in SDSC metadata
+            if arg.device_dtype == DataFormats.IEEE_FP32:
+                # Allow FP32 for index tensors (interpreted as SENUINT32) or specific ops
+                if not is_index_tensor and op not in SPYRE_FP32_OPS:
+                    raise Unsupported(f"{op} on {arg.device_dtype}")
             elif arg.device_dtype not in [
                 DataFormats.IEEE_FP32,
                 DataFormats.SEN169_FP16,
@@ -621,6 +619,26 @@ class SpyreKernel(Kernel[CSEVariable]):
                         index_to_value_map[pair["index_arg"]] = pair["value_arg"]
 
                 for arg_idx, input in enumerate(value.arguments):
+                    # Handle string buffer names (for indirect operations)
+                    if isinstance(input, str):
+                        # This is a buffer name passed directly (e.g., for indirect_gather)
+                        # For indirect operations, the input buffer is referenced by name
+                        # but we need to load it to get its layout information
+                        # Use the load method to get a TensorAccess with proper layout
+                        tensor_access = self.load(input, sympy.Integer(0))
+                        
+                        # Mark as value tensor (not index) for indirect operations
+                        is_index_tensor = arg_idx in index_args
+                        related_value_idx = index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
+                        
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"Creating TensorArg from buffer name via load: arg_idx={arg_idx}, name={input}, is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}")
+                        
+                        args.append(self.create_tensor_arg(True, input, tensor_access,
+                                                          is_index_tensor=is_index_tensor,
+                                                          related_value_tensor_idx=related_value_idx))
+                        continue
+                    
                     # Unwrap nested PointwiseOp (e.g., to_dtype) to get the underlying TensorAccess
                     unwrapped_input = input
                     while isinstance(unwrapped_input, PointwiseOp):

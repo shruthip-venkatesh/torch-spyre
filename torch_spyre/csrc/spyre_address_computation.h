@@ -40,4 +40,31 @@ at::Tensor compute_addresses_from_indices(
     const std::vector<int64_t>& device_stride,
     int64_t element_size);
 
+/**
+ * Compute stick addresses from row indices for 2D gather operations.
+ *
+ * This function converts row indices to stick addresses for gathering rows
+ * from a 2D tensor. Each row index is converted to the stick address of the
+ * first stick in that row.
+ *
+ * For a [rows, cols] tensor with stick groups:
+ * - Each stick group contains rows_per_group rows
+ * - Row index is relative to the stick group
+ * - Absolute row = stick_group * rows_per_group + row_in_group
+ * - Stick address = absolute_row * sticks_per_row
+ *
+ * @param row_indices Tensor of row indices, shape [num_groups, rows_per_group]
+ * @param virtual_offset Base virtual address offset of the tensor in HBM (bytes)
+ * @param rows_per_group Number of rows in each stick group
+ * @param cols_per_row Number of columns per row
+ * @param element_size Size of each element in bytes (dtype.itemsize)
+ * @return Tensor of stick addresses with same shape as row_indices, as float32
+ */
+at::Tensor compute_stick_addresses_from_rows(
+    const at::Tensor& row_indices,
+    int64_t virtual_offset,
+    int64_t rows_per_group,
+    int64_t cols_per_row,
+    int64_t element_size);
+
 } // namespace torch_spyre

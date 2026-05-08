@@ -408,25 +408,18 @@ def generate_sdsc(sdsc_spec):
                                     # This prevents them from being processed in the loop at line 4476
                                     # that expects transfer nodes (line 4599 skips index tensors without LX)
                                     {
-                                        "hbm": {
-                                            "isPresent": 1,
-                                            "allocateNode_": f"allocate-Tensor{i}_hbm",
-                                        },
+                                        "hbm": {"isPresent": 1},
                                     }
                                     if tensor.is_index_tensor
                                     # Regular tensors with allocation: only in LX
                                     else {
-                                        "lx": {
-                                            "isPresent": 1,
-                                            "allocateNode_": f"allocate-Tensor{i}_lx",
-                                        }
+                                        "lx": {"isPresent": 1} 
                                     }
                                     if tensor.allocation
                                     # Regular tensors without allocation: in both HBM and LX
                                     else {
                                         "hbm": {
                                             "isPresent": 1,
-                                            "allocateNode_": f"allocate-Tensor{i}_hbm",
                                         },
                                         "lx": {"isPresent": 1},
                                     }

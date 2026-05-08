@@ -51,7 +51,8 @@ at::Tensor compute_addresses_from_indices(
   auto flat_indices = indices_cpu.reshape({-1, ndim});
   int64_t num_indices = flat_indices.size(0);
   
-  // Create output address tensor as float32 (to match SDSC SENUINT32 format)
+  // Create output address tensor as float32 for device copy support
+  // The SENUINT32 interpretation happens in SDSC JSON metadata
   auto addresses = at::zeros({num_indices}, at::TensorOptions().dtype(at::kFloat));
   
   // Get accessor for efficient access
@@ -60,9 +61,24 @@ at::Tensor compute_addresses_from_indices(
   
   // DeepTools stick size (128 bytes for Sen1.0)
   constexpr int64_t STICK_SIZE_BYTES = 128;
+  // Elements per stick for FP16 (128 bytes / 2 bytes per element = 64 elements)
+  constexpr int64_t ELEMENTS_PER_STICK_FP16 = 64;
 
   // Compute address for each index tuple
   for (int64_t i = 0; i < num_indices; ++i) {
+    // HBM Layout for 2D tensors:
+    // A [32, 128] FP16 tensor has:
+    // - 32 rows × 128 columns = 4096 elements
+    // - Each stick holds 64 FP16 elements
+    // - Total sticks = 4096 / 64 = 64 sticks
+    // - Device layout: [64, 64] (64 sticks, 64 elements per stick)
+    //
+    // Mapping from logical [32, 128] to device [64, 64]:
+    // - Each logical row (128 elements) spans 2 sticks (128 / 64 = 2)
+    // - Logical element (row, col) maps to:
+    //   - stick_index = row * 2 + (col / 64)
+    //   - within_stick_offset = col % 64
+    
     // Start with virtual offset (in bytes)
     int64_t byte_address = virtual_offset;
 
@@ -88,11 +104,12 @@ at::Tensor compute_addresses_from_indices(
     TORCH_CHECK(
         byte_address % STICK_SIZE_BYTES == 0,
         "Address ", byte_address, " is not stick-aligned (must be multiple of ",
-        STICK_SIZE_BYTES, " bytes)");
+        STICK_SIZE_BYTES, " bytes). Element offset: ", element_offset,
+        ", byte offset: ", element_offset * element_size);
 
     int64_t stick_address = byte_address / STICK_SIZE_BYTES;
     
-    // Store as float32 (bits will represent the stick address)
+    // Store as float (will be interpreted as SENUINT32 via SDSC metadata)
     addresses_accessor[i] = static_cast<float>(stick_address);
   }
   
@@ -103,6 +120,80 @@ at::Tensor compute_addresses_from_indices(
 
   // Move the result back to the original device (spyre)
   return reshaped_addresses.to(original_device);
+}
+
+at::Tensor compute_stick_addresses_from_rows(
+    const at::Tensor& row_indices,
+    int64_t virtual_offset,
+    int64_t rows_per_group,
+    int64_t cols_per_row,
+    int64_t element_size) {
+
+  // Store the original device for later
+  auto original_device = row_indices.device();
+
+  // Ensure row_indices tensor is on CPU
+  auto row_indices_cpu = row_indices.cpu();
+  
+  // Get the shape of row_indices: [num_groups, rows_per_group]
+  auto indices_shape = row_indices_cpu.sizes();
+  TORCH_CHECK(
+      indices_shape.size() == 2,
+      "Row indices must be 2D tensor, got ", indices_shape.size(), "D");
+  
+  int64_t num_groups = indices_shape[0];
+  int64_t rows_to_gather = indices_shape[1];
+  
+  // Create output address tensor as float32
+  auto addresses = at::zeros({num_groups, rows_to_gather},
+                             at::TensorOptions().dtype(at::kFloat));
+  
+  // Get accessors for efficient access
+  auto row_indices_accessor = row_indices_cpu.accessor<int64_t, 2>();
+  auto addresses_accessor = addresses.accessor<float, 2>();
+  
+  // DeepTools stick size (128 bytes for Sen1.0)
+  constexpr int64_t STICK_SIZE_BYTES = 128;
+  
+  // Compute stick address for each row index
+  for (int64_t group = 0; group < num_groups; ++group) {
+    // Base row for this stick group
+    int64_t base_row = group * rows_per_group;
+    
+    for (int64_t idx = 0; idx < rows_to_gather; ++idx) {
+      int64_t row_in_group = row_indices_accessor[group][idx];
+      
+      // Validate row index is within bounds
+      TORCH_CHECK(
+          row_in_group >= 0 && row_in_group < rows_per_group,
+          "Row index ", row_in_group, " out of bounds for group ", group,
+          " (rows_per_group: ", rows_per_group, ")");
+      
+      // Compute absolute row index
+      int64_t absolute_row = base_row + row_in_group;
+      
+      // Compute byte address for the start of this row (column 0)
+      // element_offset = absolute_row * cols_per_row
+      // byte_offset = element_offset * element_size
+      int64_t element_offset = absolute_row * cols_per_row;
+      int64_t byte_offset = element_offset * element_size;
+      int64_t absolute_byte_address = virtual_offset + byte_offset;
+      
+      // Convert to stick address
+      TORCH_CHECK(
+          absolute_byte_address % STICK_SIZE_BYTES == 0,
+          "Address ", absolute_byte_address, " for row ", absolute_row,
+          " is not stick-aligned (must be multiple of ", STICK_SIZE_BYTES, " bytes)");
+      
+      int64_t stick_address = absolute_byte_address / STICK_SIZE_BYTES;
+      
+      // Store as float (will be interpreted as SENUINT32 via SDSC metadata)
+      addresses_accessor[group][idx] = static_cast<float>(stick_address);
+    }
+  }
+  
+  // Move the result back to the original device (spyre)
+  return addresses.to(original_device);
 }
 
 } // namespace spyre
