@@ -181,11 +181,15 @@ def _get_device_dim_order(
     dim_order: list[Symbol] = []
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
         expr = arg.device_coordinates[i].subs(symbol_mapping)
-        if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
-            dim_order.append(stick_dim)
+        if expr == 0:
+            continue
         for sym in expr.free_symbols:
             if sym not in dim_order:
                 dim_order.append(sym)
+
+    if stick_dim is not None and stick_dim not in dim_order:
+        dim_order.append(stick_dim)
+
     return dim_order, stick_dim
 
 
@@ -283,16 +287,12 @@ def _create_sdsc_tensors(
     for i, arg in enumerate(op_spec.args):
         addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         
-        # For value tensors in indirect access, use the index tensor's layout
-        if i in value_to_index_map:
-            index_arg_pos = value_to_index_map[i]
-            if index_arg_pos in index_tensor_layouts:
-                dim_order, stick_dim = index_tensor_layouts[index_arg_pos]
-                logger.debug(f"Tensor {i}: Using index tensor layout from position {index_arg_pos}: dim_order={dim_order}, stick_dim={stick_dim}")
-            else:
-                dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
-        else:
-            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+        # For indirect access value tensors, preserve their own logical/output
+        # dimension symbols while still using the index tensor layout only for
+        # sizing/indirection-related handling later in the pipeline. Reusing the
+        # index tensor dim symbols here causes physical stick-axis names like x
+        # to leak into emitted SDSC metadata for gathered outputs.
+        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
@@ -344,28 +344,30 @@ def _create_sdsc_tensors(
                 backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] / dev_dim_size * it_dim_size
 
-            # Set max_dim_sizes based on tensor type and indirect access requirements
-            # For indirect access:
-            # - Value tensors (accessed indirectly): Use actual device dim size for non-stick dims
-            #   (represents elements per stick in that dimension)
-            # - Index tensors: Use -1 (dynamic)
-            # - Output tensors: Use -1 (dynamic)
-            # - Regular tensors: Use -1 (dynamic)
-            
-            # Check if this is a value tensor being accessed indirectly
+            # Set max_dim_sizes based on tensor type and indirect access requirements.
+            # For indirect access value tensors, only dimensions that are actually
+            # traversed by the index/address tensor should get a positive bound.
+            # Other dimensions must remain dynamic (-1).
             is_value_tensor_for_indirect = (
                 i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]
             )
-            
-            if is_value_tensor_for_indirect and dim != stick_dim:
-                # For value tensors in indirect access, non-stick dimensions should use
-                # the per-core iteration space size to ensure page size alignment.
-                # The page size must divide evenly into the per-core workload (ss_).
-                # Since ss_ = iteration_space / work_slices, we use iteration_space here
-                # which will be divided by work_slices in the backend to get ss_.
+
+            positive_max_dims: set[Symbol] = set()
+            if is_value_tensor_for_indirect and i in value_to_index_map:
+                index_arg_pos = value_to_index_map[i]
+                if index_arg_pos in index_tensor_layouts:
+                    index_dim_order, _ = index_tensor_layouts[index_arg_pos]
+                    positive_max_dims = {
+                        d for d in index_dim_order
+                        if d in dim_order and d != stick_dim
+                    }
+
+            if is_value_tensor_for_indirect and dim in positive_max_dims:
+                # Positive bounds only along indirection-traversed non-stick dims.
+                # This matches backends that expect maxDimSizes to constrain only
+                # the paged / indirect dimensions.
                 max_dim_sizes[dim] = it_dim_size
             else:
-                # For all other cases (index tensors, output tensors, stick dims, regular tensors)
                 max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim

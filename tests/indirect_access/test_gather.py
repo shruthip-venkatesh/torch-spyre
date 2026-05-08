@@ -288,6 +288,8 @@ def test_gather_2d_output_simple():
     #     print("\n✗ Full row gather test failed")
 
 def test_gather_1d():
+    # import pdb
+    # pdb.set_trace()
     def gather_fn(input, index):
         return torch.ops.spyre.indirect_gather(input, index)
 
@@ -299,16 +301,131 @@ def test_gather_1d():
     input_2d = torch.nn.functional.pad(input.unsqueeze(1), (0,63), value=0).to("spyre")
     print(f"Input 2D tensor shape: {input_2d.shape}")
 
-    index = torch.tensor([0,3,4,5], dtype=torch.float32).to("spyre")
-    #index_2d = torch.nn.functional.pad(index.unsqueeze(1), (0,63), value=0).to("spyre")
-    print("Index shape : ", index.shape)
+    index = torch.tensor([0,3,4,5], dtype=torch.float32)
+    index_2d = index.unsqueeze(1).to("spyre")
+    #index_2d = torch.nn.functional.pad(index.unsqueeze(1), (0,1), value=0).to("spyre")
+    print("Index shape : ", index_2d.shape)
 
     compiled_fn = torch.compile(gather_fn)
-    result = compiled_fn(input_2d, index)
+    result = compiled_fn(input_2d, index_2d)
     
     print(f"\n✓ Result shape: {result.shape}")  # Should be [7, 4]
     print("Result (all rows, all stick-aligned positions):")
     print(result)
+
+def test_gather_4d():
+    def gather_fn(input, index):
+        return torch.ops.spyre.indirect_gather(input, index)
+
+    print("\n" + "="*60)
+    print("Test: Gather Stick-Aligned Positions as 4D Output")
+    print("="*60)
+
+    # Build 4D input: [batch=2, heads=4, rows=32, cols=64]
+    # Each [32, 64] slice has arange values in col 0, zeros elsewhere
+    base = torch.arange(32, dtype=torch.float16)                              # [32]
+    slice_2d = torch.nn.functional.pad(base.unsqueeze(1), (0, 63), value=0)  # [32, 64]
+    input_4d = (
+        slice_2d
+        .unsqueeze(0)                      # [1, 32, 64]
+        .unsqueeze(0)                      # [1, 1, 32, 64]
+        .expand(2, 4, 32, 64)              # [2, 4, 32, 64]
+        .contiguous()
+        .to("spyre")
+    )
+    print(f"Input 4D tensor shape: {input_4d.shape}")   # [2, 4, 32, 64]
+
+    # Build 4D index: [batch=2, heads=4, 4 indices, 1]
+    index = torch.tensor([0, 3, 4, 5], dtype=torch.float32)   # [4]
+    index_4d = (
+        index
+        .unsqueeze(0)                      # [1, 4]
+        .unsqueeze(0)                      # [1, 1, 4]
+        .unsqueeze(-1)                     # [1, 1, 4, 1]
+        .expand(2, 4, 4, 1)               # [2, 4, 4, 1]
+        .contiguous()
+        .to("spyre")
+    )
+    print(f"Index shape: {index_4d.shape}")              # [2, 4, 4, 1]
+
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_4d, index_4d)
+
+    print(f"\n✓ Result shape: {result.shape}")           # [2, 4, 4, 1]
+    print("Result (gathered rows per batch and head):")
+    print(result)
+
+# def test_gather_like_paged_attn_case():
+#     def gather_fn(value, index):
+#         return torch.ops.spyre.indirect_gather(value, index)
+
+#     # Logical value tensor: [out, mb, x, y]
+#     out_dim, mb_dim, x_dim, y_dim = 128, 128, 8, 2
+#     value = torch.arange(
+#         out_dim * mb_dim * x_dim * y_dim,
+#         dtype=torch.float16,
+#         device="spyre",
+#     ).reshape(out_dim, mb_dim, x_dim, y_dim)
+
+#     # We indirectly select along [mb, y].
+#     # Build coordinates for one address per (mb, y), while fixing out=0 and x=0
+#     # in the address tensor because out/x are not indirection dimensions.
+#     mb_idx = torch.arange(mb_dim, dtype=torch.int64)
+#     y_idx = torch.arange(y_dim, dtype=torch.int64)
+
+#     mb_grid = mb_idx.unsqueeze(1).expand(mb_dim, y_dim)   # [128, 2]
+#     y_grid = y_idx.unsqueeze(0).expand(mb_dim, y_dim)     # [128, 2]
+
+#     out_grid = torch.zeros_like(mb_grid)                  # fixed
+#     x_grid = torch.zeros_like(mb_grid)                    # fixed
+
+#     # Coordinates in value layout order: [out, mb, x, y]
+#     indices = torch.stack([out_grid, mb_grid, x_grid, y_grid], dim=-1).to("spyre")
+#     #indices_flat = indices.reshape(-1, 4)                 # [256, 4]
+
+#     # addresses = torch.ops.spyre.indices_to_address(
+#     #     indices_flat,
+#     #     virtual_offset=0,
+#     #     device_size=[out_dim, mb_dim, x_dim, y_dim],
+#     #     device_stride=[mb_dim * x_dim * y_dim, x_dim * y_dim, y_dim, 1],
+#     #     element_size=2,  # fp16
+#     # )
+
+#     #index = indices.reshape(mb_dim, y_dim)             # [128, 2]
+
+#     compiled_fn = torch.compile(gather_fn)
+#     result = compiled_fn(value, indices)
+
+#     print("value shape:", value.shape)   # [128, 128, 8, 2]
+#     print("index shape:", index.shape)   # [128, 2]
+#     print("result shape:", result.shape)
+#     print(result)
+
+def test_gather_with_compile():
+    """
+    Test using torch.compile to trigger inductor and SDSC generation
+    """
+    
+    device = torch.device("spyre")
+    
+    @torch.compile
+    def gather_op(input_t, index_t):
+        return torch.ops.spyre.indirect_gather(input_t, index_t)
+        #return torch.gather(input_t, dim=0, index=index_t)
+    
+    # Create tensors
+    input_tensor = torch.randn(64, 64, dtype=torch.float16, device=device)
+    index_tensor = torch.randint(0, 64, (64, 64), dtype=torch.int64).to(device)
+    
+    # Run compiled version
+    output_tensor = gather_op(input_tensor, index_tensor)
+    
+    assert output_tensor.shape == (64, 64)
+    
+    print("✓ Test passed: torch.compile + torch.gather")
+    print(f"  Generated SDSC configuration for spatial distribution")
+    
+    return output_tensor
 
 if __name__ == "__main__":
     print("\n" + "=" * 70)
@@ -320,8 +437,11 @@ if __name__ == "__main__":
         #test_gather_2d_output_full_rows()
         #test_gather_2d_output_submatrix()
         #test_gather_2d_output_simple()
-        test_gather_1d()
-        
+        #test_gather_1d()
+        #test_gather_4d()
+        #test_gather_like_paged_attn_case()
+        test_gather_with_compile()
+
         print("\n" + "=" * 70)
         print("Summary: How to Get 2D Output from Indirect Gather")
         print("=" * 70)

@@ -619,13 +619,13 @@ def lower_indirect_gather(input, addresses):
 
     def inner_fn(index):
         return fn(
-            input.make_loader()(index),
-            addresses.make_loader()(index),
+            input.make_loader()(index),     #=> 2 D
+            addresses.make_loader()(index), #=> 1 D
         )
 
     pw = Pointwise.create(
         device=input.get_device(),
-        dtype=input.get_dtype(),
+        dtype=torch.float16,
         inner_fn=inner_fn,
         ranges=addresses.get_size(),
         origin_node=input.get_origin_node(),
