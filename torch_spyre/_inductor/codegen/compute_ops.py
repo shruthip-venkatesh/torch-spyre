@@ -83,6 +83,7 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
+    is_indirect_access: bool = False,
 ):
     return (
         {
@@ -190,9 +191,10 @@ def gen_coord_info_value(
                         "label_": "row_fold",
                     },
                     {
-                        "factor_": 1
-                        if is_stick_reduction
-                        else (size // elems_per_stick),
+                        "factor_": (
+                            0 if (is_indirect_access and size == elems_per_stick)
+                            else (1 if is_stick_reduction else (size // elems_per_stick))
+                        ),
                         "label_": "elem_arr_1",
                     },
                     {
@@ -379,6 +381,9 @@ def generate_sdsc(sdsc_spec):
                                             ),
                                             is_stick_reduction=(
                                                 tensor.scales[dim] == -2
+                                            ),
+                                            is_indirect_access=(
+                                                i in [t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor]
                                             ),
                                         )
                                         for dim in sdsc_spec.layouts[tensor.layout][

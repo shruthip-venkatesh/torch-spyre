@@ -171,7 +171,7 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
 
 
 def _get_device_dim_order(
-    arg: TensorArg, symbol_mapping: dict
+    arg: TensorArg, symbol_mapping: dict, reverse_for_indirect: bool = False
 ) -> tuple[list[Symbol], Symbol | None]:
     """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution."""
     last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
@@ -179,6 +179,7 @@ def _get_device_dim_order(
     stick_dim = free[0] if free else None
 
     dim_order: list[Symbol] = []
+    # Build dimension order from highest to lowest (reverse iteration)
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
         expr = arg.device_coordinates[i].subs(symbol_mapping)
         if expr == 0:
@@ -189,6 +190,10 @@ def _get_device_dim_order(
 
     if stick_dim is not None and stick_dim not in dim_order:
         dim_order.append(stick_dim)
+
+    # For indirect access operations, reverse to get proper order: stick dimension first
+    if reverse_for_indirect:
+        dim_order.reverse()
 
     return dim_order, stick_dim
 
@@ -265,6 +270,7 @@ def _create_sdsc_tensors(
     use_op_dims = not _is_matmul(op_spec.op)
 
     index_args = set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
+    has_indirect_access = len(index_args) > 0
     
     # Build a mapping of value_arg -> index_arg for indirect access operations
     value_to_index_map = {}
@@ -280,19 +286,22 @@ def _create_sdsc_tensors(
     index_tensor_layouts = {}
     for i, arg in enumerate(op_spec.args):
         if i in index_args:
-            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
-            index_tensor_layouts[i] = (dim_order, stick_dim)
+            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, reverse_for_indirect=has_indirect_access)
+            # Index tensors should only have non-stick dimensions from value tensor perspective
+            # Remove the original stick dimension (e.g., 'out')
+            if stick_dim in dim_order:
+                dim_order = [d for d in dim_order if d != stick_dim]
+            # The remaining dimension (e.g., 'mb') becomes the stick dimension for the index tensor
+            # This ensures the stick dim is innermost as required by the backend
+            index_stick_dim = dim_order[-1] if dim_order else None
+            index_tensor_layouts[i] = (dim_order, index_stick_dim)
     
     # Second pass: create SDSC args with proper layout handling
     for i, arg in enumerate(op_spec.args):
         addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         
-        # For indirect access value tensors, preserve their own logical/output
-        # dimension symbols while still using the index tensor layout only for
-        # sizing/indirection-related handling later in the pipeline. Reusing the
-        # index tensor dim symbols here causes physical stick-axis names like x
-        # to leak into emitted SDSC metadata for gathered outputs.
-        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+        # Get initial dimension order for all tensors
+        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, reverse_for_indirect=has_indirect_access)
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
@@ -352,24 +361,36 @@ def _create_sdsc_tensors(
                 i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]
             )
 
-            positive_max_dims: set[Symbol] = set()
+            positive_max_dims: dict[Symbol, int] = {}
             if is_value_tensor_for_indirect and i in value_to_index_map:
                 index_arg_pos = value_to_index_map[i]
                 if index_arg_pos in index_tensor_layouts:
                     index_dim_order, _ = index_tensor_layouts[index_arg_pos]
-                    positive_max_dims = {
-                        d for d in index_dim_order
-                        if d in dim_order and d != stick_dim
-                    }
+                    # For each dimension in the index tensor, store its size
+                    # This will be used as maxDimSize for the value tensor
+                    for d in index_dim_order:
+                        if d in dim_order and d != stick_dim:
+                            # Use the index tensor's dimension size from iteration space
+                            positive_max_dims[d] = iteration_space[d]
 
             if is_value_tensor_for_indirect and dim in positive_max_dims:
-                # Positive bounds only along indirection-traversed non-stick dims.
-                # This matches backends that expect maxDimSizes to constrain only
-                # the paged / indirect dimensions.
-                max_dim_sizes[dim] = it_dim_size
+                # For indirect access value tensors, non-stick dimensions traversed
+                # by the index tensor should have maxDimSize set to the index tensor's
+                # dimension size (which indicates the range of indirect access).
+                max_dim_sizes[dim] = positive_max_dims[dim]
             else:
                 max_dim_sizes[dim] = -1
 
+        # For index tensors, filter out dimensions with scale=-1 (reduced dimensions)
+        # Keep only dimensions with scale=1 (non-reduced dimensions)
+        if i in index_args:
+            # Filter dimensions: keep only those with scale == 1
+            filtered_dim_order = [d for d in dim_order if scales.get(d, 1) == 1]
+            if filtered_dim_order:
+                dim_order = filtered_dim_order
+                # The last remaining dimension becomes the stick dimension
+                stick_dim = dim_order[-1]
+            
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
 
         # Check if this argument is an index tensor
@@ -495,8 +516,12 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
+    # Check if this is an indirect access operation
+    index_args = set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
+    has_indirect_access = len(index_args) > 0
+
     ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
+    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping, reverse_for_indirect=has_indirect_access)
 
     if op_stick_dim is None:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])

@@ -301,8 +301,8 @@ def test_gather_1d():
     input_2d = torch.nn.functional.pad(input.unsqueeze(1), (0,63), value=0).to("spyre")
     print(f"Input 2D tensor shape: {input_2d.shape}")
 
-    index = torch.tensor([0,3,4,5], dtype=torch.float32)
-    index_2d = index.unsqueeze(1).to("spyre")
+    index_2d = torch.tensor([0,3,4,5], dtype=torch.float32).reshape(2,2).to("spyre")
+    #index_2d = index.unsqueeze(1).reshapeto("spyre")
     #index_2d = torch.nn.functional.pad(index.unsqueeze(1), (0,1), value=0).to("spyre")
     print("Index shape : ", index_2d.shape)
 
@@ -427,6 +427,47 @@ def test_gather_with_compile():
     
     return output_tensor
 
+def test_working_gather():
+    # Define the operation using the built-in indirect_gather
+    def gather_fn(input, addresses):
+        return torch.ops.spyre.indirect_gather(input, addresses)
+
+    # Create tensors with your desired shapes
+    input_tensor = torch.randn(64, 4, dtype=torch.float16)
+    print("Input Tensor : ", input_tensor)
+    print("Input Tensor Shape : ", input_tensor.shape)
+    input_tensor = input_tensor.to("spyre")
+    address_tensor = torch.randint(0, 64, (4,), dtype=torch.int64).unsqueeze(0).expand(64, 4)
+    print("Index Tensor : ", address_tensor)
+    print("Index Tensor Shape : ", address_tensor.shape)
+    address_tensor = address_tensor.to("spyre")
+    # Compile - this triggers SDSC generation
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_tensor, address_tensor)
+
+    print("Result : ", result)
+
+def test_gather_original_expected():
+    """Generate JSON exactly matching the original expected configuration"""
+    
+    def gather_fn(input, addresses):
+        return torch.ops.spyre.indirect_gather(input, addresses)
+
+    input_tensor = torch.randn(64, 4, dtype=torch.float16, device="spyre")
+    print("Input Tensor Shape:", input_tensor.shape)
+    
+    address_tensor = torch.randint(0, 64, (4,), dtype=torch.int64).to("spyre")
+    print("Index Tensor Shape:", address_tensor.shape)  # Should be torch.Size([4])
+    
+    # Compile
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_tensor, address_tensor)
+    
+    print("Result Shape:", result.shape)  # Should be torch.Size([4])
+    print("Result:", result)
+    
+    return result
+
 if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("2D Output Tensor Tests for Indirect Gather")
@@ -440,7 +481,9 @@ if __name__ == "__main__":
         #test_gather_1d()
         #test_gather_4d()
         #test_gather_like_paged_attn_case()
-        test_gather_with_compile()
+        #test_gather_with_compile()
+        test_working_gather()
+        #test_gather_original_expected()
 
         print("\n" + "=" * 70)
         print("Summary: How to Get 2D Output from Indirect Gather")
