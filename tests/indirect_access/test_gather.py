@@ -468,6 +468,117 @@ def test_gather_original_expected():
     
     return result
 
+def test_gather_v2():
+    """Generate JSON exactly matching the original expected configuration"""
+    
+    def gather_fn(input, addresses):
+        return torch.ops.spyre.indirect_gather(input, addresses)
+
+    input_tensor = torch.randn(64, dtype=torch.float16, device="spyre")
+    print("Input Tensor Shape:", input_tensor.shape)
+    
+    address_tensor = torch.randint(0, 64, (4,), dtype=torch.int64).to("spyre")
+    print("Index Tensor Shape:", address_tensor.shape)  # Should be torch.Size([4])
+    
+    # Compile
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_tensor, address_tensor)
+    
+    print("Result Shape:", result.shape)  # Should be torch.Size([4])
+    print("Result:", result)
+    
+    return result
+
+
+def test_gather():
+    """Generate JSON exactly matching the original expected configuration"""
+
+    def gather_fn(input, dim, index):
+        return torch.gather(input, 0, index)
+
+    input_tensor = torch.randn(64, dtype=torch.float16, device="spyre")
+    print("Input Tensor Shape:", input_tensor.shape)
+    
+    address_tensor = torch.randint(0, 64, (4,), dtype=torch.int64).to("spyre")
+    print("Index Tensor Shape:", address_tensor.shape)  # Should be torch.Size([4])
+    
+    # Compile
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_tensor, address_tensor)
+    
+    print("Result Shape:", result.shape)  # Should be torch.Size([4])
+    print("Result:", result)
+    
+    return result
+
+def test_gather_2d_stick_aligned():
+    """
+    Test gather with stick-aligned access for Spyre hardware.
+    
+    For FP16 data, stick size is 64 elements (128 bytes / 2 bytes per element).
+    This test uses a [32, 64] input tensor (1 stick per row) and gathers
+    specific rows using a 2D index tensor.
+    """
+    def gather_fn(input, index):
+        return torch.ops.spyre.indirect_gather(input, index)
+    
+    print("\n" + "="*60)
+    print("Test: 2D Gather with Stick-Aligned Access")
+    print("="*60)
+    
+    # Create 2D input tensor [32 rows x 64 columns]
+    # Each row is exactly 1 stick (64 FP16 elements = 128 bytes)
+    input_tensor = torch.arange(32 * 64, dtype=torch.float16).reshape(32, 64).to("spyre")
+    
+    print("\nInput tensor shape:", input_tensor.shape)
+    print("Input : ", input_tensor)
+    # print("Input tensor (first 3 rows, first 8 columns):")
+    # print(input_tensor[:3, :8])
+    
+    # Create 2D index tensor [4 rows x 2 columns]
+    # Gather 4 specific rows, but only 2 values per row
+    # Note: For full stick access, we'd gather entire rows
+    index_tensor = torch.tensor([[5, 10],
+                                  [15, 20],
+                                  [25, 30],
+                                  [2, 7]], dtype=torch.int64).to("spyre")
+    print("\nIndex tensor shape:", index_tensor.shape)
+    print("Index tensor :", index_tensor)
+    # print("Index tensor:")
+    # print(index_tensor)
+    #print("\nGathering rows: [5, 10, 15, 20, 25, 30, 2, 7]")
+    
+    # Compile and execute
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_tensor, index_tensor)
+    
+    print("\n" + "-"*60)
+    print("Result shape:", result.shape)
+    print("Result: ", result)
+    # print("Result tensor (first 8 columns):")
+    # print(result[:, :8])
+    
+    # # Verify by manual indexing
+    # expected = torch.zeros_like(result)
+    # for i in range(index_tensor.shape[0]):
+    #     for j in range(index_tensor.shape[1]):
+    #         row_idx = index_tensor[i, j].item()
+    #         expected[i, j] = input_tensor[row_idx, j]
+    
+    # if torch.allclose(result.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3):
+    #     print("\n✓ Test PASSED! Stick-aligned gather working correctly.")
+    # else:
+    #     print("\n✗ Test FAILED - results don't match")
+    #     print(f"Max difference: {(result.cpu() - expected.cpu()).abs().max()}")
+    
+    # print("\n" + "="*60)
+    # print("Stick-Aligned Access Notes:")
+    # print("="*60)
+    # print("- Stick size for FP16: 64 elements (128 bytes)")
+    # print("- Input: [32, 64] = 32 sticks (1 per row)")
+    # print("- Gather operates at stick boundaries")
+    # print("- Each gathered row is a complete stick")
+
 if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("2D Output Tensor Tests for Indirect Gather")
@@ -482,26 +593,29 @@ if __name__ == "__main__":
         #test_gather_4d()
         #test_gather_like_paged_attn_case()
         #test_gather_with_compile()
-        test_working_gather()
+        #test_working_gather()
         #test_gather_original_expected()
+        #test_gather_v2()
+        #test_gather()
+        test_gather_2d_stick_aligned()
 
-        print("\n" + "=" * 70)
-        print("Summary: How to Get 2D Output from Indirect Gather")
-        print("=" * 70)
-        print("\n✓ Key Principle: Index tensor shape determines output shape!")
-        print("\nStrategies demonstrated:")
-        print("1. Sparse 2D gather: Use 2D index tensor [M, N] → output [M, N]")
-        print("2. Stick-aligned gather: Index shape [num_rows, num_sticks] → output [num_rows, num_sticks]")
-        print("3. Submatrix gather: Index shape [rows, cols] → output [rows, cols]")
-        print("\nImplementation steps:")
-        print("1. Create 2D grid of (row, col) indices AT STICK BOUNDARIES")
-        print("2. Flatten to compute addresses")
-        print("3. Reshape addresses to desired 2D output shape")
-        print("4. Pass reshaped addresses to indirect_gather")
-        print("5. Output will have the same shape as the address tensor!")
-        print("\n⚠️  CRITICAL: Spyre requires stick-aligned access (128-byte boundaries)")
-        print("   For FP16: Only access columns at multiples of 64 (0, 64, 128, 192, ...)")
-        print("   For FP32: Only access columns at multiples of 32 (0, 32, 64, 96, ...)")
+        # print("\n" + "=" * 70)
+        # print("Summary: How to Get 2D Output from Indirect Gather")
+        # print("=" * 70)
+        # print("\n✓ Key Principle: Index tensor shape determines output shape!")
+        # print("\nStrategies demonstrated:")
+        # print("1. Sparse 2D gather: Use 2D index tensor [M, N] → output [M, N]")
+        # print("2. Stick-aligned gather: Index shape [num_rows, num_sticks] → output [num_rows, num_sticks]")
+        # print("3. Submatrix gather: Index shape [rows, cols] → output [rows, cols]")
+        # print("\nImplementation steps:")
+        # print("1. Create 2D grid of (row, col) indices AT STICK BOUNDARIES")
+        # print("2. Flatten to compute addresses")
+        # print("3. Reshape addresses to desired 2D output shape")
+        # print("4. Pass reshaped addresses to indirect_gather")
+        # print("5. Output will have the same shape as the address tensor!")
+        # print("\n⚠️  CRITICAL: Spyre requires stick-aligned access (128-byte boundaries)")
+        # print("   For FP16: Only access columns at multiples of 64 (0, 64, 128, 192, ...)")
+        # print("   For FP32: Only access columns at multiples of 32 (0, 32, 64, 96, ...)")
         
     except Exception as e:
         print(f"\nError: {e}")
