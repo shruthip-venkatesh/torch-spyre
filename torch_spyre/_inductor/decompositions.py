@@ -673,6 +673,17 @@ def paged_attention_decomp(
     # TODO : Proper Implementation required
     return torch.ops.spyre.indirect_add(input1, index1, input2, index2)
 
+
+@register_spyre_decomposition([torch.ops.aten.gather.default])
+def spyre_gather(
+    input: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+) -> torch.Tensor:
+    # TODO : Index to Address translation to be handled
+    return torch.ops.spyre.indirect_gather(input, index)
+
+
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################
