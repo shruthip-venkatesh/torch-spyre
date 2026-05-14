@@ -282,6 +282,49 @@ def _(
     output_shape = indices.shape[:-1]
     return torch.empty(output_shape, dtype=torch.float32, device=indices.device)
 
+@torch.library.custom_op("spyre::indices_to_addresses", mutates_args=(), device_types="spyre")
+def indices_to_addresses(
+    logical_indices: torch.Tensor,
+    value_tensor: torch.Tensor,
+    dim: int = 0,
+) -> torch.Tensor:
+    """
+    Convert logical indices to physical memory addresses for IBR.
+    
+    Supports 2D, 3D, 4D, and N-D tensors with flexible indexing:
+    
+    **2D Mode** (backward compatible):
+    - logical_indices: [MB, IJ] with row indices (0 to IN-1)
+    - value_tensor: [IN, OUT]
+    - Returns: [MB, IJ] stick addresses
+    
+    **N-D Multi-dimensional Mode**:
+    - logical_indices: [..., ndim] with coordinates for each dimension
+    - value_tensor: [D0, D1, ..., Dn]
+    - Returns: [...] stick addresses
+    
+    **N-D Single-dimension Mode**:
+    - logical_indices: [...] with indices along dimension `dim`
+    - value_tensor: [D0, D1, ..., Dn]
+    - dim: dimension to index along (default: 0)
+    - Returns: [...] stick addresses
+    
+    Address formula: address = base_address + sum(index[i] * stride[i] * element_size)
+    """
+    from torch_spyre import _C
+    # Use N-D version which handles all cases
+    return _C.indices_to_addresses_nd(logical_indices, value_tensor, dim)
+
+
+@indices_to_addresses.register_fake
+def _(
+    logical_indices: torch.Tensor,
+    value_tensor: torch.Tensor,
+):
+    # Output has same shape as logical_indices
+    return logical_indices.new_empty(logical_indices.shape, dtype=torch.float32)
+
+
 @torch.library.custom_op("spyre::indirect_gather", mutates_args=(), device_types="spyre")
 def indirect_gather(
     input: torch.Tensor,
@@ -295,6 +338,17 @@ def _(
     input: torch.Tensor,
     addresses: torch.Tensor,
 ):
+    # Output shape: [MB, IJ, OUT] where addresses is [MB, IJ] and input is [IN, OUT]
+    # Each address fetches a full row (OUT dimension) from input
+    if input.dim() == 2:
+        # 2D input: [IN, OUT]
+        out_dim = input.shape[1]
+        output_shape = list(addresses.shape) + [out_dim]
+    else:
+        # For N-D input, gather along first dimension by default
+        # Output: addresses.shape + input.shape[1:]
+        output_shape = list(addresses.shape) + list(input.shape[1:])
+    
     return input.new_empty(addresses.shape)
 
 
