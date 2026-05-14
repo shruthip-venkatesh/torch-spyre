@@ -222,8 +222,9 @@ at::Tensor indices_to_addresses_2d(
   int64_t element_size = value_tensor.element_size();
   int64_t row_stride_bytes = out_dim * element_size;
   
-  // Get base address (virtual offset)
-  int64_t base_address = reinterpret_cast<int64_t>(value_tensor.data_ptr());
+  // Use relative addressing starting from 0
+  // The actual HBM base address will be set in SDSC JSON
+  int64_t base_address = 0;
   
   // Flatten indices for processing
   auto flat_indices = indices_cpu.reshape({-1});
@@ -292,8 +293,9 @@ at::Tensor indices_to_addresses_nd(
   // DeepTools stick size (128 bytes for Sen1.0)
   constexpr int64_t STICK_SIZE_BYTES = 128;
   
-  // Get base address (virtual offset)
-  int64_t base_address = 0; //reinterpret_cast<int64_t>(value_tensor.data_ptr());
+  // Use relative addressing starting from 0
+  // The actual HBM base address will be set in SDSC JSON
+  int64_t base_address = 0;
   int64_t element_size = value_tensor.element_size();
   
   // Compute strides for value tensor (row-major order)

@@ -683,6 +683,16 @@ def spyre_gather(
     # TODO : Index to Address translation to be handled
     return torch.ops.spyre.indirect_gather(input, index)
 
+@register_spyre_decomposition([torch.ops.spyre.indirect_add.default])
+def indirect_add_decomp(
+    input_a: torch.Tensor,
+    index_a: torch.Tensor,
+    input_b: torch.Tensor,
+    index_b: torch.Tensor,
+) -> torch.Tensor:
+    op_a = torch.ops.spyre.indirect_gather(input_a, index_a)
+    op_b = torch.ops.spyre.indirect_gather(input_b, index_b)
+    return torch.add(op_a, op_b)
 
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
