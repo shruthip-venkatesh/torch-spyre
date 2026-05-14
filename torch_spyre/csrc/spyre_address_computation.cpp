@@ -196,4 +196,214 @@ at::Tensor compute_stick_addresses_from_rows(
   return addresses.to(original_device);
 }
 
+at::Tensor indices_to_addresses_2d(
+    const at::Tensor& logical_indices,
+    const at::Tensor& value_tensor) {
+  
+  // Store the original device for later
+  auto original_device = logical_indices.device();
+  
+  // Only move indices to CPU for computation (value tensor stays on device)
+  auto indices_cpu = logical_indices.cpu();
+  
+  // Get shapes (no need to move value_tensor to CPU for metadata)
+  auto indices_shape = indices_cpu.sizes();
+  auto value_shape = value_tensor.sizes();
+  
+  // Validate: value_tensor must be 2D [IN, OUT]
+  TORCH_CHECK(
+      value_shape.size() == 2,
+      "value_tensor must be 2D [IN, OUT], got ", value_shape.size(), "D");
+  
+  int64_t in_dim = value_shape[0];
+  int64_t out_dim = value_shape[1];
+  
+  // Get element size and compute row stride
+  int64_t element_size = value_tensor.element_size();
+  int64_t row_stride_bytes = out_dim * element_size;
+  
+  // Get base address (virtual offset)
+  int64_t base_address = reinterpret_cast<int64_t>(value_tensor.data_ptr());
+  
+  // Flatten indices for processing
+  auto flat_indices = indices_cpu.reshape({-1});
+  int64_t num_indices = flat_indices.size(0);
+  
+  // Create output address tensor as float32
+  auto addresses = at::zeros({num_indices}, at::TensorOptions().dtype(at::kFloat));
+  
+  // Get accessors
+  auto flat_indices_accessor = flat_indices.accessor<int64_t, 1>();
+  auto addresses_accessor = addresses.accessor<float, 1>();
+  
+  // DeepTools stick size (128 bytes for Sen1.0)
+  constexpr int64_t STICK_SIZE_BYTES = 128;
+  
+  // Compute address for each index
+  for (int64_t i = 0; i < num_indices; ++i) {
+    int64_t row_index = flat_indices_accessor[i];
+    
+    // Validate row index is within bounds
+    TORCH_CHECK(
+        row_index >= 0 && row_index < in_dim,
+        "Row index ", row_index, " out of bounds for dimension IN=", in_dim);
+    
+    // DeepTools address formula:
+    // address = base_address + (row_index * row_stride)
+    int64_t byte_address = base_address + (row_index * row_stride_bytes);
+    
+    // Verify stick alignment
+    TORCH_CHECK(
+        byte_address % STICK_SIZE_BYTES == 0,
+        "Address ", byte_address, " for row ", row_index,
+        " is not stick-aligned (must be multiple of ", STICK_SIZE_BYTES, " bytes). ",
+        "Row stride: ", row_stride_bytes, " bytes");
+    
+    // Convert to stick address
+    int64_t stick_address = byte_address / STICK_SIZE_BYTES;
+    
+    // Store as float (will be interpreted as SENUINT32 via SDSC metadata)
+    addresses_accessor[i] = static_cast<float>(stick_address);
+  }
+  
+  // Reshape back to original shape
+  auto reshaped_addresses = addresses.reshape(indices_shape);
+  
+  // Move the result back to the original device (spyre)
+  return reshaped_addresses.to(original_device);
+}
+
+at::Tensor indices_to_addresses_nd(
+    const at::Tensor& logical_indices,
+    const at::Tensor& value_tensor,
+    int64_t dim) {
+  
+  // Store the original device for later
+  auto original_device = logical_indices.device();
+  
+  // Only move indices to CPU for computation (value tensor stays on device)
+  auto indices_cpu = logical_indices.cpu();
+  
+  // Get shapes (no need to move value_tensor to CPU for metadata)
+  auto indices_shape = indices_cpu.sizes();
+  auto value_shape = value_tensor.sizes();
+  int64_t value_ndim = value_shape.size();
+  
+  // DeepTools stick size (128 bytes for Sen1.0)
+  constexpr int64_t STICK_SIZE_BYTES = 128;
+  
+  // Get base address (virtual offset)
+  int64_t base_address = 0; //reinterpret_cast<int64_t>(value_tensor.data_ptr());
+  int64_t element_size = value_tensor.element_size();
+  
+  // Compute strides for value tensor (row-major order)
+  std::vector<int64_t> value_strides(value_ndim);
+  int64_t stride = 1;
+  for (int64_t i = value_ndim - 1; i >= 0; --i) {
+    value_strides[i] = stride;
+    stride *= value_shape[i];
+  }
+  
+  // Determine indexing mode based on indices shape
+  bool is_multidim_index = (indices_shape.size() > 0 &&
+                            indices_shape[indices_shape.size() - 1] == value_ndim);
+  
+  at::Tensor addresses;
+  
+  if (is_multidim_index) {
+    // Multi-dimensional indexing: indices shape is [..., ndim]
+    // Each index tuple specifies coordinates in all dimensions
+    
+    auto flat_indices = indices_cpu.reshape({-1, value_ndim});
+    int64_t num_indices = flat_indices.size(0);
+    
+    addresses = at::zeros({num_indices}, at::TensorOptions().dtype(at::kFloat));
+    auto flat_indices_accessor = flat_indices.accessor<int64_t, 2>();
+    auto addresses_accessor = addresses.accessor<float, 1>();
+    
+    for (int64_t i = 0; i < num_indices; ++i) {
+      int64_t element_offset = 0;
+      
+      // Compute offset using all dimensions
+      for (int64_t d = 0; d < value_ndim; ++d) {
+        int64_t coord = flat_indices_accessor[i][d];
+        
+        // Validate coordinate
+        TORCH_CHECK(
+            coord >= 0 && coord < value_shape[d],
+            "Index ", coord, " out of bounds for dimension ", d,
+            " (size: ", value_shape[d], ")");
+        
+        element_offset += coord * value_strides[d];
+      }
+      
+      // Convert to byte address
+      int64_t byte_address = base_address + (element_offset * element_size);
+      
+      // Verify stick alignment
+      TORCH_CHECK(
+          byte_address % STICK_SIZE_BYTES == 0,
+          "Address ", byte_address, " is not stick-aligned. ",
+          "Element offset: ", element_offset);
+      
+      // Convert to stick address
+      int64_t stick_address = byte_address / STICK_SIZE_BYTES;
+      addresses_accessor[i] = static_cast<float>(stick_address);
+    }
+    
+    // Reshape back to original shape (without last dimension)
+    std::vector<int64_t> output_shape(
+        indices_shape.begin(), indices_shape.end() - 1);
+    addresses = addresses.reshape(output_shape);
+    
+  } else {
+    // Single-dimension indexing: indices shape is [...]
+    // Index along specified dimension (default: dim=0, row-major)
+    
+    TORCH_CHECK(
+        dim >= 0 && dim < value_ndim,
+        "Dimension ", dim, " out of bounds for ", value_ndim, "D tensor");
+    
+    auto flat_indices = indices_cpu.reshape({-1});
+    int64_t num_indices = flat_indices.size(0);
+    
+    addresses = at::zeros({num_indices}, at::TensorOptions().dtype(at::kFloat));
+    auto flat_indices_accessor = flat_indices.accessor<int64_t, 1>();
+    auto addresses_accessor = addresses.accessor<float, 1>();
+    
+    // Compute stride for the indexed dimension
+    int64_t dim_stride_elements = value_strides[dim];
+    int64_t dim_stride_bytes = dim_stride_elements * element_size;
+    
+    for (int64_t i = 0; i < num_indices; ++i) {
+      int64_t index = flat_indices_accessor[i];
+      
+      // Validate index
+      TORCH_CHECK(
+          index >= 0 && index < value_shape[dim],
+          "Index ", index, " out of bounds for dimension ", dim,
+          " (size: ", value_shape[dim], ")");
+      
+      // Compute address: base + (index * stride)
+      int64_t byte_address = base_address + (index * dim_stride_bytes);
+      
+      // Verify stick alignment
+      TORCH_CHECK(
+          byte_address % STICK_SIZE_BYTES == 0,
+          "Address ", byte_address, " for index ", index,
+          " is not stick-aligned. Stride: ", dim_stride_bytes, " bytes");
+      
+      // Convert to stick address
+      int64_t stick_address = byte_address / STICK_SIZE_BYTES;
+      addresses_accessor[i] = static_cast<float>(stick_address);
+    }
+    
+    // Reshape back to original indices shape
+    addresses = addresses.reshape(indices_shape);
+  }
+  
+  // Move the result back to the original device (spyre)
+  return addresses.to(original_device);
+}
+
 } // namespace spyre

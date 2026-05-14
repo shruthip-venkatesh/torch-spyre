@@ -418,4 +418,10 @@ PYBIND11_MODULE(_C, m) {
         "Convert 2D row indices to stick addresses for gather operations",
         py::arg("row_indices"), py::arg("virtual_offset"), py::arg("rows_per_group"),
         py::arg("cols_per_row"), py::arg("element_size"));
+  m.def("indices_to_addresses_2d", &spyre::indices_to_addresses_2d,
+        "Convert logical indices to addresses following DeepTools model",
+        py::arg("logical_indices"), py::arg("value_tensor"));
+  m.def("indices_to_addresses_nd", &spyre::indices_to_addresses_nd,
+        "Convert N-dimensional logical indices to addresses",
+        py::arg("logical_indices"), py::arg("value_tensor"), py::arg("dim") = 0);
 }
