@@ -11,20 +11,18 @@ def test_gather_1d():
         # Squeeze back to 1D for output
         return result_2d.squeeze(-1)
 
-    input_tensor = torch.randn(64, dtype=torch.float16)
+    input_tensor = torch.randn(64 , dtype=torch.float16)
+    input_tensor = torch.nn.functional.pad(input_tensor.reshape(64,1), (0, 63), value=0).to("spyre")
     print("Input Tensor Shape:", input_tensor.shape)
     
     index_tensor = torch.tensor([0, 10, 20, 30], dtype=torch.int64)
-    print("Index Tensor Shape:", address_tensor.shape)  # Should be torch.Size([4])
+    index_tensor = torch.nn.functional.pad(index_tensor.reshape(4,1), (0, 31), value=0).to("spyre")
+    print("Index Tensor Shape:", index_tensor.shape)  # Should be torch.Size([4])
 
-    input_tensor = input_tensor.reshape(64, 64).to("spyre")
-    index_tensor = index_tensor.reshape(4, 32).to("spyre")
-
-    # Compile
     compiled_fn = torch.compile(gather_fn)
     result = compiled_fn(input_tensor, 0, index_tensor)
     
-    print("Result Shape:", result.shape)  # Should be torch.Size([4])
+    print("Result Shape:", result.shape)
     print("Result:", result)
     
     return result
@@ -39,7 +37,7 @@ def test_gather_2d():
     def gather_fn(input, dim, index):
         return torch.gather(input, dim, index)
 
-    input_tensor = torch.arange(32 * 64, dtype=torch.float16).reshape(32, 64).to("spyre")
+    input_tensor = torch.arange(32 * 128, dtype=torch.float16).reshape(32, 128).to("spyre")
     
     print("\nInput tensor shape:", input_tensor.shape)
     print("Input : ", input_tensor)
@@ -50,7 +48,8 @@ def test_gather_2d():
                                   [2, 7]], dtype=torch.int64).to("spyre")
     print("\nIndex tensor shape:", index_tensor.shape)
     print("Index tensor :", index_tensor)
-    
+    #addresses_tensor = torch.ops.spyre.indices_to_addresses(index_tensor, input_tensor, 0)
+
     compiled_fn = torch.compile(gather_fn)
     result = compiled_fn(input_tensor, 0, index_tensor)
     
@@ -132,7 +131,7 @@ def test_gather_4d():
 if __name__ == "__main__":
 
     try:
-        #test_gather_1d()
+        test_gather_1d()
         test_gather_2d()
         test_gather_3d()
         test_gather_4d()
