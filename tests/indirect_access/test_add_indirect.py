@@ -1,7 +1,7 @@
 import torch
 
-def test_indirect_add_address():
-    """Test indirect_add using stick addresses as expected by DeepTools.
+def test_indirect_add_address_1d():
+    """Test indirect_add using stick addresses for 1D tensors.
 
     DeepTools indirect access operates at stick granularity (128 bytes).
     For FP16 data, each stick holds 64 elements (128 bytes / 2 bytes per element).
@@ -10,6 +10,9 @@ def test_indirect_add_address():
     - Stick 0: elements 0-63   (row 0)
     - Stick 1: elements 64-127 (row 1)
     """
+    print("\n" + "="*80)
+    print("Testing 1D Tensors")
+    print("="*80)
     def indirect_add_fn(input_a, address_a, input_b, address_b):
         return torch.ops.spyre.indirect_add(input_a, address_a, input_b, address_b)
 
@@ -74,5 +77,248 @@ def test_indirect_add_address():
         print(f"Result values: {result.cpu()}")
         print(f"Expected values: {expected.cpu()}")
 
+def test_indirect_add_address_2d():
+    """Test indirect_add using stick addresses for 2D tensors.
+    
+    For a 2D tensor [4, 64] with FP16 data:
+    - Logical shape: [4, 64] = 256 elements
+    - Each row is 64 elements = 1 stick (64 * 2 bytes = 128 bytes)
+    - Device layout: [4, 64] (4 sticks, 64 elements per stick)
+    - device_size = [4, 64], device_stride = [64, 1]
+    """
+    print("\n" + "="*80)
+    print("Testing 2D Tensors [4, 64]")
+    print("="*80)
+    
+    def indirect_add_fn(input_a, address_a, input_b, address_b):
+        return torch.ops.spyre.indirect_add(input_a, address_a, input_b, address_b)
+
+    # Data tensors (4x64 FP16 elements = 4 sticks)
+    input_a = torch.randn(4, 64, dtype=torch.float16, device="spyre")
+    input_b = torch.randn(4, 64, dtype=torch.float16, device="spyre")
+
+    # Stick-aligned indices for 2D tensor
+    # Each row is 64 elements, so stick boundaries are at row boundaries
+    # Access elements at [0,0], [1,0], [2,0], [3,0] (first element of each row)
+    index1_row = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+    index1_col = torch.tensor([0, 0, 0, 0], dtype=torch.int64)
+    
+    index2_row = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    index2_col = torch.tensor([0, 0, 0, 0], dtype=torch.int64)
+
+    print(f"Index 1: rows={index1_row.tolist()}, cols={index1_col.tolist()}")
+    print(f"Index 2: rows={index2_row.tolist()}, cols={index2_col.tolist()}")
+    print(f"Logical shape: [4, 64]")
+    print(f"Device layout: [4, 64] (4 sticks, 64 elements/stick)")
+
+    # Device indices are the same as logical indices for this case
+    indices1_2d = torch.stack([index1_row, index1_col], dim=1).to("spyre")
+    indices2_2d = torch.stack([index2_row, index2_col], dim=1).to("spyre")
+    
+    # Convert to stick addresses
+    # device_size=[4, 64]: 4 sticks in dim 0, 64 elements in dim 1
+    # device_stride=[64, 1]: stride of 64 elements for dim 0, 1 for dim 1
+    address_a = torch.ops.spyre.indices_to_address(
+        indices1_2d,
+        virtual_offset=0,
+        device_size=[4, 64],
+        device_stride=[64, 1],
+        element_size=2
+    )
+    print(f"Stick addresses for input_a: {address_a}")
+
+    address_b = torch.ops.spyre.indices_to_address(
+        indices2_2d,
+        virtual_offset=34359738368,
+        device_size=[4, 64],
+        device_stride=[64, 1],
+        element_size=2
+    )
+    print(f"Stick addresses for input_b: {address_b}")
+
+    # Compile and execute
+    compiled_fn = torch.compile(indirect_add_fn)
+    result = compiled_fn(input_a, indices1_2d, input_b, indices2_2d)
+
+    print(f"\nResult: {result}")
+
+    # Verify the result manually
+    expected = input_a[index1_row, index1_col] + input_b[index2_row, index2_col]
+    print(f"Expected: {expected}")
+
+    # Check if results match
+    if torch.allclose(result.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3):
+        print("\n✓ 2D Test passed! Indirect access working correctly.")
+    else:
+        print("\n✗ 2D Test failed - results don't match")
+        print(f"Difference: {(result.cpu() - expected.cpu()).abs().max()}")
+
+
+def test_indirect_add_address_3d():
+    """Test indirect_add using stick addresses for 3D tensors.
+    
+    For a 3D tensor [2, 4, 64] with FP16 data:
+    - Logical shape: [2, 4, 64] = 512 elements
+    - Last dim is 64 elements = 1 stick per "row"
+    - Total "rows": 2 * 4 = 8
+    - Device layout: [2, 4, 64] maps to device [8, 64]
+    - device_size = [2, 4, 64], device_stride = [4*64, 64, 1] = [256, 64, 1]
+    """
+    print("\n" + "="*80)
+    print("Testing 3D Tensors [2, 4, 64]")
+    print("="*80)
+    
+    def indirect_add_fn(input_a, address_a, input_b, address_b):
+        return torch.ops.spyre.indirect_add(input_a, address_a, input_b, address_b)
+
+    # Data tensors (2x4x64 FP16 elements = 8 sticks)
+    input_a = torch.randn(2, 4, 64, dtype=torch.float16, device="spyre")
+    input_b = torch.randn(2, 4, 64, dtype=torch.float16, device="spyre")
+
+    # Stick-aligned indices for 3D tensor
+    # Access elements at stick boundaries
+    index1_d0 = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    index1_d1 = torch.tensor([0, 1, 0, 1], dtype=torch.int64)
+    index1_d2 = torch.tensor([0, 0, 0, 0], dtype=torch.int64)
+    
+    index2_d0 = torch.tensor([0, 0, 0, 1], dtype=torch.int64)
+    index2_d1 = torch.tensor([0, 1, 2, 0], dtype=torch.int64)
+    index2_d2 = torch.tensor([0, 0, 0, 0], dtype=torch.int64)
+
+    print(f"Index 1: d0={index1_d0.tolist()}, d1={index1_d1.tolist()}, d2={index1_d2.tolist()}")
+    print(f"Index 2: d0={index2_d0.tolist()}, d1={index2_d1.tolist()}, d2={index2_d2.tolist()}")
+    print(f"Logical shape: [2, 4, 64]")
+    print(f"Device layout: device_size=[2, 4, 64], device_stride=[256, 64, 1]")
+
+    # Create 3D device indices (no flattening in the test - let indices_to_address handle it)
+    indices1_3d = torch.stack([index1_d0, index1_d1, index1_d2], dim=1).to("spyre")
+    indices2_3d = torch.stack([index2_d0, index2_d1, index2_d2], dim=1).to("spyre")
+    
+    # Convert to stick addresses
+    # device_size=[2, 4, 64]: logical dimensions
+    # device_stride=[256, 64, 1]: stride in elements (2*4*64=256 for d0, 4*64=64 for d1, 1 for d2)
+    address_a = torch.ops.spyre.indices_to_address(
+        indices1_3d,
+        virtual_offset=0,
+        device_size=[2, 4, 64],
+        device_stride=[256, 64, 1],
+        element_size=2
+    )
+    print(f"Stick addresses for input_a: {address_a}")
+
+    address_b = torch.ops.spyre.indices_to_address(
+        indices2_3d,
+        virtual_offset=34359738368,
+        device_size=[2, 4, 64],
+        device_stride=[256, 64, 1],
+        element_size=2
+    )
+    print(f"Stick addresses for input_b: {address_b}")
+
+    # Compile and execute
+    compiled_fn = torch.compile(indirect_add_fn)
+    result = compiled_fn(input_a, address_a, input_b, address_b)
+
+    print(f"\nResult: {result}")
+
+    # Verify the result manually
+    expected = input_a[index1_d0, index1_d1, index1_d2] + input_b[index2_d0, index2_d1, index2_d2]
+    print(f"Expected: {expected}")
+
+    # Check if results match
+    if torch.allclose(result.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3):
+        print("\n✓ 3D Test passed! Indirect access working correctly.")
+    else:
+        print("\n✗ 3D Test failed - results don't match")
+        print(f"Difference: {(result.cpu() - expected.cpu()).abs().max()}")
+
+
+def test_indirect_add_address_4d():
+    """Test indirect_add using stick addresses for 4D tensors.
+    
+    For a 4D tensor [2, 2, 2, 64] with FP16 data:
+    - Logical shape: [2, 2, 2, 64] = 512 elements
+    - Last dim is 64 elements = 1 stick per "row"
+    - Total "rows": 2 * 2 * 2 = 8
+    - device_size = [2, 2, 2, 64]
+    - device_stride = [2*2*64, 2*64, 64, 1] = [256, 128, 64, 1]
+    """
+    print("\n" + "="*80)
+    print("Testing 4D Tensors [2, 2, 2, 64]")
+    print("="*80)
+    
+    def indirect_add_fn(input_a, address_a, input_b, address_b):
+        return torch.ops.spyre.indirect_add(input_a, address_a, input_b, address_b)
+
+    # Data tensors (2x2x2x64 FP16 elements = 8 sticks)
+    input_a = torch.randn(2, 2, 2, 64, dtype=torch.float16, device="spyre")
+    input_b = torch.randn(2, 2, 2, 64, dtype=torch.float16, device="spyre")
+
+    # Stick-aligned indices for 4D tensor
+    # Access elements at stick boundaries
+    index1_d0 = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    index1_d1 = torch.tensor([0, 1, 0, 1], dtype=torch.int64)
+    index1_d2 = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    index1_d3 = torch.tensor([0, 0, 0, 0], dtype=torch.int64)
+    
+    index2_d0 = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    index2_d1 = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+    index2_d2 = torch.tensor([0, 1, 0, 1], dtype=torch.int64)
+    index2_d3 = torch.tensor([0, 0, 0, 0], dtype=torch.int64)
+
+    print(f"Index 1: d0={index1_d0.tolist()}, d1={index1_d1.tolist()}, d2={index1_d2.tolist()}, d3={index1_d3.tolist()}")
+    print(f"Index 2: d0={index2_d0.tolist()}, d1={index2_d1.tolist()}, d2={index2_d2.tolist()}, d3={index2_d3.tolist()}")
+    print(f"Logical shape: [2, 2, 2, 64]")
+    print(f"Device layout: device_size=[2, 2, 2, 64], device_stride=[256, 128, 64, 1]")
+
+    # Create 4D device indices (no flattening in the test - let indices_to_address handle it)
+    indices1_4d = torch.stack([index1_d0, index1_d1, index1_d2, index1_d3], dim=1).to("spyre")
+    indices2_4d = torch.stack([index2_d0, index2_d1, index2_d2, index2_d3], dim=1).to("spyre")
+    
+    # Convert to stick addresses
+    # device_size=[2, 2, 2, 64]: logical dimensions
+    # device_stride=[256, 128, 64, 1]: stride in elements
+    address_a = torch.ops.spyre.indices_to_address(
+        indices1_4d,
+        virtual_offset=0,
+        device_size=[2, 2, 2, 64],
+        device_stride=[256, 128, 64, 1],
+        element_size=2
+    )
+    print(f"Stick addresses for input_a: {address_a}")
+
+    address_b = torch.ops.spyre.indices_to_address(
+        indices2_4d,
+        virtual_offset=34359738368,
+        device_size=[2, 2, 2, 64],
+        device_stride=[256, 128, 64, 1],
+        element_size=2
+    )
+    print(f"Stick addresses for input_b: {address_b}")
+
+    # Compile and execute
+    compiled_fn = torch.compile(indirect_add_fn)
+    result = compiled_fn(input_a, address_a, input_b, address_b)
+
+    print(f"\nResult: {result}")
+
+    # Verify the result manually
+    expected = input_a[index1_d0, index1_d1, index1_d2, index1_d3] + input_b[index2_d0, index2_d1, index2_d2, index2_d3]
+    print(f"Expected: {expected}")
+
+    # Check if results match
+    if torch.allclose(result.cpu(), expected.cpu(), rtol=1e-3, atol=1e-3):
+        print("\n✓ 4D Test passed! Indirect access working correctly.")
+    else:
+        print("\n✗ 4D Test failed - results don't match")
+        print(f"Difference: {(result.cpu() - expected.cpu()).abs().max()}")
+
+
 if __name__ == "__main__":
-    test_indirect_add_address()
+    #test_indirect_add_address_1d()
+    test_indirect_add_address_2d()
+    test_indirect_add_address_3d()
+    test_indirect_add_address_4d()
+    print("\n" + "="*80)
+    print("All tests completed!")
+    print("="*80)
