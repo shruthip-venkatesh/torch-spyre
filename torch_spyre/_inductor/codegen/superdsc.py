@@ -234,6 +234,7 @@ def _get_padded_iteration_space(
     sdsc_args: list[SDSCArgs],
     sdsc_iteration_space: dict,
     layouts: dict,
+    is_indirect_access: bool = False,
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
@@ -245,14 +246,25 @@ def _get_padded_iteration_space(
     for sdsc_arg, op_spec_arg in zip(sdsc_args, op_spec_args):
         layout = layouts[sdsc_arg.layout]
         stick_dim = layout["stick_dim_order"]
+        stick_size = layout["stick_size"]
         dev_size = op_spec_arg.device_size[-2::-1]
         for idx, dim in enumerate(layout["dim_order"]):
-            if idx >= len(dev_size) or dim != stick_dim:
+            if idx >= len(dev_size):
                 continue
-            dim_size = dev_size[idx] * layout["stick_size"]
-            if sdsc_iteration_space[dim] < dim_size:
-                padding[dim] = dim_size - sdsc_iteration_space[dim]
-                sdsc_iteration_space[dim] = dim_size
+            
+            # For stick dimensions, pad to device size
+            if dim == stick_dim:
+                dim_size = dev_size[idx] * stick_size
+                if sdsc_iteration_space[dim] < dim_size:
+                    padding[dim] = dim_size - sdsc_iteration_space[dim]
+                    sdsc_iteration_space[dim] = dim_size
+            # For indirect access, ensure ALL dimensions are multiples of stick_size
+            elif is_indirect_access:
+                current_size = sdsc_iteration_space[dim]
+                aligned_size = ((current_size + stick_size - 1) // stick_size) * stick_size
+                if current_size < aligned_size:
+                    padding[dim] = aligned_size - current_size
+                    sdsc_iteration_space[dim] = aligned_size
     return padding
 
 
@@ -420,7 +432,7 @@ def _create_sdsc_tensors(
 
             if is_value_tensor_for_indirect:
                 # Value tensors: stick dimension is -1 (dynamic access)
-                # - Non-stick dimensions ("mb"): actual size (number of rows that can be accessed)
+                # - Non-stick dimensions: use actual device dimension size
                 logger.debug(f"Tensor {i} (value), checking dim={dim}, stick_dim={stick_dim}, dim==stick_dim={dim==stick_dim}")
                 if dim == stick_dim:
                     max_dim_sizes[dim] = -1
@@ -601,11 +613,15 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     elif op_spec.is_reduction or op_spec.op == "overwrite":
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
     else:
-        # For indirect access: pad based on ALL tensors (including index tensors)
-        has_index_tensors = any(arg.is_index_tensor for arg in op_spec.args)
-        pad_args, pad_sdsc_args = (list(op_spec.args), args) if has_index_tensors else ([op_spec.args[-1]], [args[-1]])
+        # For indirect access: pad based on output tensor only, NOT index tensors
+        # Index tensors have their own stick dimensions that shouldn't affect iteration space
+        pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
+    
+    # Check if this is an indirect access operation
+    has_indirect_access = len(index_args) > 0
+    
     padding = _get_padded_iteration_space(
-        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts
+        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, has_indirect_access
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
