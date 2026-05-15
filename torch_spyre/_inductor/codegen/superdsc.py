@@ -198,6 +198,14 @@ def _get_device_dim_order(
     return dim_order, stick_dim
 
 
+def _find_value_tensor_idx(args, index_args: set[int]) -> int | None:
+    """Find the value tensor index (not index tensor, not output)."""
+    for j in range(len(args)):
+        if j not in index_args and j != len(args) - 1:
+            return j
+    return None
+
+
 def _get_layout_label(
     layouts: dict,
     dim_order: list,
@@ -272,7 +280,7 @@ def _create_sdsc_tensors(
     index_args = set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
     has_indirect_access = len(index_args) > 0
     
-    # Build a mapping of value_arg -> index_arg for indirect access operations
+    # Build mapping of value_arg -> index_arg for indirect access operations
     value_to_index_map = {}
     if op_spec.op_info and "index_value_pairs" in op_spec.op_info:
         for pair in op_spec.op_info["index_value_pairs"]:
@@ -282,42 +290,26 @@ def _create_sdsc_tensors(
     adjusted_output_size = op_spec.args[-1].device_size.copy()
     sdsc_args: list[SDSCArgs] = []
     
-    # First pass: collect index tensor layouts
+    # First pass: collect index tensor layouts for indirect access
     index_tensor_layouts = {}
     for i, arg in enumerate(op_spec.args):
         if i in index_args:
-            # For index tensors, we need to construct a 1D layout
-            # The index tensor should have the non-stick dimension from the iteration space
-            # For example, if iteration space is [mb=4, out=2], index tensor should be [mb]
-            
-            # Get all dimensions from iteration space and map them using symbol_mapping
             all_dims = [symbol_mapping.get(k, k) for k in op_spec.iteration_space.keys()]
-            logger.debug(f"First pass: Tensor {i} (index), all_dims from iteration_space={all_dims}")
+            logger.debug(f"Index tensor {i}: all_dims from iteration_space={all_dims}")
             
-            # For indirect access, we need to identify which dimension is the "batch" dimension
-            # This is typically the dimension that's NOT the stick dimension of the value tensor
-            # We can infer this from the value tensor's layout
-            
-            # Find the value tensor (it's the one that's not an index tensor and not the output)
-            value_tensor_idx = None
-            for j, other_arg in enumerate(op_spec.args):
-                if j not in index_args and j != len(op_spec.args) - 1:  # Not index, not output
-                    value_tensor_idx = j
-                    break
+            # Find value tensor to infer stick dimension
+            value_tensor_idx = _find_value_tensor_idx(op_spec.args, index_args)
             
             if value_tensor_idx is not None:
-                # Get the value tensor's stick dimension
                 value_dim_order, value_stick_dim = _get_device_dim_order(
                     op_spec.args[value_tensor_idx], symbol_mapping, reverse_for_indirect=False
                 )
-                logger.debug(f"First pass: Value tensor {value_tensor_idx} has dim_order={value_dim_order}, stick_dim={value_stick_dim}")
+                logger.debug(f"Value tensor {value_tensor_idx}: dim_order={value_dim_order}, stick_dim={value_stick_dim}")
                 
-                # For indirect access, the index tensor should contain only the non-stick dimensions
-                # If value_stick_dim is None or not found, we need to infer it from the iteration space
+                # Infer stick dimension if not found
                 if value_stick_dim is None or value_stick_dim not in all_dims:
-                    # Default: assume the last dimension in iteration space is the stick dimension
                     value_stick_dim = all_dims[-1] if all_dims else None
-                    logger.debug(f"First pass: Inferred value_stick_dim={value_stick_dim} from iteration_space")
+                    logger.debug(f"Inferred value_stick_dim={value_stick_dim}")
                 
                 # Index tensor should have all dimensions EXCEPT the stick dimension
                 index_dim_order = [d for d in all_dims if d != value_stick_dim]
@@ -336,33 +328,25 @@ def _create_sdsc_tensors(
     
     # Second pass: create SDSC args with proper layout handling
     for i, arg in enumerate(op_spec.args):
-        # For indirect access operations, assign addresses based on tensor role, not arg_index
-        # Value tensor should get address 0, index tensor should get address 1
-        if has_indirect_access:
-            if i in index_args:
-                # Index tensor gets SEGMENT_OFFSETS[1]
-                addr = SEGMENT_OFFSETS[1]
-            elif i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]:
-                # Value tensor gets SEGMENT_OFFSETS[0]
-                addr = SEGMENT_OFFSETS[0]
-            elif i == len(op_spec.args) - 1:
-                # Output tensor gets SEGMENT_OFFSETS[2]
-                addr = SEGMENT_OFFSETS[2]
-            else:
-                addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
+        # For indirect access: assign addresses based on tensor role
+        if has_indirect_access and i in index_args:
+            addr = SEGMENT_OFFSETS[1]  # Index tensor
+        elif has_indirect_access and i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]:
+            addr = SEGMENT_OFFSETS[0]  # Value tensor
+        elif has_indirect_access and i == len(op_spec.args) - 1:
+            addr = SEGMENT_OFFSETS[2]  # Output tensor
         else:
             addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         
-        # Determine if this is a value tensor for indirect access
+        # Check if this is a value tensor for indirect access
         is_value_tensor = i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]
         
         # For index tensors, use pre-computed layout from first pass
         if i in index_tensor_layouts:
             dim_order, stick_dim = index_tensor_layouts[i]
         else:
-            # For value tensors and output, use op_dim_order with first dim as stick
+            # For value tensors in indirect access, use op_dim_order directly
             if is_value_tensor and has_indirect_access:
-                # For value tensors in indirect access, use op_dim_order directly
                 dim_order = list(op_dim_order)
                 stick_dim = op_dim_order[0] if op_dim_order else None
             else:
@@ -390,7 +374,7 @@ def _create_sdsc_tensors(
         stride_dim_order = [
             d for d in dim_order if d not in reduced_dims
         ] + reduced_dims
-        # For indirect access operations, all scales should be 1 (no reduction)
+        # For indirect access: all scales should be 1 (no reduction)
         is_value_or_index_tensor = (
             i in index_args or
             i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]
@@ -399,8 +383,7 @@ def _create_sdsc_tensors(
         for dim in dim_order:
             stride_idx = stride_dim_order.index(dim)
             if is_value_or_index_tensor:
-                # For indirect access tensors (value and index), all dimensions have scale=1
-                scales[dim] = 1
+                scales[dim] = 1  # No reduction for indirect access tensors
             elif dim in reduced_dims and op_spec.op != "layernormscale":
                 scales[dim] = -2 if (stick_dim is None and dim is op_stick_dim) else -1
             elif dim in reduced_dims and op_spec.op == "layernormscale":
@@ -430,14 +413,13 @@ def _create_sdsc_tensors(
                 backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] / dev_dim_size * it_dim_size
 
-            # Set max_dim_sizes based on tensor type and indirect access requirements.
+            # Set max_dim_sizes for indirect access
             is_value_tensor_for_indirect = (
                 i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]
             )
 
             if is_value_tensor_for_indirect:
-                # For value tensors in indirect access:
-                # - Stick dimension ("out"): -1 (dynamic, can access any element in the stick)
+                # Value tensors: stick dimension is -1 (dynamic access)
                 # - Non-stick dimensions ("mb"): actual size (number of rows that can be accessed)
                 logger.debug(f"Tensor {i} (value), checking dim={dim}, stick_dim={stick_dim}, dim==stick_dim={dim==stick_dim}")
                 if dim == stick_dim:
@@ -467,10 +449,10 @@ def _create_sdsc_tensors(
                     "stick_size": arg.device_dtype.elems_per_stick(),
                 }
         else:
-            # For indirect access operations, both value tensor and output tensor should use OUTPUT layout
+            # For indirect access: value and output tensors use OUTPUT layout
             if has_indirect_access and (is_value_tensor or i == len(op_spec.args) - 1):
                 label = "OUTPUT"
-                logger.debug(f"Tensor {i}: Assigned OUTPUT layout (indirect access value/output tensor)")
+                logger.debug(f"Tensor {i}: OUTPUT layout (indirect access)")
                 if "OUTPUT" not in layouts:
                     layouts["OUTPUT"] = {
                         "dim_order": dim_order,
@@ -619,15 +601,9 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     elif op_spec.is_reduction or op_spec.op == "overwrite":
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
     else:
-        # For indirect access operations, we need to pad based on ALL tensors
-        # (including index tensors), not just the output tensor
+        # For indirect access: pad based on ALL tensors (including index tensors)
         has_index_tensors = any(arg.is_index_tensor for arg in op_spec.args)
-        if has_index_tensors:
-            # Include all tensors for padding calculation
-            pad_args, pad_sdsc_args = list(op_spec.args), args
-        else:
-            # Normal case: only pad based on output tensor
-            pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
+        pad_args, pad_sdsc_args = (list(op_spec.args), args) if has_index_tensors else ([op_spec.args[-1]], [args[-1]])
     padding = _get_padded_iteration_space(
         pad_args, pad_sdsc_args, sdsc_iteration_space, layouts
     )
@@ -638,11 +614,8 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
 
     num_inputs = len(args[:-1]) if is_matmul or not op_spec.is_reduction else len(args)
 
-    # Collect indices of index tensors for indirect access
-    indirect_access_indices = [
-        i for i, arg in enumerate(op_spec.args)
-        if arg.is_index_tensor
-    ]
+    # Collect index tensor indices for indirect access
+    indirect_access_indices = [i for i, arg in enumerate(op_spec.args) if arg.is_index_tensor]
 
     return SDSCSpec(
         opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),

@@ -88,22 +88,18 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     if not size_syms:
         return index
     
-    # Try to concretize each symbol. If any symbol cannot be converted to a hint
-    # (e.g., it's a loaded value in an indirect access pattern), skip concretization
+    # Try to concretize each symbol. Skip if any cannot be converted (e.g., loaded values)
     subs = {}
     for s in size_syms:
         try:
             hint = V.graph.sizevars.size_hint(s)
-            # Verify the hint is actually concrete (not symbolic)
             if isinstance(hint, (int, sympy.Integer)):
                 subs[s] = hint
             else:
-                # If size_hint returns a symbolic expression, this might be an
-                # indirect access pattern - return the original index unchanged
+                # Symbolic expression - likely indirect access pattern
                 return index
         except (TypeError, ValueError):
-            # Cannot concretize this symbol (e.g., it's a loaded value)
-            # Return the original index unchanged for indirect access patterns
+            # Cannot concretize - likely indirect access pattern
             return index
     
     result = index.subs(subs)
