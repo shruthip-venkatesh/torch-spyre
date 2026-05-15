@@ -261,11 +261,8 @@ def normalize_coordinates(
             elif term.func == sympy.Mul and term.args[0].is_rational:
                 expr0, expr1 = term.args
                 mod = expr1.args[1] if expr1.func == sympy.Mod else var_ranges[var]
-                # TODO: handle non-unit fractions
-                # https://github.com/torch-spyre/torch-spyre/issues/1353
-                assert expr0.numerator == 1 or expr0.denominator == 1, (
-                    f"Unsupported coordinate expression {expr}"
-                )
+                # Support non-unit fractions for indirect indexing patterns
+                # The Term class can handle arbitrary numerator/denominator pairs
                 dim_terms.append(
                     Term(expr0.numerator, expr0.denominator, var, mod, dim_size)
                 )

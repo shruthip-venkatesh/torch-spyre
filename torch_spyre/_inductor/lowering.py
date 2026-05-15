@@ -617,19 +617,26 @@ def lower_indirect_add(input_a, index_a, input_b, index_b):
 def lower_indirect_gather(input, addresses):
     fn = lowering.ops_wrapper(torch.ops.spyre.indirect_gather.__name__)
 
-    def inner_fn(index):
+    def inner_fn(index): #=> 2D
         return fn(
-            input.make_loader()(index),     #=> 2 D
-            addresses.make_loader()(index), #=> 1 D
+            input.make_loader()(index),     #=> 3 D
+            addresses.make_loader()(index), #=> 2 D
         )
 
     pw = Pointwise.create(
         device=input.get_device(),
         dtype=torch.float16,
         inner_fn=inner_fn,
-        ranges=addresses.get_size(),
+        ranges=addresses.get_size(), # => 2D
         origin_node=input.get_origin_node(),
         traceback=input.get_traceback(),
     )
     pw.realize()
     return pw
+
+## INPUT => 2D => 3D
+## INDEX => 2D => 3D extra dim => Removing extra dim in codegen
+# => Create a new IR node for our Indirect ops => Validate
+# => Look into PyTorch op and explore (ops.indirect_index => 2d vs 3d)
+# => Idea of Store is important
+# => 

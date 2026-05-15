@@ -80,11 +80,32 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     is also zeroed.  This function replaces size symbols with their concrete
     hints so that coordinate expressions are structurally identical to static-shape
     compilation while loop variable symbols are preserved.
+    
+    For indirect access patterns (where the index contains loaded values that
+    cannot be concretized), we skip concretization and return the index as-is.
     """
     size_syms = index.free_symbols - loop_vars
     if not size_syms:
         return index
-    subs = {s: V.graph.sizevars.size_hint(s) for s in size_syms}
+    
+    # Try to concretize each symbol. If any symbol cannot be converted to a hint
+    # (e.g., it's a loaded value in an indirect access pattern), skip concretization
+    subs = {}
+    for s in size_syms:
+        try:
+            hint = V.graph.sizevars.size_hint(s)
+            # Verify the hint is actually concrete (not symbolic)
+            if isinstance(hint, (int, sympy.Integer)):
+                subs[s] = hint
+            else:
+                # If size_hint returns a symbolic expression, this might be an
+                # indirect access pattern - return the original index unchanged
+                return index
+        except (TypeError, ValueError):
+            # Cannot concretize this symbol (e.g., it's a loaded value)
+            # Return the original index unchanged for indirect access patterns
+            return index
+    
     result = index.subs(subs)
     return result
 

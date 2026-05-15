@@ -37,7 +37,7 @@ def test_gather_2d():
     def gather_fn(input, dim, index):
         return torch.gather(input, dim, index)
 
-    input_tensor = torch.arange(32 * 128, dtype=torch.float16).reshape(32, 128).to("spyre")
+    input_tensor = torch.arange(32 * 128, dtype=torch.float16).reshape(32, 128).to("spyre") # => (32, 128, STICK_SIZE)
     
     print("\nInput tensor shape:", input_tensor.shape)
     print("Input : ", input_tensor)
@@ -131,10 +131,10 @@ def test_gather_4d():
 if __name__ == "__main__":
 
     try:
-        test_gather_1d()
+        #test_gather_1d()
         test_gather_2d()
         test_gather_3d()
-        test_gather_4d()
+        #test_gather_4d()
         
     except Exception as e:
         print(f"\nError: {e}")

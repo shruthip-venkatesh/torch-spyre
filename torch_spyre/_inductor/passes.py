@@ -44,6 +44,7 @@ from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
+from .detect_indirect_access import detect_indirect_access
 
 
 logger = get_inductor_logger("passes")
@@ -220,6 +221,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
+        detect_indirect_access(operations)
         propagate_spyre_tensor_layouts(operations)
         insert_restickify(operations)
         core_division_planning(operations)
@@ -232,6 +234,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
     def uuid(self) -> Optional[Any]:
         files = [
             inspect.getfile(deadcode_elimination),
+            inspect.getfile(detect_indirect_access),
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(insert_restickify),
             inspect.getfile(core_division_planning),

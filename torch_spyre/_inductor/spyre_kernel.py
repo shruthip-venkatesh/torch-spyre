@@ -323,6 +323,33 @@ class SpyreKernelOpsHandler(DefaultHandler):
         self.kernel.num_load += 1
         return self.kernel.load(name, index)
 
+    def indirect_indexing(
+        self, index_var, size: int, check: bool = True, wrap_neg: bool = True
+    ) -> sympy.Symbol:
+        """
+        Handle indirect indexing operations created by PyTorch's inductor.
+        
+        This is called when inductor detects an indirect access pattern like:
+            tmp0 = ops.load(index_tensor, i)
+            result = ops.load(data_tensor, tmp0)
+        
+        Args:
+            index_var: The loaded index value (TensorAccess or sympy expression)
+            size: The size of the dimension being indexed
+            check: Whether to check bounds
+            wrap_neg: Whether to wrap negative indices
+        
+        Returns a sympy symbol representing the indirect index. For TensorAccess
+        objects, we extract the underlying index expression.
+        """
+        # If index_var is a TensorAccess, extract its index expression
+        if isinstance(index_var, TensorAccess):
+            # Create a unique symbol to represent this indirect index
+            # The actual value will be loaded at runtime
+            return index_var.index
+        # Otherwise, return as-is (it's already a sympy expression)
+        return index_var
+
     def store(
         self, name: str, index: sympy.Expr, value: RValue, mode: StoreMode = None
     ) -> None:
@@ -619,6 +646,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     for pair in value.op_info["index_value_pairs"]:
                         index_to_value_map[pair["index_arg"]] = pair["value_arg"]
 
+                # For indirect access operations, we need to ensure args are in the correct order:
+                # [value_tensor, index_tensor, output_tensor]
+                # The index_value_pairs tells us the mapping
+                temp_args = []
                 for arg_idx, input in enumerate(value.arguments):
                     # Handle string buffer names (for indirect operations)
                     if isinstance(input, str):
@@ -635,9 +666,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(f"Creating TensorArg from buffer name via load: arg_idx={arg_idx}, name={input}, is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}")
                         
-                        args.append(self.create_tensor_arg(True, input, tensor_access,
+                        temp_args.append((arg_idx, self.create_tensor_arg(True, input, tensor_access,
                                                           is_index_tensor=is_index_tensor,
-                                                          related_value_tensor_idx=related_value_idx))
+                                                          related_value_tensor_idx=related_value_idx)))
                         continue
                     
                     # Unwrap nested PointwiseOp (e.g., to_dtype) to get the underlying TensorAccess
@@ -659,12 +690,21 @@ class SpyreKernel(Kernel[CSEVariable]):
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(f"Creating TensorArg: arg_idx={arg_idx}, name={unwrapped_input.name}, is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}")
 
-                        args.append(self.create_tensor_arg(True, unwrapped_input.name, unwrapped_input,
+                        temp_args.append((arg_idx, self.create_tensor_arg(True, unwrapped_input.name, unwrapped_input,
                                                           is_index_tensor=is_index_tensor,
-                                                          related_value_tensor_idx=related_value_idx))
+                                                          related_value_tensor_idx=related_value_idx)))
                     else:
                         raise Unsupported(f"unexpected argument {input} to {value.op}")
 
+                # For indirect access, reorder args so value tensor comes before index tensor
+                # Expected order: [value_tensor(0), index_tensor(1), output(2)]
+                if index_args and index_to_value_map:
+                    # Sort temp_args: value tensors first, then index tensors
+                    temp_args.sort(key=lambda x: (x[0] in index_args, x[0]))
+                    args.extend([arg for _, arg in temp_args])
+                else:
+                    args.extend([arg for _, arg in temp_args])
+                
                 args.append(self.create_tensor_arg(False, real_dst_name, dst))
                 op_info.update(value.op_info)
                 op_name = op_info.pop("op", value.op)
