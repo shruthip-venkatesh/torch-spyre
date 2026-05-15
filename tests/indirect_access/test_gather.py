@@ -3,13 +3,11 @@ import torch
 def test_gather_1d():
 
     print("\n" + "=" * 70)
-    print("1D Output Tensor Tests for Indirect Gather")
+    print("1D Output Tensor Tests for Upstream Gather")
     print("=" * 70)
 
     def gather_fn(input, dim, index):
-        result_2d = torch.gather(input, dim, index)
-        # Squeeze back to 1D for output
-        return result_2d.squeeze(-1)
+        return torch.gather(input, dim, index)
 
     input_tensor = torch.randn(64 , dtype=torch.float16)
     input_tensor = torch.nn.functional.pad(input_tensor.reshape(64,1), (0, 63), value=0).to("spyre")
@@ -17,7 +15,7 @@ def test_gather_1d():
     
     index_tensor = torch.tensor([0, 10, 20, 30], dtype=torch.int64)
     index_tensor = torch.nn.functional.pad(index_tensor.reshape(4,1), (0, 31), value=0).to("spyre")
-    print("Index Tensor Shape:", index_tensor.shape)  # Should be torch.Size([4])
+    print("Index Tensor Shape:", index_tensor.shape)
 
     compiled_fn = torch.compile(gather_fn)
     result = compiled_fn(input_tensor, 0, index_tensor)
@@ -31,7 +29,7 @@ def test_gather_1d():
 def test_gather_2d():
 
     print("\n" + "=" * 70)
-    print("2D Output Tensor Tests for Indirect Gather")
+    print("2D Output Tensor Tests for Upstream Gather")
     print("=" * 70)
 
     def gather_fn(input, dim, index):
@@ -61,7 +59,7 @@ def test_gather_2d():
 def test_gather_3d():
 
     print("\n" + "=" * 70)
-    print("3D Output Tensor Tests for Indirect Gather")
+    print("3D Output Tensor Tests for Upstream Gather")
     print("=" * 70)
 
     def gather_fn(input, dim, index):
@@ -92,7 +90,7 @@ def test_gather_3d():
 def test_gather_4d():
 
     print("\n" + "=" * 70)
-    print("4D Output Tensor Tests for Indirect Gather")
+    print("4D Output Tensor Tests for Upstream Gather")
     print("=" * 70)
 
     def gather_fn(input, dim, index):
@@ -128,6 +126,73 @@ def test_gather_4d():
     print("Result: ", result)
 
 
+def test_gather_indirect_1d():
+
+    print("\n" + "=" * 70)
+    print("1D Output Tensor Tests for Indirect Gather")
+    print("=" * 70)
+
+    def gather_fn(input, dim, index):
+        return torch.ops.spyre.indirect_gather(input, index)
+
+    input_tensor = torch.randn(64 , dtype=torch.float16)
+    print("Input Tensor :", input_tensor)
+    input_tensor = torch.nn.functional.pad(input_tensor.reshape(64,1), (0, 63), value=0).to("spyre")
+    print("Input Tensor Shape:", input_tensor.shape)
+    
+    index_tensor = torch.tensor([20, 11, 50, 37], dtype=torch.int64)
+    index_tensor = torch.nn.functional.pad(index_tensor.reshape(4,1), (0, 31), value=0).to("spyre")
+    print("Index Tensor Shape:", index_tensor.shape)
+
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_tensor, 0, index_tensor)
+    
+    print("Result Shape:", result.shape)
+    print("Result:", result.cpu()[:,0])
+    
+    return result
+
+
+def test_gather_indirect_2d():
+
+    print("\n" + "=" * 70)
+    print("2D Output Tensor Tests for Indirect Gather")
+    print("=" * 70)
+
+    def gather_fn(input, dim, index):
+        return torch.ops.spyre.indirect_gather(input, index)
+
+    vocab_size = 64
+    embed_dim = 16  # real embedding dimension
+
+    # 2D input: (vocab_size, embed_dim) — e.g. an embedding table
+    input_tensor = torch.randn(vocab_size, embed_dim, dtype=torch.float16)
+    torch.set_printoptions(threshold=torch.inf)
+    print("Input Tensor:", input_tensor)
+    torch.set_printoptions(threshold=1000)
+
+    # Pad last dim to next power of 2 >= embed_dim (here: 16 → 16, adjust as needed)
+    pad_embed_to = 64  # match spyre's last-dim requirement
+    input_tensor = torch.nn.functional.pad(
+        input_tensor, (0, pad_embed_to - embed_dim), value=0
+    ).to("spyre")
+    print("Input Tensor Shape:", input_tensor.shape)  # (64, 64)
+
+    # Index: gather 4 rows from the vocab
+    index_tensor = torch.tensor([20, 11, 50, 37], dtype=torch.int64)
+    index_tensor = torch.nn.functional.pad(
+        index_tensor.reshape(4, 1), (0, 31), value=0
+    ).to("spyre")
+    print("Index Tensor Shape:", index_tensor.shape)  # (4, 32)
+
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_tensor, 0, index_tensor)
+
+    print("Result Shape:", result.shape)
+    print("Result:", result)
+
+    return result
+
 if __name__ == "__main__":
 
     try:
@@ -135,6 +200,8 @@ if __name__ == "__main__":
         test_gather_2d()
         test_gather_3d()
         test_gather_4d()
+        test_gather_indirect_1d()
+        test_gather_indirect_2d()
         
     except Exception as e:
         print(f"\nError: {e}")
