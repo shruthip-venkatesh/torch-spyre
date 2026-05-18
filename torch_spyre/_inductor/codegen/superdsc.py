@@ -461,10 +461,21 @@ def _create_sdsc_tensors(
                     "stick_size": arg.device_dtype.elems_per_stick(),
                 }
         else:
-            # For indirect access: value and output tensors use OUTPUT layout
-            if has_indirect_access and (is_value_tensor or i == len(op_spec.args) - 1):
+            # For indirect access: separate layouts for value and output tensors
+            if has_indirect_access and is_value_tensor:
+                # Value tensor gets its own INPUT layout to represent [IN, OUT] structure
+                label = "INPUT"
+                logger.debug(f"Tensor {i}: INPUT layout (value tensor for indirect access)")
+                if "INPUT" not in layouts:
+                    layouts["INPUT"] = {
+                        "dim_order": dim_order,
+                        "stick_dim_order": effective_stick,
+                        "stick_size": arg.device_dtype.elems_per_stick(),
+                    }
+            elif has_indirect_access and i == len(op_spec.args) - 1:
+                # Output tensor gets OUTPUT layout to represent [MB, OUT] structure
                 label = "OUTPUT"
-                logger.debug(f"Tensor {i}: OUTPUT layout (indirect access)")
+                logger.debug(f"Tensor {i}: OUTPUT layout (output tensor for indirect access)")
                 if "OUTPUT" not in layouts:
                     layouts["OUTPUT"] = {
                         "dim_order": dim_order,

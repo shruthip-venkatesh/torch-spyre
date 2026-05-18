@@ -126,6 +126,34 @@ def test_gather_4d():
     print("Result: ", result)
 
 
+# def test_gather_indirect_1d():
+
+#     print("\n" + "=" * 70)
+#     print("1D Output Tensor Tests for Indirect Gather")
+#     print("=" * 70)
+
+#     def gather_fn(input, dim, index):
+#         return torch.ops.spyre.indirect_gather(input, index)
+
+#     input_tensor = torch.randn(64 , dtype=torch.float16)
+#     print("Input Tensor :", input_tensor)
+#     input_tensor = torch.nn.functional.pad(input_tensor.reshape(64,1), (0, 63), value=0).to("spyre")
+#     #print("Input Tensor :", input_tensor)
+#     print("Input Tensor Shape:", input_tensor.shape)
+    
+#     index_tensor = torch.tensor([20, 11, 50, 37], dtype=torch.int64)
+#     index_tensor = torch.nn.functional.pad(index_tensor.reshape(4,1), (0, 31), value=0).to("spyre")
+#     print("Index Tensor:", index_tensor)
+#     print("Index Tensor Shape:", index_tensor.shape)
+
+#     compiled_fn = torch.compile(gather_fn)
+#     result = compiled_fn(input_tensor, 0, index_tensor)
+    
+#     print("Result Shape:", result.shape)
+#     print("Result:", result.cpu()[:,0])
+    
+#     return result
+
 def test_gather_indirect_1d():
 
     print("\n" + "=" * 70)
@@ -135,13 +163,16 @@ def test_gather_indirect_1d():
     def gather_fn(input, dim, index):
         return torch.ops.spyre.indirect_gather(input, index)
 
-    input_tensor = torch.randn(64 , dtype=torch.float16)
+    input_tensor = torch.randn(10 , dtype=torch.float16)
     print("Input Tensor :", input_tensor)
-    input_tensor = torch.nn.functional.pad(input_tensor.reshape(64,1), (0, 63), value=0).to("spyre")
+    input_tensor = torch.nn.functional.pad(input_tensor.reshape(10,1), (0, 63), value=0).to("spyre")
+    #print("Input Tensor :", input_tensor)
     print("Input Tensor Shape:", input_tensor.shape)
     
-    index_tensor = torch.tensor([20, 11, 50, 37], dtype=torch.int64)
-    index_tensor = torch.nn.functional.pad(index_tensor.reshape(4,1), (0, 31), value=0).to("spyre")
+    #index_tensor = torch.tensor([[0,5,2,1],[0,5,2,1],[0,5,2,1],[0,5,2,1]], dtype=torch.int64).to("spyre")
+    index_tensor = torch.tensor([[0,5,2,1],[0,0,0,0],[0,0,0,0],[0,0,0,0]], dtype=torch.int64).to("spyre")
+    #index_tensor = torch.nn.functional.pad(index_tensor.reshape(4,1), (0, 31), value=0).to("spyre")
+    print("Index Tensor:", index_tensor)
     print("Index Tensor Shape:", index_tensor.shape)
 
     compiled_fn = torch.compile(gather_fn)
@@ -151,7 +182,6 @@ def test_gather_indirect_1d():
     print("Result:", result.cpu()[:,0])
     
     return result
-
 
 def test_gather_indirect_2d():
 
@@ -196,12 +226,12 @@ def test_gather_indirect_2d():
 if __name__ == "__main__":
 
     try:
-        test_gather_1d()
-        test_gather_2d()
-        test_gather_3d()
-        test_gather_4d()
+        # test_gather_1d()
+        # test_gather_2d()
+        # test_gather_3d()
+        # test_gather_4d()
         test_gather_indirect_1d()
-        test_gather_indirect_2d()
+        # test_gather_indirect_2d()
         
     except Exception as e:
         print(f"\nError: {e}")
