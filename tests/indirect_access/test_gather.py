@@ -162,8 +162,9 @@ def test_gather_indirect_1d():
     result = compiled_fn(input_tensor, 0, index_tensor)
     
     print("Result Shape:", result.shape)
+    print("Result Spyre:", result)
     result_cpu = result.cpu()[:,0]
-    print("Result:", result_cpu)
+    print("Result CPU :", result_cpu)
     
     # Assert the result matches expected values
     assert torch.allclose(result_cpu, expected, rtol=1e-3, atol=1e-3), \
@@ -218,6 +219,7 @@ def test_gather_indirect_2d():
     result_cpu = result.cpu()
 
     print("Result Shape:", result.shape)
+    print("Result Spyre:", result)
     print("Result (CPU):", result_cpu)
     
     # Assert the result matches expected values
