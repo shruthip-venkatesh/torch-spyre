@@ -86,13 +86,28 @@ def _find_indirect_pattern(reads) -> tuple[int | None, int | None]:
 
 def _mark_indirect_access(op, reads, index_tensor_pos: int, value_tensor_pos: int) -> None:
     """Mark operation with indirect access metadata."""
-    tensor_names = [read.name for read in reads if isinstance(read, MemoryDep)]
+    all_tensor_names = [read.name for read in reads if isinstance(read, MemoryDep)]
+    
+    # Reorder tensor_names to match custom op: [value, index, ...]
+    # This ensures the OpSpec args are in the correct order
+    value_name = all_tensor_names[value_tensor_pos]
+    index_name = all_tensor_names[index_tensor_pos]
+    
+    tensor_names = [value_name, index_name]
+    # Add any remaining tensors
+    for name in all_tensor_names:
+        if name not in tensor_names:
+            tensor_names.append(name)
+    
+    # Update positions based on new ordering
+    new_value_pos = 0  # Value is now first
+    new_index_pos = 1  # Index is now second
     
     op_info = {
         "op": "identity",
-        "index_args": [index_tensor_pos],
+        "index_args": [new_index_pos],
         "index_value_pairs": [
-            {"index_arg": index_tensor_pos, "value_arg": value_tensor_pos}
+            {"index_arg": new_index_pos, "value_arg": new_value_pos}
         ],
         "tensor_names": tensor_names
     }
@@ -105,5 +120,6 @@ def _mark_indirect_access(op, reads, index_tensor_pos: int, value_tensor_pos: in
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             f"Detected indirect access in {op.get_name()}: "
-            f"index_pos={index_tensor_pos}, value_pos={value_tensor_pos}"
+            f"tensor_names={tensor_names} (reordered: value first, index second), "
+            f"index_arg={new_index_pos}, value_arg={new_value_pos}"
         )
