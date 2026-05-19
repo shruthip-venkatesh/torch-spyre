@@ -724,3 +724,25 @@ def lower_empty(size, device, dtype=None):
     return ir.TensorBox.create(
         SpyreEmptyFallback(op_overload, list(size), device, dtype)
     )
+
+
+@register_spyre_lowering(torch.ops.spyre.indirect_gather)
+def lower_indirect_gather(input, addresses):
+    fn = lowering.ops_wrapper(torch.ops.spyre.indirect_gather.__name__)
+
+    def inner_fn(index):
+        return fn(
+            input.make_loader()(index),
+            addresses.make_loader()(index),
+        )
+
+    pw = Pointwise.create(
+        device=input.get_device(),
+        dtype=torch.float16,
+        inner_fn=inner_fn,
+        ranges=addresses.get_size(),
+        origin_node=input.get_origin_node(),
+        traceback=input.get_traceback(),
+    )
+    pw.realize()
+    return pw
