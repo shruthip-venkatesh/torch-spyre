@@ -467,3 +467,29 @@ def _constant(
     fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
 ) -> torch.types.Number:
     return fill_value
+
+
+@torch.library.custom_op("spyre::indirect_gather", mutates_args=(), device_types="spyre")
+def indirect_gather(
+    input: torch.Tensor,
+    dim: int,
+    addresses: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+@indirect_gather.register_fake
+def _(
+    input: torch.Tensor,
+    dim:int,
+    addresses: torch.Tensor,
+):
+    if input.dim() == 2:
+        # 2D input: [IN, OUT]
+        out_dim = input.shape[1]
+        output_shape = list(addresses.shape) + [out_dim]
+    else:
+        # For N-D input, gather along first dimension by default
+        # Output: addresses.shape + input.shape[1:]
+        output_shape = list(addresses.shape) + list(input.shape[1:])
+
+    return input.new_empty(addresses.shape)
