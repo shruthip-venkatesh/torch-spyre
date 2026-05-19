@@ -483,13 +483,4 @@ def _(
     dim:int,
     addresses: torch.Tensor,
 ):
-    if input.dim() == 2:
-        # 2D input: [IN, OUT]
-        out_dim = input.shape[1]
-        output_shape = list(addresses.shape) + [out_dim]
-    else:
-        # For N-D input, gather along first dimension by default
-        # Output: addresses.shape + input.shape[1:]
-        output_shape = list(addresses.shape) + list(input.shape[1:])
-
     return input.new_empty(addresses.shape)

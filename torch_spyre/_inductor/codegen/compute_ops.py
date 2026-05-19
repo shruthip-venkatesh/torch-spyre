@@ -303,6 +303,23 @@ def generate_sdsc(idx, sdsc_spec):
                                         "dim_order"
                                     ]
                                 ],
+                                "indirectAllocType_": (
+                                    "index_tensor" if tensor.is_index_tensor
+                                    else "value_tensor" if i in [t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor]
+                                    else "no_indirection"
+                                ),
+                                **(
+                                    {
+                                        "relatedIndirectAccessAlloc_": (
+                                            f"allocate-Tensor{tensor.related_value_tensor_idx}_hbm"
+                                            if tensor.is_index_tensor
+                                            else f"allocate-Tensor{next((j for j, t in enumerate(sdsc_spec.args) if t.is_index_tensor and t.related_value_tensor_idx == i), -1)}_hbm"
+                                        )
+                                    }
+                                    if (tensor.is_index_tensor and tensor.related_value_tensor_idx >= 0) or
+                                       (i in [t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor])
+                                    else {}
+                                ),
                                 "startAddressCoreCorelet_": {
                                     "dim_prop_func": [
                                         {"Map": {}},
@@ -387,7 +404,10 @@ def generate_sdsc(idx, sdsc_spec):
                                 ],
                                 "wordLength": num_bytes(tensor.data_format),
                                 "dataFormat_": tensor.data_format.name,
-                                "memOrg_": {
+                                "memOrg_": { "hbm": {"isPresent": 1} }
+                                if tensor.is_index_tensor
+                                else
+                                {
                                     "hbm": {"isPresent": 1},
                                     "lx": {"isPresent": 1},
                                 }
@@ -413,8 +433,19 @@ def generate_sdsc(idx, sdsc_spec):
                                 "inputLabeledDs": [
                                     f"Tensor{i}-idx{i}"
                                     for i in range(sdsc_spec.num_inputs)
+                                    if i not in sdsc_spec.indirect_access_indices
                                 ],
                                 "outputLabeledDs": [f"Tensor{out_idx}-idx{out_idx}"],
+                                **(
+                                    {
+                                        "indirectAccessIndexLabeledDs": [
+                                            f"Tensor{i}-idx{i}"
+                                            for i in sdsc_spec.indirect_access_indices
+                                        ]
+                                    }
+                                    if sdsc_spec.indirect_access_indices
+                                    else {}
+                                ),
                             }
                         ],
                     }

@@ -727,7 +727,7 @@ def lower_empty(size, device, dtype=None):
 
 
 @register_spyre_lowering(torch.ops.spyre.indirect_gather)
-def lower_indirect_gather(input, addresses):
+def lower_indirect_gather(input, dim, addresses):
     fn = lowering.ops_wrapper(torch.ops.spyre.indirect_gather.__name__)
 
     def inner_fn(index):
