@@ -9,19 +9,43 @@ def test_gather_1d():
     def gather_fn(input, dim, index):
         return torch.gather(input, dim, index)
 
-    input_tensor = torch.randn(10 , dtype=torch.float16)
-    input_tensor = torch.nn.functional.pad(input_tensor.reshape(10,1), (0, 63), value=0).to("spyre")
+    # Create input tensor and keep a CPU copy for validation
+    input_tensor_cpu = torch.randn(10, dtype=torch.float16)
+    print("Input Tensor :", input_tensor_cpu)
+    
+    # Prepare input for spyre device
+    input_tensor = torch.nn.functional.pad(input_tensor_cpu.reshape(10,1), (0, 63), value=0).to("spyre")
     print("Input Tensor Shape:", input_tensor.shape)
     
-    index_tensor = torch.tensor([5, 1, 2, 3], dtype=torch.int64)
-    index_tensor = torch.nn.functional.pad(index_tensor.reshape(4,1), (0, 31), value=0).to("spyre")
+    # Index tensor: gather indices [0, 5, 2, 1] from first row
+    gather_indices = [0, 5, 2, 1]
+    index_tensor = torch.tensor([gather_indices], dtype=torch.int64)
+    index_tensor = torch.nn.functional.pad(index_tensor, (0, 0, 0, 3), value=0).to("spyre")
+    print("Index Tensor:", index_tensor)
     print("Index Tensor Shape:", index_tensor.shape)
+
+    # Compute expected result on CPU
+    # The gather should select elements at indices [0, 5, 2, 1] from input_tensor_cpu
+    expected = torch.stack([
+        input_tensor_cpu[0],  # index 0
+        input_tensor_cpu[5],  # index 5
+        input_tensor_cpu[2],  # index 2
+        input_tensor_cpu[1]   # index 1
+    ])
+    print("Expected Result:", expected)
 
     compiled_fn = torch.compile(gather_fn)
     result = compiled_fn(input_tensor, 0, index_tensor)
     
     print("Result Shape:", result.shape)
-    print("Result:", result)
+    print("Result Spyre:", result)
+    result_cpu = result.cpu()[:,0]
+    print("Result CPU :", result_cpu)
+    
+    # Assert the result matches expected values
+    assert torch.allclose(result_cpu, expected, rtol=1e-3, atol=1e-3), \
+        f"Result mismatch!\nExpected: {expected}\nGot: {result_cpu}"
+    print("✓ Assertion passed: Result matches expected values")
     
     return result
 
