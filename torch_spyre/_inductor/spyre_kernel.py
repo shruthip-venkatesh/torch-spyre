@@ -937,20 +937,26 @@ class SpyreKernel(Kernel[CSEVariable]):
         pool_size = getattr(V.graph, "pool_size", 0)
         has_pool_allocations = pool_size > 0
 
-        # Check if any op_spec has indirect access
+        # Check if any op_spec has indirect access (index tensor present in args).
         has_indirect_access = any(
-            not isinstance(op_spec, UnimplementedOp) and
-            hasattr(op_spec, 'op_info') and
-            op_spec.op_info and
-            'index_args' in op_spec.op_info
+            not isinstance(op_spec, UnimplementedOp)
+            and any(a.is_index_tensor for a in op_spec.args)
             for op_spec in self.op_specs
         )
+        # Cache for call_kernel, which runs after codegen_kernel returns.
+        self._has_indirect_access = has_indirect_access
 
-        for name, tensor_arg in self.spyre_kernel_args:
-            tensor_arg.arg_index = actuals.index(name)
-            # Skip allocation assignment for indirect access operations
-            # because superdsc.py already assigns allocations based on tensor roles
-            if not has_indirect_access:
+        for i, (name, tensor_arg) in enumerate(self.spyre_kernel_args):
+            if has_indirect_access:
+                # For indirect-access kernels, spyre_kernel_args is already ordered
+                # [value_tensor, index_tensor, output] by the store() routing logic.
+                # Use this position as arg_index so the generated TensorArg and the
+                # .run() call agree on slot assignment.
+                # We must NOT use actuals.index(name) here because actuals reflects
+                # the inner_fn load order (index loaded first for gathers → inverted).
+                tensor_arg.arg_index = i
+            else:
+                tensor_arg.arg_index = actuals.index(name)
                 tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
                     tensor_arg.arg_index + 1
                     if has_pool_allocations
@@ -972,8 +978,16 @@ class SpyreKernel(Kernel[CSEVariable]):
         if getattr(V.graph, "pool_size", 0) > 0:
             call_args.append("_pool")
 
-        # Add remaining kernel arguments
-        call_args.extend(self.args.python_argdefs()[1])
+        if getattr(self, "_has_indirect_access", False):
+            # Emit arguments in spyre_kernel_args order: [value_tensor, index_tensor, output].
+            # This matches the arg_index assignment in codegen_kernel and ensures the runtime
+            # binds each tensor to the correct SDSC slot (slot 0 = value, slot 1 = index).
+            # Using self.args.python_argdefs()[1] (actuals) would be wrong here: actuals
+            # reflects the inner_fn load order, which for gather-style ops is inverted
+            # (index loaded first, value second).
+            call_args.extend(n for n, _ in self.spyre_kernel_args)
+        else:
+            call_args.extend(self.args.python_argdefs()[1])
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
@@ -1075,14 +1089,13 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
 
 def simplify_op_spec(op_spec):
     # Skip tensor alignment for indirect access operations to avoid adding extra dimensions
-    # that cause mismatches between tensor rank and iteration space dimensionality
-    is_indirect_access = (
-        op_spec.op_info and
-        'index_args' in op_spec.op_info
-    )
-    
+    # that cause mismatches between tensor rank and iteration space dimensionality.
+    # Use is_index_tensor on args (authoritative) rather than op_info['index_args']
+    # (which may be absent when the indirect path is driven by detect_indirect_access).
+    if isinstance(op_spec, UnimplementedOp):
+        return
+    is_indirect_access = any(a.is_index_tensor for a in op_spec.args)
     if is_indirect_access:
-        # For indirect access, keep tensors as-is without alignment
         logger.debug(f"Skipping align_tensors for indirect access operation: {op_spec.op}")
         return
     
