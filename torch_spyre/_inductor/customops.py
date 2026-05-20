@@ -467,3 +467,27 @@ def _constant(
     fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
 ) -> torch.types.Number:
     return fill_value
+
+@torch.library.custom_op("spyre::indices_to_address", mutates_args=(), device_types="spyre")
+def indices_to_address(
+    indices: torch.Tensor,
+    virtual_offset: int,
+    device_size: Sequence[int],
+    device_stride: Sequence[int],
+    element_size: int,
+) -> torch.Tensor:
+    import torch_spyre._C as _C
+    return _C.compute_addresses_from_indices(
+        indices, virtual_offset, list(device_size), list(device_stride), element_size
+    )
+
+@indices_to_address.register_fake
+def _(
+    indices: torch.Tensor,
+    virtual_offset: int,
+    device_size: Sequence[int],
+    device_stride: Sequence[int],
+    element_size: int,
+):
+    output_shape = indices.shape[:-1]
+    return torch.empty(output_shape, dtype=torch.float32, device=indices.device)
