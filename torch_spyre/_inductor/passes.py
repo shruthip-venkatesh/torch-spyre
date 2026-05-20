@@ -50,7 +50,7 @@ from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
-
+from .detect_indirect_access import detect_indirect_access
 
 logger = get_inductor_logger("passes")
 
@@ -225,6 +225,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
+        detect_indirect_access(operations)
         propagate_spyre_tensor_layouts(operations)
         optimize_restickify_locations(operations)
         finalize_layouts(operations)
@@ -246,6 +247,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         files = [
             inspect.getfile(deadcode_elimination),
             inspect.getfile(dedup_and_promote_constants),
+            inspect.getfile(detect_indirect_access),
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),

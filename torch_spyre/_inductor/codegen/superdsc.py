@@ -594,7 +594,7 @@ def _create_sdsc_tensors(
                 offsets=offsets,
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
-                start_address= addr if arg.is_index_tensor
+                start_address= addr if (arg.is_index_tensor or has_indirect_access)
                 else arg.allocation.get("pool")
                 if "pool" in arg.allocation
                 else arg.allocation.get("lx")
