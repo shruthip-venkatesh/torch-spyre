@@ -937,13 +937,25 @@ class SpyreKernel(Kernel[CSEVariable]):
         pool_size = getattr(V.graph, "pool_size", 0)
         has_pool_allocations = pool_size > 0
 
+        # Check if any op_spec has indirect access
+        has_indirect_access = any(
+            not isinstance(op_spec, UnimplementedOp) and
+            hasattr(op_spec, 'op_info') and
+            op_spec.op_info and
+            'index_args' in op_spec.op_info
+            for op_spec in self.op_specs
+        )
+
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
-            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
-                tensor_arg.arg_index + 1
-                if has_pool_allocations
-                else tensor_arg.arg_index
-            ]
+            # Skip allocation assignment for indirect access operations
+            # because superdsc.py already assigns allocations based on tensor roles
+            if not has_indirect_access:
+                tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
+                    tensor_arg.arg_index + 1
+                    if has_pool_allocations
+                    else tensor_arg.arg_index
+                ]
 
         buf = IndentedBuffer()
         buf.writeline("[")
