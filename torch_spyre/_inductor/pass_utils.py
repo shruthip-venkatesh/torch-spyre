@@ -105,6 +105,9 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     is also zeroed.  This function replaces size symbols with their concrete
     hints so that coordinate expressions are structurally identical to static-shape
     compilation while loop variable symbols are preserved.
+
+    For indirect access patterns (where the index contains loaded values that
+    cannot be concretized), we skip concretization and return the index as-is.
     """
     size_syms = index.free_symbols - loop_vars
     if not size_syms:

@@ -68,6 +68,7 @@ from .dedup_constants import dedup_and_promote_constants
 from .chunk_large_tensors import chunk_large_tensors
 from .coarse_tile import coarse_tile
 
+from .detect_indirect_access import detect_indirect_access
 
 logger = get_inductor_logger("passes")
 
@@ -258,6 +259,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
         deadcode_elimination(operations)
+        detect_indirect_access(operations)
 
         # Tensor Layout Assignment
         propagate_spyre_tensor_layouts(operations)
@@ -299,6 +301,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(deadcode_elimination),
             inspect.getfile(dedup_and_promote_constants),
             inspect.getfile(propagate_named_dims),
+            inspect.getfile(detect_indirect_access),
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),

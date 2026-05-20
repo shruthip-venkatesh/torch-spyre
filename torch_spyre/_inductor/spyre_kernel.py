@@ -70,12 +70,34 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
+    
+    def __hash__(self):
+        # Use id() for layout since FixedTiledLayout may not be hashable
+        return hash((self.name, self.index, id(self.layout)))
+    
+    def __eq__(self, other):
+        if not isinstance(other, TensorAccess):
+            return False
+        return self.name == other.name and self.index == other.index and self.layout is other.layout
+    
+    def _sympy_(self):
+        # Make TensorAccess sympifiable by returning a unique symbol
+        # This allows it to be used in sympy expressions
+        return sympy.Symbol(f"_indirect_{self.name}_{id(self)}")
 
 
 @dataclass
 class Constant(RValue):
     value: Union[bool, float, int]
     dtype: torch.dtype
+    
+    def __hash__(self):
+        return hash((self.value, self.dtype))
+    
+    def __eq__(self, other):
+        if not isinstance(other, Constant):
+            return False
+        return self.value == other.value and self.dtype == other.dtype
 
 
 @dataclass
@@ -83,6 +105,15 @@ class PointwiseOp(RValue):
     op: str
     arguments: list[RValue]
     op_info: dict[str, Any] = field(default_factory=dict)
+    
+    def __hash__(self):
+        # Use tuple of argument ids for hashability
+        return hash((self.op, tuple(id(arg) for arg in self.arguments), tuple(sorted(self.op_info.items()))))
+    
+    def __eq__(self, other):
+        if not isinstance(other, PointwiseOp):
+            return False
+        return self.op == other.op and self.arguments == other.arguments and self.op_info == other.op_info
 
 
 @dataclass
@@ -90,11 +121,32 @@ class ReductionOp(RValue):
     op: str
     arguments: list[RValue]
     op_info: dict[str, Any] = field(default_factory=dict)
+    
+    def __hash__(self):
+        # Use tuple of argument ids for hashability
+        return hash((self.op, tuple(id(arg) for arg in self.arguments), tuple(sorted(self.op_info.items()))))
+    
+    def __eq__(self, other):
+        if not isinstance(other, ReductionOp):
+            return False
+        return self.op == other.op and self.arguments == other.arguments and self.op_info == other.op_info
 
 
 @dataclass
 class UnimplementedOp(RValue):
     op: str
+    
+    def __hash__(self):
+        return hash(self.op)
+    
+    def __eq__(self, other):
+        if not isinstance(other, UnimplementedOp):
+            return False
+        return self.op == other.op
+    
+    def _sympy_(self):
+        # Make UnimplementedOp sympifiable by returning a unique symbol
+        return sympy.Symbol(f"_unimpl_{self.op}_{id(self)}")
 
 
 def _serialize_value(v):
@@ -508,6 +560,18 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+        
+        # Check if index contains any RValue objects (indirect access pattern)
+        # If so, don't try to sympify it - just use it as-is
+        if isinstance(index, RValue):
+            # This is an indirect access - the index is a loaded value
+            # Return a TensorAccess that will be handled specially in store()
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"kernel_load (indirect): {name}, index is RValue type {type(index).__name__}"
+                )
+            return TensorAccess(name, index, layout)
+        
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         if "lx" not in layout.allocation and "pool" not in layout.allocation:
             _ = self.args.input(name)
@@ -519,6 +583,33 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
 
         return TensorAccess(name, index, layout)
+
+    def indirect_indexing(
+        self, index_var, size: int, check: bool = True, wrap_neg: bool = True
+    ) -> sympy.Symbol:
+        """
+        Handle indirect indexing operations created by PyTorch's inductor.
+        
+        This is called when inductor detects an indirect access pattern like:
+            tmp0 = ops.load(index_tensor, i)
+            result = ops.load(data_tensor, tmp0)
+        
+        Args:
+            index_var: The loaded index value (TensorAccess or sympy expression)
+            size: The size of the dimension being indexed
+            check: Whether to check bounds
+            wrap_neg: Whether to wrap negative indices
+        
+        Returns a sympy symbol representing the indirect index. For TensorAccess
+        objects, we extract the underlying index expression.
+        """
+        # If index_var is a TensorAccess, extract its index expression
+        if isinstance(index_var, TensorAccess):
+            # Create a unique symbol to represent this indirect index
+            # The actual value will be loaded at runtime
+            return index_var.index
+        # Otherwise, return as-is (it's already a sympy expression)
+        return index_var
 
     def store(
         self,
@@ -561,6 +652,66 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if isinstance(value, UnimplementedOp):
             self.op_specs.append(value)
+        elif op_info and "index_args" in op_info and "tensor_names" in op_info:
+            # Handle indirect access operations where op_info specifies tensor names and index positions
+            args: list[TensorArg] = []
+            index_args = set(op_info.get("index_args", []))
+            index_to_value_map = {}
+            if "index_value_pairs" in op_info:
+                for pair in op_info["index_value_pairs"]:
+                    index_to_value_map[pair["index_arg"]] = pair["value_arg"]
+
+            # Use tensor_names from op_info (includes both value and index tensors)
+            tensor_names = op_info["tensor_names"]
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Indirect access op: tensor_names={tensor_names}, index_args={index_args}, op_info={op_info}")
+
+            for arg_idx, tensor_name in enumerate(tensor_names):
+                # For indirect access, create a generic index that maps iteration variables to tensor dimensions
+                buf = V.graph.get_buffer(tensor_name)
+                layout = buf.get_layout()
+                
+                # Create index using iteration space variables mapped to tensor dimensions
+                it_space_keys = list(iteration_space(self.current_node).keys())
+                
+                # For indirect access, map iteration variables directly to tensor dimensions
+                # The last dimension will be handled specially by compute_coordinates for stickification
+                if len(layout.size) > 0 and len(it_space_keys) >= len(layout.size):
+                    # Direct mapping: iteration_var[i] * stride[i]
+                    # This will produce floor/mod coordinates for the stick dimension
+                    tensor_index = sum(
+                        it_space_keys[i] * concretize_expr(layout.stride[i])
+                        for i in range(len(layout.size))
+                    )
+                elif len(layout.size) > 0 and len(it_space_keys) > 0:
+                    # Fewer iteration vars than tensor dims - map what we can
+                    # Use last iteration var for last (stick) dimension
+                    tensor_index = sum(
+                        it_space_keys[min(i, len(it_space_keys)-1)] * concretize_expr(layout.stride[i])
+                        for i in range(len(layout.size))
+                    )
+                else:
+                    tensor_index = sympy.Integer(0)
+                
+                tensor = self.load(tensor_name, tensor_index)
+                is_index_tensor = arg_idx in index_args
+                related_value_idx = index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
+
+                args.append(self.create_tensor_arg(
+                    True,
+                    tensor_name,
+                    tensor,
+                    is_index_tensor=is_index_tensor,
+                    related_value_tensor_idx=related_value_idx
+                ))
+
+            # Add output tensor
+            args.append(self.create_tensor_arg(False, real_dst_name, dst))
+
+            # Create the op spec - for indirect add, the operation is still "add"
+            op_name = op_info.get("op", "add")
+            self.op_specs.append(self.create_op_spec(op_name, False, args, op_info))
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
             args: list[TensorArg] = []
@@ -911,6 +1062,18 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
 
 
 def simplify_op_spec(op_spec):
+    # Skip tensor alignment for indirect access operations to avoid adding extra dimensions
+    # that cause mismatches between tensor rank and iteration space dimensionality
+    is_indirect_access = (
+        op_spec.op_info and
+        'index_args' in op_spec.op_info
+    )
+    
+    if is_indirect_access:
+        # For indirect access, keep tensors as-is without alignment
+        logger.debug(f"Skipping align_tensors for indirect access operation: {op_spec.op}")
+        return
+    
     new_op_space_splits, new_tensors = align_tensors(
         op_spec.iteration_space,
         [

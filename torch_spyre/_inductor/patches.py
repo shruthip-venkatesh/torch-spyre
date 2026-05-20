@@ -102,7 +102,19 @@ def enable_spyre_context(
 
     # Force all operations to be realized when LoopLevel IR is initially constructed
     old_loop = Loops.has_large_inner_fn
-    Loops.has_large_inner_fn = lambda self, threshold=None: True
+    def _spyre_has_large_inner_fn(self, threshold=None):
+        try:
+            for dep in self.get_reads():
+                idx = getattr(dep, "index", None)
+                if idx is None:
+                    continue
+                if any(s.name.startswith("tmp") for s in idx.free_symbols):
+                    return False
+        except Exception:
+            pass
+        return True
+
+    Loops.has_large_inner_fn = _spyre_has_large_inner_fn
 
     from torch._inductor.fx_passes import joint_graph
 
