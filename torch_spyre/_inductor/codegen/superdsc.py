@@ -31,6 +31,16 @@ from torch_spyre._inductor.constants import (
     SEGMENT_OFFSETS
 )
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor.indirect_access_utils import (
+    find_indirect_pair_by_index_arg,
+    get_active_indirect_dims,
+    get_index_related_positive_dims,
+    get_indirect_tensor_address,
+    get_relabeled_pair_metadata,
+    get_value_pair_metadata,
+    get_value_tensor_max_dim_size,
+    is_indirect_value_tensor,
+)
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import OpSpec
 from torch_spyre._inductor.op_spec import TensorArg
@@ -374,10 +384,20 @@ def _create_sdsc_tensors(
 
     # First pass: collect index tensor layouts for indirect access
     index_tensor_layouts = {}
+    index_active_dims: dict[int, set[Symbol]] = {}
     for i, arg in enumerate(op_spec.args):
         if i in index_args:
             all_dims = [symbol_mapping.get(k, k) for k in op_spec.iteration_space.keys()]
             logger.debug(f"Index tensor {i}: all_dims from iteration_space={all_dims}")
+
+            related_pair = find_indirect_pair_by_index_arg(op_spec, i)
+            related_metadata = get_relabeled_pair_metadata(related_pair, symbol_mapping)
+            active_dims = get_active_indirect_dims(
+                all_dims,
+                related_metadata["value_host_shape"],
+                related_metadata["index_host_shape"],
+            )
+            index_active_dims[i] = active_dims
 
             # Find value tensor to infer stick dimension
             value_tensor_idx = _find_value_tensor_idx(op_spec.args, index_args)
@@ -393,15 +413,18 @@ def _create_sdsc_tensors(
                     value_stick_dim = all_dims[-1] if all_dims else None
                     logger.debug(f"Inferred value_stick_dim={value_stick_dim}")
 
-                # Index tensor should have all dimensions EXCEPT the stick dimension
-                index_dim_order = [d for d in all_dims if d != value_stick_dim]
+                # Index tensor should only keep truly indirect dimensions.
+                index_dim_order = [d for d in all_dims if d in active_dims and d != value_stick_dim]
 
                 # The index tensor's stick dimension should be the innermost (last) dimension
-                # This ensures it's innermost in the chunk loop order as required by DeepTools
+                # of the reduced index layout, if any dims remain.
                 index_stick_dim = index_dim_order[-1] if index_dim_order else None
 
                 index_tensor_layouts[i] = (index_dim_order, index_stick_dim)
-                logger.debug(f"First pass: Tensor {i} (index), final dim_order={index_dim_order}, stick_dim={index_stick_dim}")
+                logger.debug(
+                    f"First pass: Tensor {i} (index), active_dims={sorted(map(str, active_dims))}, "
+                    f"final dim_order={index_dim_order}, stick_dim={index_stick_dim}"
+                )
             else:
                 logger.warning(f"First pass: Could not find value tensor for index tensor {i}")
                 index_tensor_layouts[i] = ([], None)
@@ -411,17 +434,14 @@ def _create_sdsc_tensors(
     # Second pass: create SDSC args with proper layout handling
     for i, arg in enumerate(op_spec.args):
         # For indirect access: assign addresses based on tensor role
-        if has_indirect_access and i in index_args:
-            addr = SEGMENT_OFFSETS[1]  # Index tensor
-        elif has_indirect_access and i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]:
-            addr = SEGMENT_OFFSETS[0]  # Value tensor
-        elif has_indirect_access and i == len(op_spec.args) - 1:
-            addr = SEGMENT_OFFSETS[2]  # Output tensor
-        else:
-            addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
+        addr = (
+            get_indirect_tensor_address(op_spec, index_args, i)
+            if has_indirect_access
+            else None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
+        )
 
         # Check if this is a value tensor for indirect access
-        is_value_tensor = i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]
+        is_value_tensor = is_indirect_value_tensor(op_spec, i)
 
         # For index tensors, use pre-computed layout from first pass
         if i in index_tensor_layouts:
@@ -433,7 +453,11 @@ def _create_sdsc_tensors(
                 stick_dim = op_dim_order[0] if op_dim_order else None
             else:
                 dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, reverse_for_indirect=False)
-        logger.debug(f"Tensor {i}: Initial dim_order={dim_order}, stick_dim={stick_dim}, device_size={arg.device_size}")
+        logger.debug(
+            f"Tensor {i}: Initial dim_order={dim_order}, stick_dim={stick_dim}, "
+            f"device_size={arg.device_size}, device_coords={arg.device_coordinates}, "
+            f"is_index_tensor={arg.is_index_tensor}, related_value_tensor_idx={arg.related_value_tensor_idx}"
+        )
 
         scales: dict = {}
         strides: dict = {}
@@ -491,25 +515,59 @@ def _create_sdsc_tensors(
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
             # Set max_dim_sizes for indirect access
-            is_value_tensor_for_indirect = (
-                i in [t.related_value_tensor_idx for t in op_spec.args if t.is_index_tensor]
+            is_value_tensor_for_indirect = is_indirect_value_tensor(op_spec, i)
+            indirect_pair, indirect_metadata = get_value_pair_metadata(
+                op_spec, i, symbol_mapping
+            )
+            indirect_value_host_shape = indirect_metadata["value_host_shape"]
+            indirect_value_host_stride = indirect_metadata["value_host_stride"]
+            indirect_index_host_shape = indirect_metadata["index_host_shape"]
+            indirect_index_host_stride = indirect_metadata["index_host_stride"]
+            related_value_positive_dims = get_index_related_positive_dims(
+                op_spec, i, symbol_mapping
             )
 
             if is_value_tensor_for_indirect:
-                # Value tensors: stick dimension is -1 (dynamic access)
-                # - Non-stick dimensions: use actual device dimension size
-                logger.debug(f"Tensor {i} (value), checking dim={dim}, stick_dim={stick_dim}, dim==stick_dim={dim==stick_dim}")
-                if dim == stick_dim:
-                    max_dim_sizes[dim] = -1
-                    logger.debug(f"Tensor {i} (value), dim={dim} (STICK): maxDimSize=-1, stride_idx={stride_idx}, original_dev_dim_size={original_dev_dim_size}")
-                else:
-                    # For non-stick dimensions, use the actual device dimension size
-                    # This represents the number of rows/batches in the value tensor
-                    max_dim_sizes[dim] = original_dev_dim_size
-                    logger.debug(f"Tensor {i} (value), dim={dim} (NON-STICK): maxDimSize={original_dev_dim_size}, stride_idx={stride_idx}, device_size={arg.device_size}")
+                # Value tensors: keep the truly indirect dimension dynamic (-1).
+                # If a value and index tensor host dimension match, that dimension is
+                # traversed directly rather than indirectly indexed, so use the host size.
+                max_dim_sizes[dim] = get_value_tensor_max_dim_size(
+                    i,
+                    dim,
+                    stick_dim,
+                    original_dev_dim_size,
+                    indirect_value_host_shape,
+                    indirect_index_host_shape,
+                )
+
+                logger.debug(
+                    f"Tensor {i} (value), dim={dim}: "
+                    f"maxDimSize={max_dim_sizes[dim]}, stride_idx={stride_idx}, "
+                    f"value_host_shape={indirect_value_host_shape}, "
+                    f"value_host_stride={indirect_value_host_stride}, "
+                    f"index_host_shape={indirect_index_host_shape}, "
+                    f"index_host_stride={indirect_index_host_stride}, "
+                    f"device_size={arg.device_size}, strides={strides}, offsets={offsets}, backGap={backGap}"
+                )
             else:
-                # For index tensors and output tensors, keep max_dim_sizes as -1 (dynamic)
-                max_dim_sizes[dim] = -1
+                # For index tensors, only preserve dims corresponding to positive maxDimSize
+                # decisions on the related value tensor; all others stay dynamic.
+                if i in index_args:
+                    dim_label = str(dim)
+                    if dim_label in related_value_positive_dims:
+                        max_dim_sizes[dim] = -1
+                    else:
+                        max_dim_sizes[dim] = 0
+                    logger.debug(
+                        f"Tensor {i} (index), dim={dim}: maxDimSize={max_dim_sizes[dim]}, "
+                        f"stride_idx={stride_idx}, dim_label={dim_label}, "
+                        f"related_value_positive_dims={sorted(related_value_positive_dims)}, "
+                        f"device_size={arg.device_size}, device_coords={arg.device_coordinates}, "
+                        f"op_info_pairs={op_spec.op_info.get('index_value_pairs')}"
+                    )
+                else:
+                    # Output tensors keep max_dim_sizes as -1 (dynamic)
+                    max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         # Check if this argument is an index tensor
