@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field    
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
 
@@ -47,6 +47,7 @@ from .pass_utils import (
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
+from .indirect_access_utils import enrich_indirect_index_value_pairs
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -614,7 +615,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.op_specs.append(value)
         elif op_info and "index_args" in op_info and "tensor_names" in op_info:
             # Handle indirect access operations where op_info specifies tensor names and index positions
-            args: list[TensorArg] = []
+            indirect_args: list[TensorArg] = []
             index_args = set(op_info.get("index_args", []))
             index_to_value_map = {}
             if "index_value_pairs" in op_info:
@@ -623,6 +624,8 @@ class SpyreKernel(Kernel[CSEVariable]):
 
             # Use tensor_names from op_info (includes both value and index tensors)
             tensor_names = op_info["tensor_names"]
+            dim_labels = [str(d) for d in iteration_space(self.current_node).keys()]
+            enrich_indirect_index_value_pairs(op_info, dim_labels)
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Indirect access op: tensor_names={tensor_names}, index_args={index_args}, op_info={op_info}")
@@ -658,7 +661,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 is_index_tensor = arg_idx in index_args
                 related_value_idx = index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
 
-                args.append(self.create_tensor_arg(
+                indirect_args.append(self.create_tensor_arg(
                     True,
                     tensor_name,
                     tensor,
@@ -667,11 +670,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                 ))
 
             # Add output tensor
-            args.append(self.create_tensor_arg(False, real_dst_name, dst))
+            indirect_args.append(self.create_tensor_arg(False, real_dst_name, dst))
 
             # Create the op spec - for indirect add, the operation is still "add"
             op_name = op_info.get("op", "add")
-            self.op_specs.append(self.create_op_spec(op_name, False, args, op_info))
+            self.op_specs.append(self.create_op_spec(op_name, False, indirect_args, op_info))
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
             args: list[TensorArg] = []
