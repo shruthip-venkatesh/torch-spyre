@@ -244,18 +244,6 @@ class SpyreOpFuncs:
         return PointwiseOp("greaterthan", [a, b])
 
     @staticmethod
-    def indirect_gather(input, addresses):
-        # index_args: positions of index tensors (address tensors)
-        # index_value_pairs: mapping of index tensor position to value tensor position
-        op_info = {
-            "index_args": [1],  # position of addresses tensor in args list
-            "index_value_pairs": [
-                {"index_arg": 1, "value_arg": 0},  # addresses (pos 1) accesses input (pos 0)
-            ]
-        }
-        return PointwiseOp("identity", [input, addresses], op_info)
-
-    @staticmethod
     def layernormnorm(*args):
         return PointwiseOp("layernormnorm", list(args))
 
@@ -776,7 +764,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 for arg_idx, input in enumerate(value.arguments):
                     # Handle string buffer names (for indirect operations)
                     if isinstance(input, str):
-                        # This is a buffer name passed directly (e.g., for indirect_gather)
+                        # This is a buffer name passed directly
                         # For indirect operations, the input buffer is referenced by name
                         # but we need to load it to get its layout information
                         # Use the load method to get a TensorAccess with proper layout
