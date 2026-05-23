@@ -344,6 +344,79 @@ def test_gather_paged_attention():
 
     return result
 
+def test_gather_paged_attention_small():
+    """
+    Test paged attention pattern: gather full page slices from 4D tensor
+    Shape: [NUM_PAGES, PAGE_SIZE, NUM_HEADS, HEAD_SIZE]
+    Index: Only for NUM_PAGES dimension
+    
+    SMALLER VERSION: Reduced dimensions for easier testing and debugging
+    """
+    print("\n" + "=" * 70)
+    print("Paged Attention Gather Test (Small)")
+    print("=" * 70)
+
+    def gather_fn(input, dim, index):
+        return torch.gather(input, dim, index)
+
+    # Paged attention dimensions - REDUCED for testing
+    NUM_PAGES = 8       # Total pages in cache (was 64)
+    PAGE_SIZE = 4       # Tokens per page (was 128)
+    NUM_HEADS = 2       # Attention heads (was 8)
+    HEAD_SIZE = 64      # Dimension per head (keep at 64 for stick alignment)
+
+    # 4D input: [NUM_PAGES, PAGE_SIZE, NUM_HEADS, HEAD_SIZE]
+    input_tensor_cpu = torch.randn(
+        NUM_PAGES, PAGE_SIZE, NUM_HEADS, HEAD_SIZE,
+        dtype=torch.float16
+    )
+    
+    # Pad HEAD_SIZE to stick size (64 is already aligned)
+    input_tensor = input_tensor_cpu.to("spyre")
+    print(f"Input Tensor Shape: {input_tensor.shape}")
+    print(f"Total elements: {input_tensor.numel():,}")
+
+    # Index tensor: select 2 pages (e.g., pages 1 and 5)
+    # Shape: [BATCH_SIZE] where BATCH_SIZE=2
+    page_indices = torch.tensor([1, 5], dtype=torch.int64)
+    
+    # CRITICAL: Index tensor should be 1D for page selection
+    # We're gathering along dim=0 (NUM_PAGES dimension)
+    # The index shape should match the output shape for non-gathered dims
+    # Output will be: [2, PAGE_SIZE, NUM_HEADS, HEAD_SIZE]
+    
+    # Expand index to match output dimensions (except gathered dim)
+    # index shape: [2, 1, 1, 1] -> broadcast to [2, PAGE_SIZE, NUM_HEADS, HEAD_SIZE]
+    index_tensor = page_indices.view(-1, 1, 1, 1).expand(
+        -1, PAGE_SIZE, NUM_HEADS, HEAD_SIZE
+    ).to("spyre")
+    
+    print(f"Index Tensor Shape: {index_tensor.shape}")
+    print(f"Page indices: {page_indices.tolist()}")
+
+    # Expected result: gather the 2 selected pages
+    expected = torch.stack([
+        input_tensor_cpu[1],  # page 1
+        input_tensor_cpu[5],  # page 5
+    ])
+    print(f"Expected Result Shape: {expected.shape}")  # [2, 4, 2, 64]
+    print(f"Expected Result : {expected}")
+
+    # Compile and run
+    compiled_fn = torch.compile(gather_fn)
+    result = compiled_fn(input_tensor, 0, index_tensor)  # dim=0 for NUM_PAGES
+    result_cpu = result.cpu()
+
+    print(f"Result Shape: {result.shape}")
+    print(f"Result : {result}")
+    
+    # Verify
+    assert torch.allclose(result_cpu, expected, rtol=1e-3, atol=1e-3), \
+        f"Result mismatch! Max diff: {torch.max(torch.abs(result_cpu - expected))}"
+    print("✓ Paged attention gather test passed!")
+
+    return result
+
 if __name__ == "__main__":
 
     try:
@@ -352,6 +425,7 @@ if __name__ == "__main__":
         # test_gather_3d() # Values are wrongly fetched
         # test_gather_4d() # Runtime error
         # test_gather_paged_attention() # SDSC JSON Compile error
+        # test_gather_paged_attention_small() # Values are wrongly fetched
         
     except Exception as e:
         print(f"\nError: {e}")
