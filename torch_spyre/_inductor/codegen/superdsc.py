@@ -473,6 +473,14 @@ def _create_sdsc_tensors(
                 stick_dim = op_dim_order[0] if op_dim_order else None
             else:
                 dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, reverse_for_indirect=False)
+                # For output tensors in indirect access (gather), reverse the non-stick dimensions
+                # to maintain correct dimension order from input tensor
+                if has_indirect_access and i == len(op_spec.args) - 1 and len(dim_order) > 2:
+                    # Reverse all dimensions except the stick dimension (last one)
+                    non_stick_dims = dim_order[:-1]
+                    non_stick_dims.reverse()
+                    dim_order = non_stick_dims + [dim_order[-1]]
+                    logger.debug(f"Tensor {i}: Reversed non-stick dims for indirect access output, new dim_order={dim_order}")
         logger.debug(
             f"Tensor {i}: Initial dim_order={dim_order}, stick_dim={stick_dim}, "
             f"device_size={arg.device_size}, device_coords={arg.device_coordinates}, "
@@ -564,6 +572,21 @@ def _create_sdsc_tensors(
                     indirect_value_host_shape,
                     indirect_index_host_shape,
                 )
+
+                # CRITICAL FIX: Zero out strides and offsets for non-indexed dimensions
+                # to prevent work tile coordinates from corrupting address calculations.
+                # Only dimensions that are actually indexed (active_indirect_dims) should
+                # contribute to the address. Work division dimensions (x, y) should not.
+                if i in index_active_dims:
+                    active_dims = index_active_dims[i]
+                    if dim not in active_dims and dim != stick_dim:
+                        # This dimension is for work division only, not indexing
+                        strides[dim] = 0
+                        offsets[dim] = 0
+                        logger.debug(
+                            f"Tensor {i} (value), dim={dim}: ZEROED stride/offset "
+                            f"(not in active_indirect_dims={sorted(map(str, active_dims))})"
+                        )
 
                 logger.debug(
                     f"Tensor {i} (value), dim={dim}: "

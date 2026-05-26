@@ -350,18 +350,19 @@ def generate_sdsc(idx, sdsc_spec):
                                         #  lx addr is baked into tensor.start_addr already
                                     },
                                 },
-                                **(
-                                    {
-                                        "backGapCore_": {
-                                            str(dim): {
-                                                "-1": str(gap)  # HBM is -1
-                                            }
-                                            for dim, gap in tensor.backGap.items()
-                                        }
-                                    }
-                                    if tensor.backGap
-                                    else {}
-                                ),
+                                # TODO : Enable it for all the cases. Commented here for indirect access
+                                # **(
+                                #     {
+                                #         "backGapCore_": {
+                                #             str(dim): {
+                                #                 "-1": str(gap)  # HBM is -1
+                                #             }
+                                #             for dim, gap in tensor.backGap.items()
+                                #         }
+                                #     }
+                                #     if tensor.backGap
+                                #     else {}
+                                # ),
                                 "coordinates_": {
                                     "coordInfo": {
                                         str(dim): gen_coord_info_value(
