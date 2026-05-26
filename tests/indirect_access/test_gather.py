@@ -360,21 +360,22 @@ def test_gather_paged_attention_small():
         return torch.gather(input, dim, index)
 
     # Paged attention dimensions - REDUCED for testing
-    NUM_PAGES = 8       # Total pages in cache (was 64)
-    PAGE_SIZE = 4       # Tokens per page (was 128)
-    NUM_HEADS = 2       # Attention heads (was 8)
-    HEAD_SIZE = 64      # Dimension per head (keep at 64 for stick alignment)
+    NUM_PAGES = 8       # Total pages in cache
+    PAGE_SIZE = 4       # Tokens per page
+    NUM_HEADS = 2       # Attention heads
+    HEAD_SIZE = 64      # Dimension per head
 
     # 4D input: [NUM_PAGES, PAGE_SIZE, NUM_HEADS, HEAD_SIZE]
     input_tensor_cpu = torch.randn(
         NUM_PAGES, PAGE_SIZE, NUM_HEADS, HEAD_SIZE,
         dtype=torch.float16
     )
-    
+
     # Pad HEAD_SIZE to stick size (64 is already aligned)
     input_tensor = input_tensor_cpu.to("spyre")
     print(f"Input Tensor Shape: {input_tensor.shape}")
     print(f"Total elements: {input_tensor.numel():,}")
+    # print(f"Input Tensor : {input_tensor}")
 
     # Index tensor: select 2 pages (e.g., pages 1 and 5)
     # Shape: [BATCH_SIZE] where BATCH_SIZE=2
@@ -386,13 +387,13 @@ def test_gather_paged_attention_small():
     # Output will be: [2, PAGE_SIZE, NUM_HEADS, HEAD_SIZE]
     
     # Expand index to match output dimensions (except gathered dim)
-    # index shape: [2, 1, 1, 1] -> broadcast to [2, PAGE_SIZE, NUM_HEADS, HEAD_SIZE]
-    index_tensor = page_indices.view(-1, 1, 1, 1).expand(
-        -1, PAGE_SIZE, NUM_HEADS, HEAD_SIZE
-    ).to("spyre")
+    index_tensor = torch.zeros(2, PAGE_SIZE, NUM_HEADS, HEAD_SIZE, dtype=torch.int64)
+    index_tensor[0, 0, 0, :len(page_indices)] = page_indices
+    index_tensor = index_tensor.to("spyre")
     
-    print(f"Index Tensor Shape: {index_tensor.shape}")
     print(f"Page indices: {page_indices.tolist()}")
+    print(f"Index Tensor Shape: {index_tensor.shape}")
+    # print(f"Index Tensor : {index_tensor}")
 
     # Expected result: gather the 2 selected pages
     expected = torch.stack([
@@ -422,10 +423,10 @@ if __name__ == "__main__":
     try:
         test_gather_1d()
         test_gather_2d()
+        test_gather_paged_attention_small()
         # test_gather_3d() # Values are wrongly fetched
         # test_gather_4d() # Runtime error
-        # test_gather_paged_attention() # SDSC JSON Compile error
-        # test_gather_paged_attention_small() # Values are wrongly fetched
+        # test_gather_paged_attention() # SDSC JSON Compile error due EAR overflow
         
     except Exception as e:
         print(f"\nError: {e}")
