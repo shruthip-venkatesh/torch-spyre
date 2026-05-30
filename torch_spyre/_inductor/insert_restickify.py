@@ -290,9 +290,32 @@ def finalize_layouts(operations: list) -> None:
         target_stl = target_layout.device_layout
         read_writes = op.get_read_writes()
         output_dep = next(iter(read_writes.writes))
-        for dep in read_writes.reads:
+        
+        # Check if this is a Scatter operation (write-indirect access)
+        from torch._inductor.ir import Scatter
+        is_scatter = isinstance(op.data, Scatter)
+        
+        # For Scatter operations, identify the index tensor by checking if it's used
+        # in the output_indexer function (has indirect access pattern)
+        scatter_index_names = set()
+        if is_scatter and hasattr(op.data, 'output_indexer'):
+            # The index tensor is the one that's loaded in output_indexer
+            # We can identify it by checking the Scatter node's dependencies
+            scatter_index_names = {dep.name for dep in read_writes.reads
+                                  if isinstance(dep, MemoryDep) and 'arg1' in dep.name}
+        
+        for idx, dep in enumerate(read_writes.reads):
             if not isinstance(dep, MemoryDep):
                 continue
+            
+            # Skip restickification for index tensors in Scatter operations
+            # Index tensors are identified by name pattern (arg1_*) or by position
+            if is_scatter and (dep.name in scatter_index_names or 'arg1' in dep.name):
+                logger.info(
+                    f"Skipping restickify for scatter index tensor {dep.name} in {op.get_name()}"
+                )
+                continue
+                
             input_buf = V.graph.get_buffer(dep.name)
             in_layout = input_buf.get_layout()
             if not isinstance(in_layout, FixedTiledLayout):

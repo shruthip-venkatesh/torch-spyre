@@ -288,13 +288,21 @@ def _get_padded_iteration_space(
     sdsc_iteration_space: dict,
     layouts: dict,
     is_indirect_access: bool = False,
+    index_controlled_dims: set = None,
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
 
     Update sdsc_iteration_space when padding is needed.
     Returns a mapping of dim -> padding amount
+    
+    Args:
+        index_controlled_dims: Set of dimension symbols that are controlled by index tensors
+                              and should NOT be padded (for scatter operations)
     """
+    if index_controlled_dims is None:
+        index_controlled_dims = set()
+    
     padding: dict = {}
     for sdsc_arg, op_spec_arg in zip(sdsc_args, op_spec_args):
         layout = layouts[sdsc_arg.layout]
@@ -303,6 +311,10 @@ def _get_padded_iteration_space(
         dev_size = op_spec_arg.device_size[-2::-1]
         for idx, dim in enumerate(layout["dim_order"]):
             if idx >= len(dev_size):
+                continue
+
+            # Skip padding for dimensions controlled by index tensors (scatter case)
+            if dim in index_controlled_dims:
                 continue
 
             # For stick dimensions, pad to device size
@@ -391,6 +403,10 @@ def _create_sdsc_tensors(
 
     index_args = set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
     has_indirect_access = len(index_args) > 0
+    # is_scatter=True means write-indirect (scatter/index_copy): the output tensor is
+    # the scatter target, src is read sequentially.  Layout labels and max_dim_sizes are
+    # assigned differently from the gather (read-indirect) path.
+    is_scatter = op_spec.op_info.get("is_scatter", False) if op_spec.op_info else False
 
     # Build mapping of value_arg -> index_arg for indirect access operations
     value_to_index_map = {}
@@ -467,15 +483,17 @@ def _create_sdsc_tensors(
         if i in index_tensor_layouts:
             dim_order, stick_dim = index_tensor_layouts[i]
         else:
-            # For value tensors in indirect access, use op_dim_order directly
-            if is_value_tensor and has_indirect_access:
+            # For value tensors in indirect access (but NOT scatter output), use op_dim_order directly
+            # Scatter output tensors should use their own device_coordinates for proper stick dimension
+            if is_value_tensor and has_indirect_access and not (is_scatter and i == len(op_spec.args) - 1):
                 dim_order = list(op_dim_order)
                 stick_dim = op_dim_order[0] if op_dim_order else None
             else:
                 dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, reverse_for_indirect=False)
                 # For output tensors in indirect access (gather), reverse the non-stick dimensions
                 # to maintain correct dimension order from input tensor
-                if has_indirect_access and i == len(op_spec.args) - 1 and len(dim_order) > 2:
+                # For scatter, do NOT reverse - output should match input dimension order
+                if has_indirect_access and i == len(op_spec.args) - 1 and len(dim_order) > 2 and not is_scatter:
                     # Reverse all dimensions except the stick dimension (last one)
                     non_stick_dims = dim_order[:-1]
                     non_stick_dims.reverse()
@@ -571,6 +589,7 @@ def _create_sdsc_tensors(
                     original_dev_dim_size,
                     indirect_value_host_shape,
                     indirect_index_host_shape,
+                    is_scatter,
                 )
 
                 # CRITICAL FIX: Zero out strides and offsets for non-indexed dimensions
@@ -614,8 +633,21 @@ def _create_sdsc_tensors(
                         f"op_info_pairs={op_spec.op_info.get('index_value_pairs')}"
                     )
                 else:
-                    # Output tensors keep max_dim_sizes as -1 (dynamic)
-                    max_dim_sizes[dim] = -1
+                    # Output tensors: for scatter, use value tensor logic; otherwise keep -1 (dynamic)
+                    if is_scatter and i == len(op_spec.args) - 1:
+                        # Scatter output tensor (last arg): use same logic as value tensors
+                        max_dim_sizes[dim] = get_value_tensor_max_dim_size(
+                            i,
+                            dim,
+                            stick_dim,
+                            original_dev_dim_size,
+                            indirect_value_host_shape,
+                            indirect_index_host_shape,
+                            is_scatter,
+                        )
+                    else:
+                        # Regular output tensors keep max_dim_sizes as -1 (dynamic)
+                        max_dim_sizes[dim] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         # Check if this argument is an index tensor
@@ -631,23 +663,51 @@ def _create_sdsc_tensors(
                     "stick_size": arg.device_dtype.elems_per_stick(),
                 }
         else:
-            # For indirect access: separate layouts for value and output tensors
-            if has_indirect_access and is_value_tensor:
-                # Value tensor gets its own INPUT layout to represent [IN, OUT] structure
+            # For indirect access: separate layouts for value and output tensors.
+            #
+            # Gather (read-indirect, is_scatter=False):
+            #   value_tensor (e.g. vocab table) → "INPUT"  (randomly read source)
+            #   output (last arg)               → "OUTPUT" (sequentially written result)
+            #
+            # Scatter (write-indirect, is_scatter=True):
+            #   src (first non-index, non-output arg) → "INPUT"  (sequentially read source)
+            #   output (last arg, value_tensor)        → "OUTPUT" (scatter write target)
+            if has_indirect_access and is_value_tensor and not is_scatter:
+                # Gather: value tensor is the indirectly-read source → INPUT layout
                 label = "INPUT"
-                logger.debug(f"Tensor {i}: INPUT layout (value tensor for indirect access)")
+                logger.debug(f"Tensor {i}: INPUT layout (gather value tensor)")
                 if "INPUT" not in layouts:
                     layouts["INPUT"] = {
                         "dim_order": dim_order,
                         "stick_dim_order": effective_stick,
                         "stick_size": arg.device_dtype.elems_per_stick(),
                     }
-            elif has_indirect_access and i == len(op_spec.args) - 1:
-                # Output tensor gets OUTPUT layout to represent [MB, OUT] structure
+            elif has_indirect_access and i == len(op_spec.args) - 1 and not is_scatter:
+                # Gather: output tensor is written sequentially → OUTPUT layout
                 label = "OUTPUT"
-                logger.debug(f"Tensor {i}: OUTPUT layout (output tensor for indirect access)")
+                logger.debug(f"Tensor {i}: OUTPUT layout (gather output tensor)")
                 if "OUTPUT" not in layouts:
                     layouts["OUTPUT"] = {
+                        "dim_order": dim_order,
+                        "stick_dim_order": effective_stick,
+                        "stick_size": arg.device_dtype.elems_per_stick(),
+                    }
+            elif has_indirect_access and is_scatter and i == len(op_spec.args) - 1:
+                # Scatter: output tensor (last arg) is the scatter write target → OUTPUT layout
+                label = "OUTPUT"
+                logger.debug(f"Tensor {i}: OUTPUT layout (scatter write target)")
+                if "OUTPUT" not in layouts:
+                    layouts["OUTPUT"] = {
+                        "dim_order": dim_order,
+                        "stick_dim_order": effective_stick,
+                        "stick_size": arg.device_dtype.elems_per_stick(),
+                    }
+            elif has_indirect_access and is_scatter and i not in index_args and i != len(op_spec.args) - 1:
+                # Scatter: src tensor (sequential read, not index, not output) → INPUT layout
+                label = "INPUT"
+                logger.debug(f"Tensor {i}: INPUT layout (scatter src tensor)")
+                if "INPUT" not in layouts:
+                    layouts["INPUT"] = {
                         "dim_order": dim_order,
                         "stick_dim_order": effective_stick,
                         "stick_size": arg.device_dtype.elems_per_stick(),
@@ -845,9 +905,13 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     # Check if this is an indirect access operation
     index_args = set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
     has_indirect_access = len(index_args) > 0
+    is_scatter = op_spec.op_info.get("is_scatter", False) if op_spec.op_info else False
 
     ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping, reverse_for_indirect=has_indirect_access)
+    # For scatter operations, do NOT reverse dimension order - output should match input
+    # For gather operations, reverse to get proper stick-first ordering
+    should_reverse = has_indirect_access and not is_scatter
+    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping, reverse_for_indirect=should_reverse)
 
     if op_stick_dim is None:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
@@ -870,6 +934,16 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         dim_splits[missing_dim] = 1
         work_slices[missing_dim] = 1
 
+    # For scatter operations, identify dimensions controlled by index tensors
+    index_controlled_dims = set()
+    is_scatter = op_spec.op_info.get("is_scatter", False) if op_spec.op_info else False
+    if is_scatter and has_indirect_access:
+        # Find the index tensor and get its dimensions
+        for idx in index_args:
+            if idx < len(args):
+                index_layout = layouts[args[idx].layout]
+                index_controlled_dims.update(index_layout["dim_order"])
+    
     if is_matmul:
         pad_args, pad_sdsc_args = list(op_spec.args), args
     elif op_spec.is_reduction or op_spec.op == "overwrite":
@@ -879,7 +953,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         # Index tensors have their own stick dimensions that shouldn't affect iteration space
         pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
     padding = _get_padded_iteration_space(
-        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, has_indirect_access
+        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, has_indirect_access, index_controlled_dims
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)

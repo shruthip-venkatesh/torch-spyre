@@ -44,24 +44,32 @@ def get_labeled_layout_metadata(
 def enrich_indirect_index_value_pairs(
     op_info: dict[str, Any],
     dim_labels: list[str],
+    extra_tensor_names: list[str] | None = None,
 ) -> None:
+    """Enrich index_value_pairs with per-pair host shape/stride metadata.
+
+    extra_tensor_names covers tensors beyond tensor_names (e.g. the implicit
+    output buffer added by store()).  For scatter, value_arg == len(tensor_names)
+    refers to the output, passed here as extra_tensor_names=[output_name].
+    """
     tensor_names = op_info.get("tensor_names", [])
+    all_names = list(tensor_names) + (extra_tensor_names or [])
     enriched_pairs = []
     for pair in op_info.get("index_value_pairs", []):
         enriched_pair = dict(pair)
         index_arg = pair["index_arg"]
         value_arg = pair["value_arg"]
 
-        if index_arg < len(tensor_names):
+        if index_arg < len(all_names):
             index_shape, index_stride = get_labeled_layout_metadata(
-                tensor_names[index_arg], dim_labels
+                all_names[index_arg], dim_labels
             )
             enriched_pair["index_host_shape"] = index_shape
             enriched_pair["index_host_stride"] = index_stride
 
-        if value_arg < len(tensor_names):
+        if value_arg < len(all_names):
             value_shape, value_stride = get_labeled_layout_metadata(
-                tensor_names[value_arg], dim_labels
+                all_names[value_arg], dim_labels
             )
             enriched_pair["value_host_shape"] = value_shape
             enriched_pair["value_host_stride"] = value_stride
@@ -146,23 +154,43 @@ def get_relabeled_pair_metadata(
 def get_positive_indirect_dims(
     value_host_shape: dict[str, int] | None,
     index_host_shape: dict[str, int] | None,
+    is_scatter: bool = False,
 ) -> set[str]:
+    """
+    Get dimensions that should have positive (non-zero) maxDimSize.
+    
+    For gather: dimensions where index_size < value_size (gathering subset)
+    For scatter: dimensions where index_size <= value_size (scattering to positions)
+    """
     if value_host_shape is None or index_host_shape is None:
         return set()
-    return {
-        dim_label
-        for dim_label, value_dim_size in value_host_shape.items()
-        if dim_label in index_host_shape
-        and int(index_host_shape[dim_label]) < int(value_dim_size)
-    }
+    
+    if is_scatter:
+        # For scatter, include dimensions where index_size <= value_size
+        # This covers both equal sizes and subset cases
+        return {
+            dim_label
+            for dim_label, value_dim_size in value_host_shape.items()
+            if dim_label in index_host_shape
+            and int(index_host_shape[dim_label]) <= int(value_dim_size)
+        }
+    else:
+        # For gather, only include dimensions where index_size < value_size
+        return {
+            dim_label
+            for dim_label, value_dim_size in value_host_shape.items()
+            if dim_label in index_host_shape
+            and int(index_host_shape[dim_label]) < int(value_dim_size)
+        }
 
 
 def get_active_indirect_dims(
     all_dims: list[Symbol],
     value_host_shape: dict[str, int] | None,
     index_host_shape: dict[str, int] | None,
+    is_scatter: bool = False,
 ) -> set[Symbol]:
-    positive_dims = get_positive_indirect_dims(value_host_shape, index_host_shape)
+    positive_dims = get_positive_indirect_dims(value_host_shape, index_host_shape, is_scatter)
     if not positive_dims:
         return set(all_dims)
     return {dim for dim in all_dims if str(dim) in positive_dims}
@@ -194,11 +222,13 @@ def get_index_related_positive_dims(
     arg_idx: int,
     symbol_mapping: dict[Symbol, Symbol],
 ) -> set[str]:
+    is_scatter = op_spec.op_info.get("is_scatter", False) if op_spec.op_info else False
     related_value_pair = find_indirect_pair_by_index_arg(op_spec, arg_idx)
     related_metadata = get_relabeled_pair_metadata(related_value_pair, symbol_mapping)
     return get_positive_indirect_dims(
         related_metadata["value_host_shape"],
         related_metadata["index_host_shape"],
+        is_scatter,
     )
 
 
@@ -218,7 +248,19 @@ def get_value_tensor_max_dim_size(
     original_dev_dim_size: int,
     value_host_shape: dict[str, int] | None,
     index_host_shape: dict[str, int] | None,
+    is_scatter: bool = False,
 ) -> int:
+    """
+    Determine maxDimSize for value/output tensors in indirect access operations.
+    
+    For gather (read-indirect):
+      - value_size == index_size: dimension traversed directly, return -1 (dynamic)
+      - index_size < value_size: dimension indirectly indexed, return 1 (use actual size)
+    
+    For scatter (write-indirect):
+      - value_size == index_size: dimension indexed for writes, return 1 (use actual size)
+      - index_size < value_size: would be invalid for scatter
+    """
     if dim == stick_dim:
         return -1
 
@@ -236,7 +278,9 @@ def get_value_tensor_max_dim_size(
 
     if value_dim_size is not None and index_dim_size is not None:
         if value_dim_size == index_dim_size:
-            return -1
+            # For scatter: equal sizes mean this dimension is indexed, return 1
+            # For gather: equal sizes mean direct traversal, return -1
+            return 1 if is_scatter else -1
         if index_dim_size < value_dim_size:
             return 1
         if value_dim_size < index_dim_size:

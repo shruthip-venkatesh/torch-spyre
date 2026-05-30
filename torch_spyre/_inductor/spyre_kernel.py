@@ -577,11 +577,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout)
-        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
-        if real_dst_name != name:
-            # Skip allocating an output buffer; this name is an alias to another buffer
-            V.graph.removed_buffers.add(name)
+        
+        # Get op_info early to check if this is a scatter operation
         op_info: dict[str, Any] = {}
         ir_node = self.current_node.node
         if hasattr(ir_node, "op_info") and isinstance(ir_node.op_info, dict):
@@ -592,6 +589,27 @@ class SpyreKernel(Kernel[CSEVariable]):
             and isinstance(ir_node.data.op_info, dict)
         ):
             op_info.update(ir_node.data.op_info)
+        
+        # For scatter operations, create a proper index that maps all iteration variables
+        # to tensor dimensions, not just the stick dimension from the output_indexer
+        if op_info.get("is_scatter", False):
+            it_space_keys = list(iteration_space(self.current_node).keys())
+            if len(layout.size) > 0 and len(it_space_keys) >= len(layout.size):
+                # Map iteration variables to tensor dimensions using strides
+                tensor_index = sum(
+                    it_space_keys[i] * concretize_expr(layout.stride[i])
+                    for i in range(len(layout.size))
+                )
+            else:
+                tensor_index = index
+            dst = TensorAccess(name, tensor_index, layout)
+        else:
+            dst = TensorAccess(name, index, layout)
+        
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if real_dst_name != name:
+            # Skip allocating an output buffer; this name is an alias to another buffer
+            V.graph.removed_buffers.add(name)
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
             logger.debug(
@@ -613,7 +631,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Use tensor_names from op_info (includes both value and index tensors)
             tensor_names = op_info["tensor_names"]
             dim_labels = [str(d) for d in iteration_space(self.current_node).keys()]
-            enrich_indirect_index_value_pairs(op_info, dim_labels)
+            # Pass the output buffer name so scatter's value_arg=len(tensor_names) can
+            # be enriched with the output's host shape (needed for get_value_tensor_max_dim_size).
+            enrich_indirect_index_value_pairs(op_info, dim_labels, extra_tensor_names=[name])
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Indirect access op: tensor_names={tensor_names}, index_args={index_args}, op_info={op_info}")
@@ -891,11 +911,13 @@ class SpyreKernel(Kernel[CSEVariable]):
                 tensor_arg.arg_index = i
             else:
                 tensor_arg.arg_index = actuals.index(name)
-                tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
-                    tensor_arg.arg_index + 1
-                    if has_pool_allocations
-                    else tensor_arg.arg_index
-                ]
+            
+            # Set allocation for all tensors (both indirect and non-indirect)
+            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
+                tensor_arg.arg_index + 1
+                if has_pool_allocations
+                else tensor_arg.arg_index
+            ]
 
         buf = IndentedBuffer()
         buf.writeline("[")
