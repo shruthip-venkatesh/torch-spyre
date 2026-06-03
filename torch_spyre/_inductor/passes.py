@@ -103,7 +103,7 @@ def _format_operations(operations: list[Operation]) -> str:
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
     has_spyre_device = any(
         isinstance(node, torch.fx.Node)
-        and isinstance(node.meta.get("val"), torch.Tensor)
+        and isinstance(node.meta["val"], torch.Tensor)
         and node.meta["val"].device.type == DEVICE_NAME
         for node in graph.nodes
     )
