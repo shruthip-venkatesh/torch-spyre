@@ -111,22 +111,6 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
-def _get_minimal_device_size(host_size: list, stick_size: int) -> list:
-    """
-    Create minimal device_size for a tensor without extra leading dimensions.
-    
-    For a 2D tensor [H, W], creates [1, H, stick_size] instead of [1, 1, H, stick_size].
-    This prevents dimension mismatches in SDSC generation for indirect access ops.
-    """
-    if len(host_size) == 0:
-        return [1, stick_size]
-    elif len(host_size) == 1:
-        return [1, host_size[0], stick_size]
-    else:
-        # For rank >= 2, use [1, *host_size[:-1], stick_size]
-        return [1] + list(host_size[:-1]) + [stick_size]
-
-
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -442,28 +426,10 @@ def _multi_arg_pointwise_layouts(
     """
     Multi-arg pointwise is a join point so handled specially.
     Algorithm is
-        1. Compute set of output stick expressions possible given the input layouts
-        2. Compute an out STL for each
-        3. Construct the AllSameNode cost function since in and out sticks must always match
+       1. Compute set of output stick expressions possible given the input layouts
+       2. Compute an out STL for each
+       3. Construct the AllSameNode cost function since in and out sticks must always match
     """
-    # Check if this is an indirect access operation
-    data = op.data
-    is_indirect_access = (
-        hasattr(data, 'op_info') and
-        data.op_info and
-        'index_args' in data.op_info
-    )
-    
-    # For indirect access operations, use minimal layout to avoid dimension mismatches
-    if is_indirect_access:
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-        # Use simple row-major dim_order without extra dimensions
-        dim_order = list(range(len(output.size)))
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
-        op.restick_cost_fn = AnyInNode.from_args()
-        return [stl]
-    
     stick_exprs = {
         device_coordinates(stl, arg.dep)[-1]
         for arg in args
