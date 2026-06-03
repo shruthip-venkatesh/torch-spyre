@@ -425,5 +425,7 @@ def test_specialized_paged_attn_kernel():
 
 
 if __name__ == "__main__":
+    import os
+    os.environ["SPYRE_INDUCTOR_ENABLE_ADD_INDEX_TO_ADDRESS"] = "1"
     test_simple_indirect_matmul()
     test_specialized_paged_attn_kernel()

@@ -419,11 +419,17 @@ def test_gather_paged_attention_small():
     return result
 
 if __name__ == "__main__":
+    import os
 
     try:
+        os.environ["SPYRE_INDUCTOR_ENABLE_ADD_INDEX_TO_ADDRESS"] = "1"
         test_gather_1d()
         test_gather_2d()
+
+        # TODO : Index to Address Translation fails, so disabling for now
+        os.environ["SPYRE_INDUCTOR_ENABLE_ADD_INDEX_TO_ADDRESS"] = "0"
         test_gather_paged_attention_small()
+
         # test_gather_3d() # Values are wrongly fetched
         # test_gather_4d() # Runtime error
         # test_gather_paged_attention() # SDSC JSON Compile error due EAR overflow

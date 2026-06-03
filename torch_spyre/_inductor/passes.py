@@ -32,6 +32,7 @@ from .logging_utils import get_inductor_logger
 
 from .padding import insert_bmm_padding
 from .temp_passes import (
+    add_index_to_address_pass,
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,
@@ -102,7 +103,7 @@ def _format_operations(operations: list[Operation]) -> str:
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
     has_spyre_device = any(
         isinstance(node, torch.fx.Node)
-        and isinstance(node.meta["val"], torch.Tensor)
+        and isinstance(node.meta.get("val"), torch.Tensor)
         and node.meta["val"].device.type == DEVICE_NAME
         for node in graph.nodes
     )
@@ -164,6 +165,7 @@ class CustomPostPasses(CustomGraphPass):
         convert_constant_with_graph_node,
         mm_to_bmm_pass.apply,
         bmm_unflatten_pass.apply,
+        add_index_to_address_pass.apply,
     ]
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:

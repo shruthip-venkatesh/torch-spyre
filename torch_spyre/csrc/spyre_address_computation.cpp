@@ -369,9 +369,9 @@ at::Tensor indices_to_addresses_nd(
     auto flat_indices = indices_cpu.reshape({-1});
     int64_t num_indices = flat_indices.size(0);
     
-    addresses = at::zeros({num_indices}, at::TensorOptions().dtype(at::kFloat));
+    addresses = at::zeros({num_indices}, at::TensorOptions().dtype(at::kLong));
     auto flat_indices_accessor = flat_indices.accessor<int64_t, 1>();
-    auto addresses_accessor = addresses.accessor<float, 1>();
+    auto addresses_accessor = addresses.accessor<int64_t, 1>();
     
     // Compute stride for the indexed dimension
     int64_t dim_stride_elements = value_strides[dim];
@@ -397,7 +397,7 @@ at::Tensor indices_to_addresses_nd(
       
       // Convert to stick address
       int64_t stick_address = byte_address / STICK_SIZE_BYTES;
-      addresses_accessor[i] = static_cast<float>(stick_address);
+      addresses_accessor[i] = static_cast<int64_t>(stick_address);
     }
     
     // Reshape back to original indices shape
