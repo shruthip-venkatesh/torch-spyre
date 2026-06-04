@@ -410,17 +410,6 @@ PYBIND11_MODULE(_C, m) {
         "    job_plan: The JobPlan to execute\n"
         "    args: Sequence of input/output tensors");
 
-  m.def("compute_addresses_from_indices", &spyre::compute_addresses_from_indices,
-        "Convert logical indices to Spyre HBM byte addresses",
-        py::arg("indices"), py::arg("virtual_offset"), py::arg("device_size"),
-        py::arg("device_stride"), py::arg("element_size"));
-  m.def("compute_stick_addresses_from_rows", &spyre::compute_stick_addresses_from_rows,
-        "Convert 2D row indices to stick addresses for gather operations",
-        py::arg("row_indices"), py::arg("virtual_offset"), py::arg("rows_per_group"),
-        py::arg("cols_per_row"), py::arg("element_size"));
-  m.def("indices_to_addresses_2d", &spyre::indices_to_addresses_2d,
-        "Convert logical indices to addresses following DeepTools model",
-        py::arg("logical_indices"), py::arg("value_tensor"));
   m.def("indices_to_addresses_nd", &spyre::indices_to_addresses_nd,
         "Convert N-dimensional logical indices to addresses",
         py::arg("logical_indices"), py::arg("value_tensor"), py::arg("dim") = 0);

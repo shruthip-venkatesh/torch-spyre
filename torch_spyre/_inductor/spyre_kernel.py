@@ -415,8 +415,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.allocation,
             stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
-            is_index_tensor,
-            related_value_tensor_idx,
+            is_index_tensor=is_index_tensor,
+            related_value_tensor_idx=related_value_tensor_idx,
         )
         if (
             "lx" not in tensor.layout.allocation
