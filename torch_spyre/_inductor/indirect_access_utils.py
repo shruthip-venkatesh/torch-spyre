@@ -641,7 +641,7 @@ def create_sdsc_arg_for_tensor(
     scales = {}
     strides = {}
     offsets = {}
-    backGap = {}
+    backGap: dict[Symbol, int] = {}
     max_dim_sizes = {}
     reduced_dims = []
     use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
@@ -700,7 +700,7 @@ def create_sdsc_arg_for_tensor(
             dim_coord = arg.device_coordinates[-stride_idx - 2]
             dim_offset = int(dim_coord.as_coeff_Add()[0])
             offsets[dim] = dim_offset * dim_device_stride
-            backGap[dim] = dev_dim_size - it_dim_size
+            # backGap[dim] = dev_dim_size - it_dim_size # TODO: fix this
             strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         # Set max_dim_sizes for indirect access
