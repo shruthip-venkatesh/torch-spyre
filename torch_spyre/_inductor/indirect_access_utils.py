@@ -782,6 +782,7 @@ def create_sdsc_arg_for_tensor(
     return SDSCArgs(
         layout=label,
         data_format=sdsc_dtype,
+        dim_order=dim_order,
         scales=scales,
         strides=strides,
         offsets=offsets,
@@ -797,3 +798,4 @@ def create_sdsc_arg_for_tensor(
         is_index_tensor=arg.is_index_tensor,
         related_value_tensor_idx=arg.related_value_tensor_idx,
     )
+
