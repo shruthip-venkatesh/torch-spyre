@@ -19,13 +19,14 @@ from torch._inductor.virtualized import V
 
 from .constants import SEGMENT_OFFSETS
 from .op_spec import OpSpec
-from .pass_utils import concretize_expr
 
 
 def get_labeled_layout_metadata(
     tensor_name: str,
     dim_labels: list[str],
 ) -> tuple[dict[str, int], dict[str, int]]:
+    from .pass_utils import concretize_expr
+
     buf = V.graph.get_buffer(tensor_name)
     layout = buf.get_layout()
     host_shape = [concretize_expr(s) for s in layout.size]
