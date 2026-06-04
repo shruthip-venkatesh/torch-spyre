@@ -192,6 +192,14 @@ jobs:
             config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
           - name: Inductor Unroll Loop Specs
             config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
+          - name: Inductor Indirect Access Utils
+            config: torch_spyre_tests/inductor/test_indirect_access_utils_config.yaml
+          - name: Inductor Detect Indirect Access
+            config: torch_spyre_tests/inductor/test_detect_indirect_access_config.yaml
+          - name: Inductor Gather
+            config: torch_spyre_tests/inductor/test_gather_config.yaml
+          - name: Inductor Paged Attention
+            config: torch_spyre_tests/inductor/test_paged_attention_config.yaml
           # Tensor tests
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
