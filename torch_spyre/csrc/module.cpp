@@ -41,6 +41,7 @@
 
 #include "logging.h"
 #include "prepare_kernel.h"
+#include "spyre_address_computation.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
 #include "spyre_guard.h"
@@ -49,7 +50,6 @@
 #include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
 #include "spyre_views.h"
-#include "spyre_address_computation.h"
 #include "types_mapping.h"
 
 namespace fs = std::filesystem;
@@ -412,5 +412,6 @@ PYBIND11_MODULE(_C, m) {
 
   m.def("indices_to_addresses_nd", &spyre::indices_to_addresses_nd,
         "Convert N-dimensional logical indices to addresses",
-        py::arg("logical_indices"), py::arg("value_tensor"), py::arg("dim") = 0);
+        py::arg("logical_indices"), py::arg("value_tensor"),
+        py::arg("dim") = 0);
 }

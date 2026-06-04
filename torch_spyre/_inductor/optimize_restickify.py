@@ -324,7 +324,10 @@ def greedy_local_min_cost(operations: list) -> None:
 
         # Skip operations with indirect access - they don't need restickify optimization
         if hasattr(op, "data") and hasattr(op.data, "op_info") and op.data.op_info:
-            if "index_args" in op.data.op_info or "index_value_pairs" in op.data.op_info:
+            if (
+                "index_args" in op.data.op_info
+                or "index_value_pairs" in op.data.op_info
+            ):
                 # This is an indirect access operation, skip restickify optimization
                 # Just commit the first available layout
                 if op.layouts:
@@ -465,7 +468,10 @@ def beam_global_min_cost(operations: list) -> None:
 
         # Skip operations with indirect access - they don't need restickify optimization
         if hasattr(op, "data") and hasattr(op.data, "op_info") and op.data.op_info:
-            if "index_args" in op.data.op_info or "index_value_pairs" in op.data.op_info:
+            if (
+                "index_args" in op.data.op_info
+                or "index_value_pairs" in op.data.op_info
+            ):
                 # This is an indirect access operation, skip restickify optimization
                 # Just use the first available layout and propagate all states
                 if op.layouts:

@@ -545,7 +545,9 @@ def _(input: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty_like(input, dtype=dtype)
 
 
-@torch.library.custom_op("spyre::indices_to_address", mutates_args=(), device_types="spyre")
+@torch.library.custom_op(
+    "spyre::indices_to_address", mutates_args=(), device_types="spyre"
+)
 def indices_to_address(
     indices: torch.Tensor,
     value_tensor: torch.Tensor,
@@ -553,7 +555,9 @@ def indices_to_address(
     virtual_offset: int = 0,
 ) -> torch.Tensor:
     import torch_spyre._C as _C
+
     return _C.indices_to_addresses_nd(indices, value_tensor, dim)
+
 
 @indices_to_address.register_fake
 def _(

@@ -533,8 +533,15 @@ def generate_sdsc(
                                         ]
                                     ],
                                     "indirectAllocType_": (
-                                        "index_tensor" if tensor.is_index_tensor
-                                        else "value_tensor" if i in [t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor]
+                                        "index_tensor"
+                                        if tensor.is_index_tensor
+                                        else "value_tensor"
+                                        if i
+                                        in [
+                                            t.related_value_tensor_idx
+                                            for t in sdsc_spec.args
+                                            if t.is_index_tensor
+                                        ]
                                         else "no_indirection"
                                     ),
                                     **(
@@ -545,8 +552,18 @@ def generate_sdsc(
                                                 else f"allocate-Tensor{next((j for j, t in enumerate(sdsc_spec.args) if t.is_index_tensor and t.related_value_tensor_idx == i), -1)}_hbm"
                                             )
                                         }
-                                        if (tensor.is_index_tensor and tensor.related_value_tensor_idx >= 0) or
-                                        (i in [t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor])
+                                        if (
+                                            tensor.is_index_tensor
+                                            and tensor.related_value_tensor_idx >= 0
+                                        )
+                                        or (
+                                            i
+                                            in [
+                                                t.related_value_tensor_idx
+                                                for t in sdsc_spec.args
+                                                if t.is_index_tensor
+                                            ]
+                                        )
                                         else {}
                                     ),
                                     "startAddressCoreCorelet_": {
@@ -628,7 +645,7 @@ def generate_sdsc(
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
-                                    "memOrg_": { "hbm": {"isPresent": 1} }
+                                    "memOrg_": {"hbm": {"isPresent": 1}}
                                     if tensor.is_index_tensor
                                     else {
                                         "hbm": {"isPresent": 1},

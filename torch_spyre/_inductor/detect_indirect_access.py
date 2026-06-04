@@ -31,11 +31,11 @@ def detect_indirect_access(operations: list[Operation]) -> None:
     """
     Detect indirect access patterns in Pointwise operations and mark them
     with appropriate op_info metadata.
-    
+
     An indirect access pattern is detected when:
     1. A Pointwise operation has multiple loads
     2. One load's result is used in the index expression of another load
-    
+
     When detected, we add op_info with:
     - index_args: list of positions of index tensors
     - index_value_pairs: mapping of which index accesses which value tensor
@@ -43,19 +43,19 @@ def detect_indirect_access(operations: list[Operation]) -> None:
     for op in operations:
         if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Pointwise):
             continue
-            
+
         # Skip if operation already has op_info (e.g., from indirect_gather lowering)
-        if hasattr(op.data, 'op_info') and op.data.op_info:
+        if hasattr(op.data, "op_info") and op.data.op_info:
             continue
-            
+
         # Get read dependencies - need at least 2 for indirect access
         reads = op.get_read_writes().reads
         if len(reads) < 2:
             continue
-            
+
         # Detect indirect access pattern by looking for tmp variables in index expressions
         index_tensor_pos, value_tensor_pos = _find_indirect_pattern(reads)
-        
+
         if index_tensor_pos is not None and value_tensor_pos is not None:
             _mark_indirect_access(op, reads, index_tensor_pos, value_tensor_pos)
 
@@ -63,18 +63,18 @@ def detect_indirect_access(operations: list[Operation]) -> None:
 def _find_indirect_pattern(reads) -> tuple[int | None, int | None]:
     """
     Find indirect access pattern in read dependencies.
-    
+
     Returns:
         Tuple of (index_tensor_pos, value_tensor_pos) or (None, None) if not found
     """
     for i, read in enumerate(reads):
         if not isinstance(read, MemoryDep):
             continue
-            
+
         # Check if index expression contains tmp variables (loaded values)
         index_expr = read.index
         for symbol in index_expr.free_symbols:
-            if str(symbol).startswith('tmp'):
+            if str(symbol).startswith("tmp"):
                 # Current read is value tensor (indexed by loaded value)
                 value_tensor_pos = i
                 # Find index tensor (first other MemoryDep)
@@ -84,39 +84,39 @@ def _find_indirect_pattern(reads) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _mark_indirect_access(op, reads, index_tensor_pos: int, value_tensor_pos: int) -> None:
+def _mark_indirect_access(
+    op, reads, index_tensor_pos: int, value_tensor_pos: int
+) -> None:
     """Mark operation with indirect access metadata."""
     all_tensor_names = [read.name for read in reads if isinstance(read, MemoryDep)]
-    
+
     # Reorder tensor_names to match custom op: [value, index, ...]
     # This ensures the OpSpec args are in the correct order
     value_name = all_tensor_names[value_tensor_pos]
     index_name = all_tensor_names[index_tensor_pos]
-    
+
     tensor_names = [value_name, index_name]
     # Add any remaining tensors
     for name in all_tensor_names:
         if name not in tensor_names:
             tensor_names.append(name)
-    
+
     # Update positions based on new ordering
     new_value_pos = 0  # Value is now first
     new_index_pos = 1  # Index is now second
-    
+
     op_info = {
         "op": "identity",
         "index_args": [new_index_pos],
-        "index_value_pairs": [
-            {"index_arg": new_index_pos, "value_arg": new_value_pos}
-        ],
-        "tensor_names": tensor_names
+        "index_value_pairs": [{"index_arg": new_index_pos, "value_arg": new_value_pos}],
+        "tensor_names": tensor_names,
     }
-    
+
     # Pointwise is frozen dataclass - use object.__setattr__ to bypass
-    if not hasattr(op.data, 'op_info') or op.data.op_info is None:
-        object.__setattr__(op.data, 'op_info', {})
+    if not hasattr(op.data, "op_info") or op.data.op_info is None:
+        object.__setattr__(op.data, "op_info", {})
     op.data.op_info.update(op_info)
-    
+
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             f"Detected indirect access in {op.get_name()}: "

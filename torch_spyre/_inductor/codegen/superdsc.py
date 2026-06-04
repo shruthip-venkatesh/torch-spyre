@@ -249,6 +249,7 @@ def _get_device_dim_order(
 
     return dim_order, stick_dim
 
+
 def _get_layout_label(
     layouts: dict,
     dim_order: list,
@@ -306,7 +307,9 @@ def _get_padded_iteration_space(
             # For indirect access, ensure ALL dimensions are multiples of stick_size
             elif is_indirect_access:
                 current_size = sdsc_iteration_space[dim]
-                aligned_size = ((current_size + stick_size - 1) // stick_size) * stick_size
+                aligned_size = (
+                    (current_size + stick_size - 1) // stick_size
+                ) * stick_size
                 if current_size < aligned_size:
                     padding[dim] = aligned_size - current_size
                     sdsc_iteration_space[dim] = aligned_size
@@ -441,6 +444,7 @@ def _create_sdsc_tensors(
 
     return sdsc_args, layouts, missing_dim
 
+
 def _create_sdsc_tensors_for_indirect_access(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -452,10 +456,12 @@ def _create_sdsc_tensors_for_indirect_access(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
-    index_args = set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
+    index_args = (
+        set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
+    )
     has_indirect_access = len(index_args) > 0
     adjusted_output_size = op_spec.args[-1].device_size.copy()
-    
+
     missing_dim = None
     sdsc_args: list[SDSCArgs] = []
 
@@ -638,11 +644,15 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     }
 
     # Check if this is an indirect access operation
-    index_args = set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
+    index_args = (
+        set(op_spec.op_info.get("index_args", [])) if op_spec.op_info else set()
+    )
     has_indirect_access = len(index_args) > 0
 
     ref_arg = _ref_arg(op_spec)
-    op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping, reverse_for_indirect=has_indirect_access)
+    op_dim_order, op_stick_dim = _get_device_dim_order(
+        ref_arg, symbol_mapping, reverse_for_indirect=has_indirect_access
+    )
 
     if op_stick_dim is None:
         stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
@@ -696,7 +706,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[-1].dim_order],
         )
     padding = _get_padded_iteration_space(
-        pad_args, pad_sdsc_args, sdsc_iteration_space, layouts, dim_order, is_indirect_access=has_indirect_access
+        pad_args,
+        pad_sdsc_args,
+        sdsc_iteration_space,
+        layouts,
+        dim_order,
+        is_indirect_access=has_indirect_access,
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
@@ -718,7 +733,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         )
 
     # Collect index tensor indices for indirect access
-    indirect_access_indices = [i for i, arg in enumerate(op_spec.args) if arg.is_index_tensor]
+    indirect_access_indices = [
+        i for i, arg in enumerate(op_spec.args) if arg.is_index_tensor
+    ]
 
     return (
         SDSCSpec(
