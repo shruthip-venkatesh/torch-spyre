@@ -28,11 +28,9 @@ from torch_spyre._inductor.constants import (
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
     TOPK_OPS,
-    SEGMENT_OFFSETS
 )
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.indirect_access_utils import (
-    build_value_to_index_map,
     collect_index_tensor_layouts,
     create_sdsc_arg_for_tensor,
 )
@@ -368,9 +366,6 @@ def _create_sdsc_tensors(
     # Modular approach: Use utility functions for indirect access, original code for regular ops
     if has_indirect_access:
         # INDIRECT ACCESS PATH: Use utility functions from indirect_access_utils.py
-        # Build mapping of value_arg -> index_arg for indirect access operations
-        value_to_index_map = build_value_to_index_map(op_spec.op_info)
-
         # First pass: collect index tensor layouts for indirect access
         index_tensor_layouts, index_active_dims = collect_index_tensor_layouts(
             op_spec, symbol_mapping, index_args, logger
