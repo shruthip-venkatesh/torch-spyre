@@ -71,34 +71,12 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
-    
-    def __hash__(self):
-        # Use id() for layout since FixedTiledLayout may not be hashable
-        return hash((self.name, self.index, id(self.layout)))
-    
-    def __eq__(self, other):
-        if not isinstance(other, TensorAccess):
-            return False
-        return self.name == other.name and self.index == other.index and self.layout is other.layout
-    
-    def _sympy_(self):
-        # Make TensorAccess sympifiable by returning a unique symbol
-        # This allows it to be used in sympy expressions
-        return sympy.Symbol(f"_indirect_{self.name}_{id(self)}")
 
 
 @dataclass
 class Constant(RValue):
     value: Union[bool, float, int]
     dtype: torch.dtype
-    
-    def __hash__(self):
-        return hash((self.value, self.dtype))
-    
-    def __eq__(self, other):
-        if not isinstance(other, Constant):
-            return False
-        return self.value == other.value and self.dtype == other.dtype
 
 
 @dataclass
@@ -106,15 +84,6 @@ class PointwiseOp(RValue):
     op: str
     arguments: list[RValue]
     op_info: dict[str, Any] = field(default_factory=dict)
-    
-    def __hash__(self):
-        # Use tuple of argument ids for hashability
-        return hash((self.op, tuple(id(arg) for arg in self.arguments), tuple(sorted(self.op_info.items()))))
-    
-    def __eq__(self, other):
-        if not isinstance(other, PointwiseOp):
-            return False
-        return self.op == other.op and self.arguments == other.arguments and self.op_info == other.op_info
 
 
 @dataclass
@@ -122,32 +91,11 @@ class ReductionOp(RValue):
     op: str
     arguments: list[RValue]
     op_info: dict[str, Any] = field(default_factory=dict)
-    
-    def __hash__(self):
-        # Use tuple of argument ids for hashability
-        return hash((self.op, tuple(id(arg) for arg in self.arguments), tuple(sorted(self.op_info.items()))))
-    
-    def __eq__(self, other):
-        if not isinstance(other, ReductionOp):
-            return False
-        return self.op == other.op and self.arguments == other.arguments and self.op_info == other.op_info
 
 
 @dataclass
 class UnimplementedOp(RValue):
     op: str
-    
-    def __hash__(self):
-        return hash(self.op)
-    
-    def __eq__(self, other):
-        if not isinstance(other, UnimplementedOp):
-            return False
-        return self.op == other.op
-    
-    def _sympy_(self):
-        # Make UnimplementedOp sympifiable by returning a unique symbol
-        return sympy.Symbol(f"_unimpl_{self.op}_{id(self)}")
 
 
 def _serialize_value(v):
@@ -387,6 +335,12 @@ class SpyreKernelOpsHandler(DefaultHandler):
     ) -> None:
         self.kernel.store_buffer_names.add(name)
         self.kernel.store_reduction(name, index, value)
+
+    def indirect_indexing(
+        self, index_var, size: int, check: bool = True, wrap_neg: bool = True
+    ) -> sympy.Symbol:
+        """Forward indirect_indexing calls to the kernel."""
+        return self.kernel.indirect_indexing(index_var, size, check, wrap_neg)
 
     def reduction(
         self,
