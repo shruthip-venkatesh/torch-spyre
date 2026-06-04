@@ -232,19 +232,28 @@ def _get_device_dim_order(
     stick_dim = free[0] if free else None
 
     dim_order: list[Symbol] = []
-    for i in range(len(arg.device_coordinates) - 2, -1, -1):
-        expr = arg.device_coordinates[i].subs(symbol_mapping)
-        if expr == 0:
-            continue
-        for sym in expr.free_symbols:
-            if sym not in dim_order:
-                dim_order.append(sym)
 
-    if stick_dim is not None and stick_dim not in dim_order:
-        dim_order.append(stick_dim)
+    if not reverse_for_indirect:
+        for i in range(len(arg.device_coordinates) - 2, -1, -1):
+            expr = arg.device_coordinates[i].subs(symbol_mapping)
+            if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
+                dim_order.append(stick_dim)
+            for sym in expr.free_symbols:
+                if sym not in dim_order:
+                    dim_order.append(sym)
+    else:
+        for i in range(len(arg.device_coordinates) - 2, -1, -1):
+            expr = arg.device_coordinates[i].subs(symbol_mapping)
+            if expr == 0:
+                continue
+            for sym in expr.free_symbols:
+                if sym not in dim_order:
+                    dim_order.append(sym)
 
-    # For indirect access operations, reverse to get proper order: stick dimension first
-    if reverse_for_indirect:
+        if stick_dim is not None and stick_dim not in dim_order:
+            dim_order.append(stick_dim)
+
+        # For indirect access operations, reverse to get proper order: stick dimension first
         dim_order.reverse()
 
     return dim_order, stick_dim
@@ -256,7 +265,6 @@ def _get_layout_label(
     stick_dim_order: Symbol | None,
     stick_size: int,
     layout_labels: list[str],
-    is_indirect_access: bool = False,
 ) -> str:
     for label, layout in layouts.items():
         if (
@@ -280,7 +288,6 @@ def _get_padded_iteration_space(
     sdsc_iteration_space: dict,
     layouts: dict,
     dim_order,
-    is_indirect_access: bool = False,
 ) -> dict:
     """
     Compute padding per dim when device size exceeds iteration space.
@@ -292,27 +299,14 @@ def _get_padded_iteration_space(
     for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
         stick_dim = layout["stick_dim_order"]
-        stick_size = layout["stick_size"]
         dev_size = op_spec_arg.device_size[-2::-1]
         for idx, dim in enumerate(dim_order):
             if idx >= len(dev_size) or dim != stick_dim:
                 continue
-
-            # For stick dimensions, pad to device size
-            if dim == stick_dim:
-                dim_size = dev_size[idx] * stick_size
-                if sdsc_iteration_space[dim] < dim_size:
-                    padding[dim] = dim_size - sdsc_iteration_space[dim]
-                    sdsc_iteration_space[dim] = dim_size
-            # For indirect access, ensure ALL dimensions are multiples of stick_size
-            elif is_indirect_access:
-                current_size = sdsc_iteration_space[dim]
-                aligned_size = (
-                    (current_size + stick_size - 1) // stick_size
-                ) * stick_size
-                if current_size < aligned_size:
-                    padding[dim] = aligned_size - current_size
-                    sdsc_iteration_space[dim] = aligned_size
+            unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
+            if unaligned > 0:
+                padding[dim] = layout["stick_size"] - unaligned
+                sdsc_iteration_space[dim] += padding[dim]
     return padding
 
 
@@ -711,7 +705,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         sdsc_iteration_space,
         layouts,
         dim_order,
-        is_indirect_access=has_indirect_access,
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
