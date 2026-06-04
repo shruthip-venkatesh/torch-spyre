@@ -451,7 +451,9 @@ def test_gather_paged_attention_small():
     # assert torch.allclose(result_cpu, expected, rtol=1e-3, atol=1e-3), (
     #     f"Result mismatch! Max diff: {torch.max(torch.abs(result_cpu - expected))}"
     # )
-    print(f"✓ Paged attention gather Executed ! Max difference: {torch.max(torch.abs(result_cpu - expected))}")
+    print(
+        f"✓ Paged attention gather Executed ! Max difference: {torch.max(torch.abs(result_cpu - expected))}"
+    )
 
     return result
 
