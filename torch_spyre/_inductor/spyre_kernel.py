@@ -938,10 +938,17 @@ class SpyreKernel(Kernel[CSEVariable]):
         has_pool_allocations = pool_size > 0
 
         # Check if any op_spec has indirect access (index tensor present in args).
+        def has_indirect_access_recursive(op_spec):
+            """Recursively check if op_spec or its nested operations have indirect access."""
+            if isinstance(op_spec, UnimplementedOp):
+                return False
+            if isinstance(op_spec, LoopSpec):
+                return any(has_indirect_access_recursive(op) for op in op_spec.body)
+            # OpSpec case
+            return any(a.is_index_tensor for a in op_spec.args)
+
         has_indirect_access = any(
-            not isinstance(op_spec, UnimplementedOp)
-            and any(a.is_index_tensor for a in op_spec.args)
-            for op_spec in self.op_specs
+            has_indirect_access_recursive(op_spec) for op_spec in self.op_specs
         )
         # Cache for call_kernel, which runs after codegen_kernel returns.
         self._has_indirect_access = has_indirect_access
