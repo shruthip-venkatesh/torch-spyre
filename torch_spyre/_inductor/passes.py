@@ -31,8 +31,8 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from .logging_utils import get_inductor_logger
 
 from .padding import insert_bmm_padding
+from .index_to_address_pass import add_index_to_address_pass
 from .temp_passes import (
-    add_index_to_address_pass,
     bmm_unflatten_pass,
     mm_to_bmm_pass,
     convert_constant_with_graph_node,

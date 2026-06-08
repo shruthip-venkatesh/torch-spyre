@@ -37,7 +37,6 @@ _RESHAPE_OPS = (
 
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
-add_index_to_address_pass = PatternMatcherPass(pass_name="add_index_to_address")
 
 
 @register_graph_pattern(
