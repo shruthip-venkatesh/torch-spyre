@@ -39,6 +39,6 @@ namespace spyre {
  */
 at::Tensor indices_to_addresses_nd(const at::Tensor& logical_indices,
                                    const at::Tensor& value_tensor,
-                                   int64_t dim = 0);
+                                   int64_t dim = 0, int64_t virtual_offset = 0);
 
 }  // namespace spyre

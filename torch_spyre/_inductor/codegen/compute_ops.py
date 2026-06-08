@@ -311,6 +311,54 @@ def _should_add_indirect_access_field(sdsc_spec, tensor, tensor_idx: int) -> boo
     return tensor_idx in value_tensor_indices
 
 
+def _get_indirect_access_info(
+    sdsc_spec, tensor, tensor_idx: int
+) -> tuple[str, str | None]:
+    """Get indirect access allocation type and related allocation name for a tensor.
+
+    Returns:
+        A tuple of (alloc_type, related_alloc_or_none) where:
+        - alloc_type: "index_tensor", "value_tensor", or "no_indirection"
+        - related_alloc_or_none: allocation name of related tensor, or None
+    """
+    if tensor.is_index_tensor:
+        alloc_type = "index_tensor"
+        related_alloc = (
+            f"allocate-Tensor{tensor.related_value_tensor_idx}_hbm"
+            if tensor.related_value_tensor_idx >= 0
+            else None
+        )
+        return alloc_type, related_alloc
+
+    # Check if this is a value tensor referenced by an index tensor
+    value_tensor_indices = [
+        t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor
+    ]
+    if tensor_idx in value_tensor_indices:
+        alloc_type = "value_tensor"
+        index_tensor_idx = _find_index_tensor_for_value(sdsc_spec, tensor_idx)
+        related_alloc = f"allocate-Tensor{index_tensor_idx}_hbm"
+        return alloc_type, related_alloc
+
+    return "no_indirection", None
+
+
+def _build_indirect_access_fields(sdsc_spec, tensor, tensor_idx: int) -> dict:
+    """Build the indirect access fields for a tensor allocation.
+
+    Returns a dictionary containing:
+    - indirectAllocType_: The allocation type ("index_tensor", "value_tensor", or "no_indirection")
+    - relatedIndirectAccessAlloc_: The related allocation name (only if applicable)
+    """
+    alloc_type, related_alloc = _get_indirect_access_info(sdsc_spec, tensor, tensor_idx)
+
+    fields = {"indirectAllocType_": alloc_type}
+    if related_alloc is not None:
+        fields["relatedIndirectAccessAlloc_"] = related_alloc
+
+    return fields
+
+
 def generate_sdsc(
     idx,
     sdsc_spec,
@@ -573,28 +621,8 @@ def generate_sdsc(
                                             "dim_order"
                                         ]
                                     ],
-                                    "indirectAllocType_": (
-                                        "index_tensor"
-                                        if tensor.is_index_tensor
-                                        else "value_tensor"
-                                        if i
-                                        in [
-                                            t.related_value_tensor_idx
-                                            for t in sdsc_spec.args
-                                            if t.is_index_tensor
-                                        ]
-                                        else "no_indirection"
-                                    ),
-                                    **(
-                                        {
-                                            "relatedIndirectAccessAlloc_": _get_related_indirect_access_alloc(
-                                                sdsc_spec, tensor, i
-                                            )
-                                        }
-                                        if _should_add_indirect_access_field(
-                                            sdsc_spec, tensor, i
-                                        )
-                                        else {}
+                                    **_build_indirect_access_fields(
+                                        sdsc_spec, tensor, i
                                     ),
                                     "startAddressCoreCorelet_": {
                                         "dim_prop_func": [

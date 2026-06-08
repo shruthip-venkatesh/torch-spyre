@@ -406,7 +406,7 @@ def _create_indexed_tensor_arg(
         kernel: SpyreKernel instance
         arg_idx: Argument index position
         tensor_name: Name of the tensor
-        tensor_access: TensorAccess object
+        tensor_access: TensorAccess object (can be None if only layout is needed)
         index_args: Set of argument indices that are index tensors
         index_to_value_map: Mapping from index arg position to value arg position
 
@@ -428,6 +428,42 @@ def _create_indexed_tensor_arg(
         tensor_access,
         is_index_tensor=is_index_tensor,
         related_value_tensor_idx=related_value_idx,
+    )
+
+
+def _create_indexed_tensor_arg_from_name(
+    kernel: "SpyreKernel",
+    arg_idx: int,
+    tensor_name: str,
+    tensor_index: sympy.Expr,
+    index_args: set[int],
+    index_to_value_map: dict[int, int],
+) -> TensorArg:
+    """Create TensorArg from tensor name and index without loading.
+
+    This avoids the workaround of loading with index 0 just to get layout.
+    Instead, gets the layout directly from the buffer and constructs TensorAccess.
+
+    Args:
+        kernel: SpyreKernel instance
+        arg_idx: Argument index position
+        tensor_name: Name of the tensor
+        tensor_index: Index expression for the tensor
+        index_args: Set of argument indices that are index tensors
+        index_to_value_map: Mapping from index arg position to value arg position
+
+    Returns:
+        TensorArg with proper index tensor metadata
+    """
+    # Get layout directly from buffer instead of loading with dummy index
+    buffer = V.graph.get_buffer(tensor_name)
+    layout = buffer.get_layout()
+
+    # Create a TensorAccess with the layout and provided index
+    tensor_access = TensorAccess(name=tensor_name, layout=layout, index=tensor_index)
+
+    return _create_indexed_tensor_arg(
+        kernel, arg_idx, tensor_name, tensor_access, index_args, index_to_value_map
     )
 
 
@@ -698,13 +734,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 else:
                     tensor_index = sympy.Integer(0)
 
-                tensor = self.load(tensor_name, tensor_index)
                 indirect_args.append(
-                    _create_indexed_tensor_arg(
+                    _create_indexed_tensor_arg_from_name(
                         self,
                         arg_idx,
                         tensor_name,
-                        tensor,
+                        tensor_index,
                         index_args,
                         index_to_value_map,
                     )
@@ -739,13 +774,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                     )
 
                 for arg_idx, tensor_name in enumerate(tensor_names):
-                    tensor = self.load(tensor_name, sympy.Integer(0))
                     args.append(
-                        _create_indexed_tensor_arg(
+                        _create_indexed_tensor_arg_from_name(
                             self,
                             arg_idx,
                             tensor_name,
-                            tensor,
+                            sympy.Integer(0),
                             index_args,
                             index_to_value_map,
                         )
@@ -770,15 +804,14 @@ class SpyreKernel(Kernel[CSEVariable]):
                 for arg_idx, input in enumerate(value.arguments):
                     # Handle string buffer names (for indirect operations)
                     if isinstance(input, str):
-                        tensor_access = self.load(input, sympy.Integer(0))
                         temp_args.append(
                             (
                                 arg_idx,
-                                _create_indexed_tensor_arg(
+                                _create_indexed_tensor_arg_from_name(
                                     self,
                                     arg_idx,
                                     input,
-                                    tensor_access,
+                                    sympy.Integer(0),
                                     index_args,
                                     index_to_value_map,
                                 ),

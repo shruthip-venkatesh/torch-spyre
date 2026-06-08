@@ -556,7 +556,7 @@ def indices_to_address(
 ) -> torch.Tensor:
     import torch_spyre._C as _C
 
-    return _C.indices_to_addresses_nd(indices, value_tensor, dim)
+    return _C.indices_to_addresses_nd(indices, value_tensor, dim, virtual_offset)
 
 
 @indices_to_address.register_fake

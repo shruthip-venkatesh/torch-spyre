@@ -18,6 +18,7 @@ from sympy import Symbol
 from torch._inductor.virtualized import V
 
 from .constants import SEGMENT_OFFSETS
+from .errors import Unsupported
 from .op_spec import OpSpec
 
 
@@ -245,7 +246,7 @@ def get_value_tensor_max_dim_size(
         if index_dim_size < value_dim_size:
             return 1
         if value_dim_size < index_dim_size:
-            raise ValueError(
+            raise Unsupported(
                 f"Indirect access dimension mismatch for tensor {tensor_idx}, dim={dim}: "
                 f"value_dim_size={value_dim_size} < index_dim_size={index_dim_size}. "
                 f"value_host_shape={value_host_shape}, "

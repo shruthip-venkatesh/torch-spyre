@@ -24,8 +24,8 @@
 namespace spyre {
 
 at::Tensor indices_to_addresses_nd(const at::Tensor& logical_indices,
-                                   const at::Tensor& value_tensor,
-                                   int64_t dim) {
+                                   const at::Tensor& value_tensor, int64_t dim,
+                                   int64_t virtual_offset) {
   // Store the original device for later
   auto original_device = logical_indices.device();
 
@@ -40,9 +40,10 @@ at::Tensor indices_to_addresses_nd(const at::Tensor& logical_indices,
   // DeepTools stick size (128 bytes for Sen1.0)
   constexpr int64_t STICK_SIZE_BYTES = 128;
 
-  // Use relative addressing starting from 0
-  // The actual HBM base address will be set in SDSC JSON
-  int64_t base_address = 0;
+  // Use virtual_offset as the base address for address computation
+  // This allows for paged attention and other use cases requiring non-zero base
+  // addresses
+  int64_t base_address = virtual_offset;
   int64_t element_size = value_tensor.element_size();
 
   // Use the tensor's actual strides from SpyreTensorLayout.
