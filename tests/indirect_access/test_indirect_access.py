@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import Mock
 from sympy import Symbol
 
-from torch_spyre._inductor.indirect_access_utils import (
+from torch_spyre._inductor.indirect_access import (
     relabel_indirect_metadata_dims,
     get_indirect_pairs,
     find_indirect_pair_by_index_arg,
