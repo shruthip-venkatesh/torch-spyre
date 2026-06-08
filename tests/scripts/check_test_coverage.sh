@@ -54,8 +54,6 @@ TESTS_DIR="${REPO_ROOT}/tests"
 # (e.g. shared test harness helpers, not standalone test suites).
 IGNORED_TEST_FILES=(
   "models/test_model_ops.py"   # base class / helper — not a standalone test suite
-  "indirect_access/test_gather.py"  # helper — not a standalone test suite
-  "indirect_access/test_paged_attention.py"  # helper — not a standalone test suite
 )
 
 # ── Ignore list: config files ─────────────────────────────────────────────────

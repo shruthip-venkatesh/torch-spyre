@@ -33,7 +33,12 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
-from .pass_utils import compute_restickify_needed, device_coordinates, host_coordinates
+from .pass_utils import (
+    compute_restickify_needed,
+    device_coordinates,
+    host_coordinates,
+)
+from .indirect_access import is_indirect_access_operation
 
 INF = math.inf
 
@@ -323,15 +328,11 @@ def greedy_local_min_cost(operations: list) -> None:
             continue  # FallbackKernel and other unhandled op types
 
         # Skip operations with indirect access - they don't need restickify optimization
-        if hasattr(op, "data") and hasattr(op.data, "op_info") and op.data.op_info:
-            if (
-                "index_args" in op.data.op_info
-                or "index_value_pairs" in op.data.op_info
-            ):
-                # This is an indirect access operation, skip restickify optimization
-                # Just commit the first available layout
-                if op.layouts:
-                    op.committed_stl = next(iter(op.layouts))
+        if is_indirect_access_operation(op):
+            # This is an indirect access operation, skip restickify optimization
+            # Just commit the first available layout
+            if op.layouts:
+                op.committed_stl = next(iter(op.layouts))
                 continue
 
         assert hasattr(op, "restick_cost_fn"), (
@@ -467,22 +468,18 @@ def beam_global_min_cost(operations: list) -> None:
         frontier.add_buf(op.get_name())
 
         # Skip operations with indirect access - they don't need restickify optimization
-        if hasattr(op, "data") and hasattr(op.data, "op_info") and op.data.op_info:
-            if (
-                "index_args" in op.data.op_info
-                or "index_value_pairs" in op.data.op_info
-            ):
-                # This is an indirect access operation, skip restickify optimization
-                # Just use the first available layout and propagate all states
-                if op.layouts:
-                    stl = next(iter(op.layouts))
-                    frontier.states = [
-                        BeamState(
-                            assignments=state.assignments + (stl,),
-                            cost=state.cost,
-                        )
-                        for state in frontier.states
-                    ]
+        if is_indirect_access_operation(op):
+            # This is an indirect access operation, skip restickify optimization
+            # Just use the first available layout and propagate all states
+            if op.layouts:
+                stl = next(iter(op.layouts))
+                frontier.states = [
+                    BeamState(
+                        assignments=state.assignments + (stl,),
+                        cost=state.cost,
+                    )
+                    for state in frontier.states
+                ]
                 continue
 
         assert hasattr(op, "restick_cost_fn"), (

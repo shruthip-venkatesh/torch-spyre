@@ -54,7 +54,7 @@ from .op_spec import (
     TensorArg,
     UnimplementedOp as OpSpecUnimplementedOp,
 )
-from .indirect_access_utils import enrich_indirect_index_value_pairs
+from .indirect_access import enrich_indirect_index_value_pairs
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -375,6 +375,62 @@ class SpyreKernelOpsHandler(DefaultHandler):
         raise NotImplementedError
 
 
+def _get_index_metadata(op_info: dict[str, Any]) -> tuple[set[int], dict[int, int]]:
+    """Extract index_args and index_to_value_map from op_info.
+
+    Args:
+        op_info: Operation info dictionary containing index metadata
+
+    Returns:
+        Tuple of (index_args set, index_to_value_map dict)
+    """
+    index_args = set(op_info.get("index_args", []))
+    index_to_value_map = {}
+    if "index_value_pairs" in op_info:
+        for pair in op_info["index_value_pairs"]:
+            index_to_value_map[pair["index_arg"]] = pair["value_arg"]
+    return index_args, index_to_value_map
+
+
+def _create_indexed_tensor_arg(
+    kernel: "SpyreKernel",
+    arg_idx: int,
+    tensor_name: str,
+    tensor_access: TensorAccess,
+    index_args: set[int],
+    index_to_value_map: dict[int, int],
+) -> TensorArg:
+    """Create TensorArg with proper index tensor marking.
+
+    Args:
+        kernel: SpyreKernel instance
+        arg_idx: Argument index position
+        tensor_name: Name of the tensor
+        tensor_access: TensorAccess object
+        index_args: Set of argument indices that are index tensors
+        index_to_value_map: Mapping from index arg position to value arg position
+
+    Returns:
+        TensorArg with proper index tensor metadata
+    """
+    is_index_tensor = arg_idx in index_args
+    related_value_idx = index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"Creating TensorArg: arg_idx={arg_idx}, name={tensor_name}, "
+            f"is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}"
+        )
+
+    return kernel.create_tensor_arg(
+        True,
+        tensor_name,
+        tensor_access,
+        is_index_tensor=is_index_tensor,
+        related_value_tensor_idx=related_value_idx,
+    )
+
+
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -602,11 +658,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif op_info and "index_args" in op_info and "tensor_names" in op_info:
             # Handle indirect access operations where op_info specifies tensor names and index positions
             indirect_args: list[TensorArg] = []
-            index_args = set(op_info.get("index_args", []))
-            index_to_value_map = {}
-            if "index_value_pairs" in op_info:
-                for pair in op_info["index_value_pairs"]:
-                    index_to_value_map[pair["index_arg"]] = pair["value_arg"]
+            index_args, index_to_value_map = _get_index_metadata(op_info)
 
             # Use tensor_names from op_info (includes both value and index tensors)
             tensor_names = op_info["tensor_names"]
@@ -647,18 +699,14 @@ class SpyreKernel(Kernel[CSEVariable]):
                     tensor_index = sympy.Integer(0)
 
                 tensor = self.load(tensor_name, tensor_index)
-                is_index_tensor = arg_idx in index_args
-                related_value_idx = (
-                    index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
-                )
-
                 indirect_args.append(
-                    self.create_tensor_arg(
-                        True,
+                    _create_indexed_tensor_arg(
+                        self,
+                        arg_idx,
                         tensor_name,
                         tensor,
-                        is_index_tensor=is_index_tensor,
-                        related_value_tensor_idx=related_value_idx,
+                        index_args,
+                        index_to_value_map,
                     )
                 )
 
@@ -682,12 +730,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Check if op_info has tensor_names (from IR node) - use that path instead
             if op_info and "tensor_names" in op_info and "index_args" in op_info:
                 # Use tensor_names from op_info (includes both value and index tensors)
-                index_args = set(op_info.get("index_args", []))
-                index_to_value_map = {}
-                if "index_value_pairs" in op_info:
-                    for pair in op_info["index_value_pairs"]:
-                        index_to_value_map[pair["index_arg"]] = pair["value_arg"]
-
+                index_args, index_to_value_map = _get_index_metadata(op_info)
                 tensor_names = op_info["tensor_names"]
 
                 if logger.isEnabledFor(logging.DEBUG):
@@ -696,20 +739,15 @@ class SpyreKernel(Kernel[CSEVariable]):
                     )
 
                 for arg_idx, tensor_name in enumerate(tensor_names):
-                    # Load the tensor to get its TensorAccess
                     tensor = self.load(tensor_name, sympy.Integer(0))
-                    is_index_tensor = arg_idx in index_args
-                    related_value_idx = (
-                        index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
-                    )
-
                     args.append(
-                        self.create_tensor_arg(
-                            True,
+                        _create_indexed_tensor_arg(
+                            self,
+                            arg_idx,
                             tensor_name,
                             tensor,
-                            is_index_tensor=is_index_tensor,
-                            related_value_tensor_idx=related_value_idx,
+                            index_args,
+                            index_to_value_map,
                         )
                     )
 
@@ -720,55 +758,29 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.op_specs.append(self.create_op_spec(op_name, False, args, op_info))
             else:
                 # Original PointwiseOp path - extract from value.arguments
-                # Get index_args positions if this is an indirect operation
-                index_args = set(value.op_info.get("index_args", []))
+                index_args, index_to_value_map = _get_index_metadata(value.op_info)
 
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         f"PointwiseOp: op={value.op}, op_info={value.op_info}, index_args={index_args}"
                     )
 
-                # Build mapping from index tensor position to value tensor position
-                index_to_value_map = {}
-                if "index_value_pairs" in value.op_info:
-                    for pair in value.op_info["index_value_pairs"]:
-                        index_to_value_map[pair["index_arg"]] = pair["value_arg"]
-
-                # For indirect access operations, we need to ensure args are in the correct order:
-                # [value_tensor, index_tensor, output_tensor]
-                # The index_value_pairs tells us the mapping
+                # Build temp_args list with (arg_idx, TensorArg) tuples
                 temp_args = []
                 for arg_idx, input in enumerate(value.arguments):
                     # Handle string buffer names (for indirect operations)
                     if isinstance(input, str):
-                        # This is a buffer name passed directly
-                        # For indirect operations, the input buffer is referenced by name
-                        # but we need to load it to get its layout information
-                        # Use the load method to get a TensorAccess with proper layout
                         tensor_access = self.load(input, sympy.Integer(0))
-
-                        # Mark as value tensor (not index) for indirect operations
-                        is_index_tensor = arg_idx in index_args
-                        related_value_idx = (
-                            index_to_value_map.get(arg_idx, -1)
-                            if is_index_tensor
-                            else -1
-                        )
-
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(
-                                f"Creating TensorArg from buffer name via load: arg_idx={arg_idx}, name={input}, is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}"
-                            )
-
                         temp_args.append(
                             (
                                 arg_idx,
-                                self.create_tensor_arg(
-                                    True,
+                                _create_indexed_tensor_arg(
+                                    self,
+                                    arg_idx,
                                     input,
                                     tensor_access,
-                                    is_index_tensor=is_index_tensor,
-                                    related_value_tensor_idx=related_value_idx,
+                                    index_args,
+                                    index_to_value_map,
                                 ),
                             )
                         )
@@ -777,7 +789,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                     # Unwrap nested PointwiseOp (e.g., to_dtype) to get the underlying TensorAccess
                     unwrapped_input = input
                     while isinstance(unwrapped_input, PointwiseOp):
-                        # For ops like to_dtype, the first argument is the tensor
                         if unwrapped_input.arguments and isinstance(
                             unwrapped_input.arguments[0], (TensorAccess, PointwiseOp)
                         ):
@@ -786,30 +797,16 @@ class SpyreKernel(Kernel[CSEVariable]):
                             break
 
                     if isinstance(unwrapped_input, TensorAccess):
-                        # Mark this tensor as an index tensor if its position is in index_args
-                        is_index_tensor = arg_idx in index_args
-                        # Get the related value tensor index if this is an index tensor
-                        related_value_idx = (
-                            index_to_value_map.get(arg_idx, -1)
-                            if is_index_tensor
-                            else -1
-                        )
-
-                        # DEBUG: Log tensor marking
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(
-                                f"Creating TensorArg: arg_idx={arg_idx}, name={unwrapped_input.name}, is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}"
-                            )
-
                         temp_args.append(
                             (
                                 arg_idx,
-                                self.create_tensor_arg(
-                                    True,
+                                _create_indexed_tensor_arg(
+                                    self,
+                                    arg_idx,
                                     unwrapped_input.name,
                                     unwrapped_input,
-                                    is_index_tensor=is_index_tensor,
-                                    related_value_tensor_idx=related_value_idx,
+                                    index_args,
+                                    index_to_value_map,
                                 ),
                             )
                         )
@@ -817,14 +814,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                         raise Unsupported(f"unexpected argument {input} to {value.op}")
 
                 # For indirect access, reorder args so value tensor comes before index tensor
-                # Expected order: [value_tensor(0), index_tensor(1), output(2)]
                 if index_args and index_to_value_map:
-                    # Sort temp_args: value tensors first, then index tensors
                     temp_args.sort(key=lambda x: (x[0] in index_args, x[0]))
-                    args.extend([arg for _, arg in temp_args])
-                else:
-                    args.extend([arg for _, arg in temp_args])
 
+                args.extend([arg for _, arg in temp_args])
                 args.append(self.create_tensor_arg(False, real_dst_name, dst))
                 op_info.update(value.op_info)
                 op_name = op_info.pop("op", value.op)
