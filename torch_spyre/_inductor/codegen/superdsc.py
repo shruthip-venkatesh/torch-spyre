@@ -235,7 +235,6 @@ def _get_device_dim_order(
     stick_dim = free[0] if free else None
 
     dim_order: list[Symbol] = []
-
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
         expr = arg.device_coordinates[i].subs(symbol_mapping)
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
