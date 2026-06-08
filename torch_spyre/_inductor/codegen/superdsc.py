@@ -370,21 +370,12 @@ def _create_sdsc_tensors(
         # For index tensors in indirect access, use pre-computed layout
         if has_indirect_access and i in index_tensor_layouts:
             dim_order, stick_dim = index_tensor_layouts[i]
-        # For value tensors in indirect access, use op_dim_order directly
+        # For value/output tensors in indirect access, use dims directly
         elif has_indirect_access and (
             is_indirect_value_tensor(op_spec, i) or i == len(op_spec.args) - 1
         ):
             dim_order = dims
-            # Set stick_dim to 'out' (last element in op_dim_order for [mb, out])
-            stick_dim = dim_order[
-                -1
-            ]  # op_stick_dim #op_dim_order[-1] if op_dim_order else None
-        # For output tensors in indirect access, override stick dimension
-        # elif has_indirect_access and i == len(op_spec.args) - 1:
-        #     dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
-        #     # Override stick_dim to be the first dimension in dim_order (out)
-        #     stick_dim = dim_order[0] if dim_order else stick_dim
-        # For all other cases (direct access), use normal path
+            stick_dim = dim_order[-1]
         else:
             dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
 
@@ -504,7 +495,8 @@ def _create_sdsc_tensors(
             )
 
         # Step 8: Determine data format
-        # Index tensors use SENUINT32, all others use normal format
+        # Change dataFormat_ value if needed.
+        # This is a temporary workaround until the backend supports IEEE_INT32 in SDSC (deeptools issue #4307).
         arg_data_format = (
             DataFormats.SENUINT32
             if arg.is_index_tensor
@@ -512,7 +504,8 @@ def _create_sdsc_tensors(
         )
 
         # Step 9: Determine start address
-        # For indirect access, use segment offsets; otherwise extract from allocation
+        # For indirect access, use SEGMENT_OFFSETS symbols (index/value/output);
+        # otherwise extract from allocation (pool/lx/hbm)
         start_addr = (
             get_indirect_tensor_address(op_spec, index_args, i)
             if has_indirect_access
@@ -700,7 +693,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
-    # Use the merged function that handles both direct and indirect access
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
         symbol_mapping,

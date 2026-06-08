@@ -281,36 +281,6 @@ def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
     return -1
 
 
-def _get_related_indirect_access_alloc(sdsc_spec, tensor, tensor_idx: int) -> str:
-    """Get the allocation name for the related tensor in an indirect access pair.
-
-    For an index tensor, returns the allocation name of its related value tensor.
-    For a value tensor, returns the allocation name of the index tensor that references it.
-    """
-    if tensor.is_index_tensor:
-        return f"allocate-Tensor{tensor.related_value_tensor_idx}_hbm"
-    else:
-        index_tensor_idx = _find_index_tensor_for_value(sdsc_spec, tensor_idx)
-        return f"allocate-Tensor{index_tensor_idx}_hbm"
-
-
-def _should_add_indirect_access_field(sdsc_spec, tensor, tensor_idx: int) -> bool:
-    """Check if the relatedIndirectAccessAlloc_ field should be added.
-
-    Returns True if:
-    - The tensor is an index tensor with a valid related value tensor, OR
-    - The tensor is a value tensor that is referenced by an index tensor
-    """
-    if tensor.is_index_tensor and tensor.related_value_tensor_idx >= 0:
-        return True
-
-    # Check if this value tensor is referenced by any index tensor
-    value_tensor_indices = [
-        t.related_value_tensor_idx for t in sdsc_spec.args if t.is_index_tensor
-    ]
-    return tensor_idx in value_tensor_indices
-
-
 def _get_indirect_access_info(
     sdsc_spec, tensor, tensor_idx: int
 ) -> tuple[str, str | None]:
