@@ -17,11 +17,6 @@ import torch
 # TODO : Address computation for multicore : WIP
 # Until then set `SENCORES=1` testing indirect access
 
-# NOTE: torch.index_select requires 1D index tensor, but hardware needs
-# each index in a separate stick (device_size=[num_indices, 32] not [1, 32]).
-# This requires compiler-side fix to properly layout 1D index tensors.
-# See: Hardware out-of-bounds error analysis for details.
-
 
 def test_index_select_1d():
     """Test torch.index_select with 1D output"""
@@ -50,9 +45,6 @@ def test_index_select_1d():
     print("Index Tensor:", index_tensor)
     print("Index Tensor Shape:", index_tensor.shape)
 
-    # TODO: Compiler needs to layout this 1D tensor as [4, 32] sticks
-    # Currently generates [1, 32] causing hardware out-of-bounds
-
     # Compute expected result on CPU
     # The index_select should select elements at indices [0, 5, 2, 1] from input_tensor_cpu
     expected = torch.stack(
@@ -70,8 +62,7 @@ def test_index_select_1d():
 
     # print("Result Shape:", result.shape)
     # print("Result Spyre:", result)
-    num_indices = len(select_indices)
-    result_cpu = result.cpu()[0, :num_indices]
+    result_cpu = result.cpu()[:, 0]
     print("Result CPU :", result_cpu)
 
     # Assert the result matches expected values
@@ -136,21 +127,18 @@ def test_index_select_2d():
     result = compiled_fn(input_tensor, 0, index_tensor)
 
     result_cpu = result.cpu()  # Shape: [4, 64]
-    result_cpu = result_cpu.T  # Transpose to [64, 4]
-    result_cpu_trimmed = result_cpu[:embed_dim, :]  # Take first 16 rows
-    result_cpu_trimmed = result_cpu_trimmed.T  # Transpose back to [4, 16]
+    # Simply slice the first embed_dim columns (no transpose needed)
+    result_cpu_trimmed = result_cpu[:, :embed_dim]  # Take first 16 columns -> [4, 16]
 
     print("Result Shape:", result.shape)
-    print("Result Spyre:", result)
-    print("Result CPU (trimmed):", result_cpu)
+    # print("Result Spyre:", result)
+    print("Result CPU (trimmed):", result_cpu_trimmed)
 
     # Assert the result matches expected values
-    # assert torch.allclose(result_cpu_trimmed, expected, rtol=1e-3, atol=1e-3), \
-    #     f"Result mismatch! Max diff: {torch.max(torch.abs(result_cpu_trimmed - expected))}"
-    # print("✓ Assertion passed: Result matches expected values")
-    print(
-        f"test_index_select_2d [Max diff: {torch.max(torch.abs(result_cpu_trimmed - expected))}]: Assertion Fails as data is not fetched properly"
+    assert torch.allclose(result_cpu_trimmed, expected, rtol=1e-3, atol=1e-3), (
+        f"Result mismatch! Max diff: {torch.max(torch.abs(result_cpu_trimmed - expected))}"
     )
+    print("✓ Assertion passed: Result matches expected values")
 
     return result
 

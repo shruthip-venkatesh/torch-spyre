@@ -19,9 +19,9 @@ import torch
 
 
 def test_embedding_simple():
-    """Simple 1D embedding test with debug output"""
+    """Simple 1D embedding test"""
     print("\n" + "=" * 70)
-    print("Simple Embedding Test (1D indices) - WITH DEBUG")
+    print("Simple Embedding Test (1D indices)")
     print("=" * 70)
 
     vocab_size = 64
@@ -29,20 +29,17 @@ def test_embedding_simple():
 
     # Create embedding table
     embedding_table_cpu = torch.randn(vocab_size, embed_dim, dtype=torch.float16)
-    print(f"Embedding table shape: {embedding_table_cpu.shape}")
-    print("First few rows of embedding table:")
-    for i in [5, 20, 3, 42]:
-        print(f"  Row {i}: {embedding_table_cpu[i, :4].tolist()}")  # First 4 values
+    print(f"Embedding Table Shape: {embedding_table_cpu.shape}")
 
     # Pad to device requirement
     embedding_table = torch.nn.functional.pad(
         embedding_table_cpu, (0, 64 - embed_dim), value=0
     ).to("spyre")
-    print(f"Padded shape: {embedding_table.shape}")
 
-    # Indices
+    # Indices: select rows [5, 20, 3, 42]
     indices = torch.tensor([5, 20, 3, 42], dtype=torch.int64).to("spyre")
     print(f"Indices: {indices.tolist()}")
+    print(f"Index Tensor Shape: {indices.shape}")
 
     # Expected result
     expected = torch.stack(
@@ -53,10 +50,7 @@ def test_embedding_simple():
             embedding_table_cpu[42],
         ]
     )
-    print(f"\nExpected shape: {expected.shape}")
-    print("Expected values (first 4 cols):")
-    for i in range(4):
-        print(f"  Row {i}: {expected[i, :4].tolist()}")
+    print(f"Expected Result Shape: {expected.shape}")
 
     # Run embedding
     def embedding_fn(weight, indices):
@@ -65,52 +59,16 @@ def test_embedding_simple():
     compiled_fn = torch.compile(embedding_fn)
     result = compiled_fn(embedding_table, indices)
 
-    print(f"\nResult shape: {result.shape}")
     result_cpu = result.cpu()[:, :embed_dim]
-    print("Result values (first 4 cols):")
-    for i in range(4):
-        print(f"  Row {i}: {result_cpu[i, :4].tolist()}")
+    print(f"Result Shape: {result.shape}")
+    print(f"Result CPU (trimmed): {result_cpu}")
 
-    # Check pattern
-    print("\nChecking for data repetition pattern:")
-    print(
-        f"  result[0,:4] == expected[0,:4]? {torch.allclose(result_cpu[0, :4], expected[0, :4], rtol=1e-3, atol=1e-3)}"
+    # Verify
+    assert torch.allclose(result_cpu, expected, rtol=1e-3, atol=1e-3), (
+        f"Result mismatch!\nExpected shape: {expected.shape}\nGot shape: {result_cpu.shape}\n"
+        f"Max difference: {torch.max(torch.abs(result_cpu - expected))}"
     )
-    print(
-        f"  result[1,:4] == expected[1,:4]? {torch.allclose(result_cpu[1, :4], expected[1, :4], rtol=1e-3, atol=1e-3)}"
-    )
-    print(
-        f"  result[2,:4] == expected[2,:4]? {torch.allclose(result_cpu[2, :4], expected[2, :4], rtol=1e-3, atol=1e-3)}"
-    )
-    print(
-        f"  result[3,:4] == expected[3,:4]? {torch.allclose(result_cpu[3, :4], expected[3, :4], rtol=1e-3, atol=1e-3)}"
-    )
-
-    # Check if it's the transpose issue
-    print("\nChecking for transpose pattern:")
-    print(
-        f"  result[0,0] == expected[0,0]? {abs(result_cpu[0, 0] - expected[0, 0]) < 0.01}"
-    )
-    print(
-        f"  result[0,1] == expected[1,0]? {abs(result_cpu[0, 1] - expected[1, 0]) < 0.01}"
-    )
-    print(
-        f"  result[0,2] == expected[2,0]? {abs(result_cpu[0, 2] - expected[2, 0]) < 0.01}"
-    )
-    print(
-        f"  result[0,3] == expected[3,0]? {abs(result_cpu[0, 3] - expected[3, 0]) < 0.01}"
-    )
-
-    # Full comparison
-    max_diff = torch.max(torch.abs(result_cpu - expected))
-    print(f"\nMax difference: {max_diff}")
-
-    # assert torch.allclose(result_cpu, expected, rtol=1e-3, atol=1e-3), \
-    #     f"Result mismatch!\nExpected shape: {expected.shape}\nGot shape: {result_cpu.shape}\n" \
-    #     f"Max difference: {torch.max(torch.abs(result_cpu - expected))}"
-    print(
-        f"test_embedding_simple() [Max diff: {max_diff}]: Assertion Fails as data is not fetched properly"
-    )
+    print("✓ Assertion passed: Result matches expected values")
 
     return result
 

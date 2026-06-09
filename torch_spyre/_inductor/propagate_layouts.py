@@ -61,6 +61,7 @@ from .pass_utils import (
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
+from .indirect_access import is_indirect_access_operation
 from .views import matching_dim
 
 # ---------------------------------------------------------------------------
@@ -546,6 +547,28 @@ def _topk_layouts(
     return results
 
 
+def _indirect_access_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Compute layouts for indirect access operations (gather, scatter, embedding).
+
+    For indirect access operations, the output layout is determined by the operation's
+    semantics, not by propagating from inputs. Index tensors are used for address
+    computation and value tensors may have different dimensions than the output.
+    """
+    # For indirect access, use generic layout since dimensions may not match
+    # between value tensor and output
+    all_layouts = [generic_layout(op)]
+
+    # Use AnyInNode: indirect access operations handle layout conversion internally
+    # via address computation, so no restickify is needed before them
+    op.restick_cost_fn = AnyInNode.from_args()
+    return all_layouts
+
+
 def compute_layouts(
     op: Operation,
     output: FixedLayout,
@@ -558,6 +581,9 @@ def compute_layouts(
     2. Attach a restick cost function based on the type of op.
     """
     data = op.data
+
+    if is_indirect_access_operation(op):
+        return _indirect_access_layouts(op, output, output_dep, args)
 
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)
