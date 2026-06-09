@@ -75,6 +75,7 @@ from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .chunk_large_tensors import chunk_large_tensors
 from .coarse_tile import coarse_tile
+from .indices_to_address_pass import add_indices_to_address_pass
 
 
 logger = get_inductor_logger("passes")
@@ -212,6 +213,7 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
                 mm_to_bmm_pass.apply,
                 mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
+                add_indices_to_address_pass.apply,
             ]
         )
 
