@@ -41,6 +41,7 @@
 
 #include "logging.h"
 #include "prepare_kernel.h"
+#include "spyre_address_computation.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
 #include "spyre_guard.h"
