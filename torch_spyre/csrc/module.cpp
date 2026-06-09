@@ -408,4 +408,8 @@ PYBIND11_MODULE(_C, m) {
         "Args:\n"
         "    job_plan: The JobPlan to execute\n"
         "    args: Sequence of input/output tensors");
+  m.def("indices_to_addresses_nd", &spyre::indices_to_addresses_nd,
+        "Convert N-dimensional logical indices to addresses",
+        py::arg("logical_indices"), py::arg("value_tensor"), py::arg("dim") = 0,
+        py::arg("virtual_offset") = 0);
 }
