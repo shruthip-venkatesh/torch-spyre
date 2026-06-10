@@ -595,18 +595,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-
-        # Check if index contains any RValue objects (indirect access pattern)
-        # If so, don't try to sympify it - just use it as-is
-        if isinstance(index, RValue):
-            # This is an indirect access - the index is a loaded value
-            # Return a TensorAccess that will be handled specially in store()
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"kernel_load (indirect): {name}, index is RValue type {type(index).__name__}"
-                )
-            return TensorAccess(name, index, layout)
-
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         if "lx" not in layout.allocation and "pool" not in layout.allocation:
             _ = self.args.input(name)
@@ -705,31 +693,13 @@ class SpyreKernel(Kernel[CSEVariable]):
                     f"Indirect access op: tensor_names={tensor_names}, index_args={index_args}, op_info={op_info}"
                 )
 
-            for arg_idx, tensor_name in enumerate(tensor_names):
-                # For indirect access, create a generic index that maps iteration variables to tensor dimensions
+            for arg_idx, tensor_name in enumerate(op_info["tensor_names"]):
                 buf = V.graph.get_buffer(tensor_name)
                 layout = buf.get_layout()
 
-                # For indirect access, map iteration variables directly to tensor dimensions
-                # The last dimension will be handled specially by compute_coordinates for stickification
-                if len(layout.size) > 0 and len(it_space_keys) >= len(layout.size):
-                    # Direct mapping: iteration_var[i] * stride[i]
-                    # This will produce floor/mod coordinates for the stick dimension
-                    tensor_index = sum(
-                        it_space_keys[i] * concretize_expr(layout.stride[i])
-                        for i in range(len(layout.size))
-                    )
-                elif len(layout.size) > 0 and len(it_space_keys) > 0:
-                    # Fewer iteration vars than tensor dims - map what we can
-                    # Use last iteration var for last (stick) dimension
-                    tensor_index = sum(
-                        it_space_keys[min(i, len(it_space_keys) - 1)]
-                        * concretize_expr(layout.stride[i])
-                        for i in range(len(layout.size))
-                    )
-                else:
-                    tensor_index = sympy.Integer(0)
-
+                # Use a simple default index - compute_coordinates() will handle it
+                # The actual addressing is determined by device_coordinates in the layout
+                tensor_index = sympy.Integer(0)
                 tensor_access = TensorAccess(
                     name=tensor_name, layout=layout, index=tensor_index
                 )
@@ -737,13 +707,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 related_value_idx = (
                     index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
                 )
-
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        f"Creating TensorArg: arg_idx={arg_idx}, name={tensor_name}, "
-                        f"is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}"
-                    )
-
                 indirect_args.append(
                     self.create_tensor_arg(
                         True,
@@ -1042,10 +1005,9 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
 
 
 def simplify_op_spec(op_spec):
-    # Skip tensor alignment for indirect access operations to avoid adding extra dimensions
-    # that cause mismatches between tensor rank and iteration space dimensionality.
-    # Use is_index_tensor on args (authoritative) rather than op_info['index_args']
-    # (which may be absent when the indirect path is driven by detect_indirect_access).
+    # TODO : Skip tensor alignment for indirect access operations.
+    # Dependent on handle non-unit fractions :
+    # https://github.com/torch-spyre/torch-spyre/issues/1353
     is_indirect_access = any(a.is_index_tensor for a in op_spec.args)
     if is_indirect_access:
         logger.debug(
