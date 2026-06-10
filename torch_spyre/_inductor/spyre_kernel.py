@@ -375,98 +375,6 @@ class SpyreKernelOpsHandler(DefaultHandler):
         raise NotImplementedError
 
 
-def _get_index_metadata(op_info: dict[str, Any]) -> tuple[set[int], dict[int, int]]:
-    """Extract index_args and index_to_value_map from op_info.
-
-    Args:
-        op_info: Operation info dictionary containing index metadata
-
-    Returns:
-        Tuple of (index_args set, index_to_value_map dict)
-    """
-    index_args = set(op_info.get("index_args", []))
-    index_to_value_map = {}
-    if "index_value_pairs" in op_info:
-        for pair in op_info["index_value_pairs"]:
-            index_to_value_map[pair["index_arg"]] = pair["value_arg"]
-    return index_args, index_to_value_map
-
-
-def _create_indexed_tensor_arg(
-    kernel: "SpyreKernel",
-    arg_idx: int,
-    tensor_name: str,
-    tensor_access: TensorAccess,
-    index_args: set[int],
-    index_to_value_map: dict[int, int],
-) -> TensorArg:
-    """Create TensorArg with proper index tensor marking.
-
-    Args:
-        kernel: SpyreKernel instance
-        arg_idx: Argument index position
-        tensor_name: Name of the tensor
-        tensor_access: TensorAccess object (can be None if only layout is needed)
-        index_args: Set of argument indices that are index tensors
-        index_to_value_map: Mapping from index arg position to value arg position
-
-    Returns:
-        TensorArg with proper index tensor metadata
-    """
-    is_index_tensor = arg_idx in index_args
-    related_value_idx = index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
-
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            f"Creating TensorArg: arg_idx={arg_idx}, name={tensor_name}, "
-            f"is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}"
-        )
-
-    return kernel.create_tensor_arg(
-        True,
-        tensor_name,
-        tensor_access,
-        is_index_tensor=is_index_tensor,
-        related_value_tensor_idx=related_value_idx,
-    )
-
-
-def _create_indexed_tensor_arg_from_name(
-    kernel: "SpyreKernel",
-    arg_idx: int,
-    tensor_name: str,
-    tensor_index: sympy.Expr,
-    index_args: set[int],
-    index_to_value_map: dict[int, int],
-) -> TensorArg:
-    """Create TensorArg from tensor name and index without loading.
-
-    This avoids the workaround of loading with index 0 just to get layout.
-    Instead, gets the layout directly from the buffer and constructs TensorAccess.
-
-    Args:
-        kernel: SpyreKernel instance
-        arg_idx: Argument index position
-        tensor_name: Name of the tensor
-        tensor_index: Index expression for the tensor
-        index_args: Set of argument indices that are index tensors
-        index_to_value_map: Mapping from index arg position to value arg position
-
-    Returns:
-        TensorArg with proper index tensor metadata
-    """
-    # Get layout directly from buffer instead of loading with dummy index
-    buffer = V.graph.get_buffer(tensor_name)
-    layout = buffer.get_layout()
-
-    # Create a TensorAccess with the layout and provided index
-    tensor_access = TensorAccess(name=tensor_name, layout=layout, index=tensor_index)
-
-    return _create_indexed_tensor_arg(
-        kernel, arg_idx, tensor_name, tensor_access, index_args, index_to_value_map
-    )
-
-
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
@@ -692,11 +600,16 @@ class SpyreKernel(Kernel[CSEVariable]):
         elif op_info and "index_args" in op_info and "tensor_names" in op_info:
             # Handle indirect access operations where op_info specifies tensor names and index positions
             indirect_args: list[TensorArg] = []
-            index_args, index_to_value_map = _get_index_metadata(op_info)
+            index_args = set(op_info.get("index_args", []))
+            index_to_value_map = {}
+            if "index_value_pairs" in op_info:
+                for pair in op_info["index_value_pairs"]:
+                    index_to_value_map[pair["index_arg"]] = pair["value_arg"]
 
             # Use tensor_names from op_info (includes both value and index tensors)
             tensor_names = op_info["tensor_names"]
-            dim_labels = [str(d) for d in iteration_space(self.current_node).keys()]
+            it_space_keys = list(iteration_space(self.current_node).keys())
+            dim_labels = [str(d) for d in it_space_keys]
             enrich_indirect_index_value_pairs(op_info, dim_labels)
 
             if logger.isEnabledFor(logging.DEBUG):
@@ -708,9 +621,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # For indirect access, create a generic index that maps iteration variables to tensor dimensions
                 buf = V.graph.get_buffer(tensor_name)
                 layout = buf.get_layout()
-
-                # Create index using iteration space variables mapped to tensor dimensions
-                it_space_keys = list(iteration_space(self.current_node).keys())
 
                 # For indirect access, map iteration variables directly to tensor dimensions
                 # The last dimension will be handled specially by compute_coordinates for stickification
@@ -732,14 +642,27 @@ class SpyreKernel(Kernel[CSEVariable]):
                 else:
                     tensor_index = sympy.Integer(0)
 
+                tensor_access = TensorAccess(
+                    name=tensor_name, layout=layout, index=tensor_index
+                )
+                is_index_tensor = arg_idx in index_args
+                related_value_idx = (
+                    index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
+                )
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"Creating TensorArg: arg_idx={arg_idx}, name={tensor_name}, "
+                        f"is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}"
+                    )
+
                 indirect_args.append(
-                    _create_indexed_tensor_arg_from_name(
-                        self,
-                        arg_idx,
+                    self.create_tensor_arg(
+                        True,
                         tensor_name,
-                        tensor_index,
-                        index_args,
-                        index_to_value_map,
+                        tensor_access,
+                        is_index_tensor=is_index_tensor,
+                        related_value_tensor_idx=related_value_idx,
                     )
                 )
 
@@ -1034,8 +957,6 @@ def simplify_op_spec(op_spec):
     # that cause mismatches between tensor rank and iteration space dimensionality.
     # Use is_index_tensor on args (authoritative) rather than op_info['index_args']
     # (which may be absent when the indirect path is driven by detect_indirect_access).
-    if isinstance(op_spec, UnimplementedOp):
-        return
     is_indirect_access = any(a.is_index_tensor for a in op_spec.args)
     if is_indirect_access:
         logger.debug(
