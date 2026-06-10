@@ -44,15 +44,16 @@ from torch_spyre._inductor.indirect_access import (
 # Create a mock logger for tests
 class MockLogger:
     """Mock logger for testing."""
+
     def debug(self, msg):
         pass
-    
+
     def info(self, msg):
         pass
-    
+
     def warning(self, msg):
         pass
-    
+
     def error(self, msg):
         pass
 
@@ -66,14 +67,14 @@ class TestMaxDimSizesComputation:
 
     def test_value_tensor_maxdim_sizes_4d_value_3d_index(self):
         """Test maxDimSizes for 4D value tensor with 3D index tensor.
-        
+
         Pattern: value[out, mb, x, y] accessed via index[mb, x, y]
         Expected maxDimSizes for value: [-1, -1, -1, -1]
         - out: -1 (not in index, indirectly accessed)
         - mb: -1 (in index with equal size, dynamically accessed)
         - x: -1 (in index with equal size, dynamically accessed)
         - y: -1 (stick dim, always -1)
-        
+
         Note: When dimensions are present in both value and index with equal sizes,
         they get -1 (not device_size) because they're accessed dynamically via the index.
         """
@@ -82,7 +83,7 @@ class TestMaxDimSizesComputation:
         mb_sym = Symbol("mb")
         x_sym = Symbol("x")
         y_sym = Symbol("y")
-        
+
         # Value tensor: 4D [out=128, mb=128, x=8, y=2]
         value_tensor = TensorArg(
             arg_index=0,
@@ -94,7 +95,7 @@ class TestMaxDimSizesComputation:
             is_index_tensor=False,
             related_value_tensor_idx=-1,
         )
-        
+
         # Index tensor: 3D [mb=128, x=8, y=2]
         index_tensor = TensorArg(
             arg_index=1,
@@ -106,7 +107,7 @@ class TestMaxDimSizesComputation:
             is_index_tensor=True,
             related_value_tensor_idx=0,
         )
-        
+
         # Create op_spec
         iteration_space = {
             out_sym: 128,
@@ -114,7 +115,7 @@ class TestMaxDimSizesComputation:
             x_sym: 8,
             y_sym: 2,
         }
-        
+
         op_spec = OpSpec(
             op="identity",
             args=[value_tensor, index_tensor],
@@ -132,38 +133,44 @@ class TestMaxDimSizesComputation:
                 ],
             },
         )
-        
+
         # Test maxDimSizes computation
         symbol_mapping = {out_sym: out_sym, mb_sym: mb_sym, x_sym: x_sym, y_sym: y_sym}
         index_args = {1}
-        
+
         # Collect index tensor layouts
         index_active_dims = collect_index_tensor_layouts(
             op_spec, symbol_mapping, index_args, mock_logger
         )
-        
+
         # Test value tensor maxDimSizes
         for dim in [out_sym, mb_sym, x_sym, y_sym]:
             max_dim_size, stride_mult, offset_mult = compute_indirect_max_dim_sizes(
                 tensor_idx=0,
                 dim=dim,
                 stick_dim=y_sym,
-                original_dev_dim_size=128 if dim == out_sym else 64 if dim == mb_sym else 1,
+                original_dev_dim_size=128
+                if dim == out_sym
+                else 64
+                if dim == mb_sym
+                else 1,
                 op_spec=op_spec,
                 symbol_mapping=symbol_mapping,
                 index_args=index_args,
                 index_active_dims=index_active_dims,
                 logger=mock_logger,
             )
-            
+
             # All dimensions should be -1 for value tensors in indirect access
             # - out: not in index (indirectly accessed)
             # - mb, x, y: in index with equal sizes (dynamically accessed via index)
-            assert max_dim_size == -1, f"{dim} dimension should be -1, got {max_dim_size}"
+            assert max_dim_size == -1, (
+                f"{dim} dimension should be -1, got {max_dim_size}"
+            )
 
     def test_value_tensor_maxdim_sizes_2d_value_1d_index(self):
         """Test maxDimSizes for 2D value tensor with 1D index tensor.
-        
+
         Pattern: value[vocab, embed] accessed via index[batch]
         Expected maxDimSizes for value: [-1, -1]
         - vocab: -1 (not in index, indirectly accessed)
@@ -172,7 +179,7 @@ class TestMaxDimSizesComputation:
         vocab_sym = Symbol("vocab")
         embed_sym = Symbol("embed")
         batch_sym = Symbol("batch")
-        
+
         value_tensor = TensorArg(
             arg_index=0,
             is_input=True,
@@ -183,7 +190,7 @@ class TestMaxDimSizesComputation:
             is_index_tensor=False,
             related_value_tensor_idx=-1,
         )
-        
+
         index_tensor = TensorArg(
             arg_index=1,
             is_input=True,
@@ -194,13 +201,13 @@ class TestMaxDimSizesComputation:
             is_index_tensor=True,
             related_value_tensor_idx=0,
         )
-        
+
         iteration_space = {
             vocab_sym: 1000,
             embed_sym: 128,
             batch_sym: 32,
         }
-        
+
         op_spec = OpSpec(
             op="identity",
             args=[value_tensor, index_tensor],
@@ -218,14 +225,18 @@ class TestMaxDimSizesComputation:
                 ],
             },
         )
-        
-        symbol_mapping = {vocab_sym: vocab_sym, embed_sym: embed_sym, batch_sym: batch_sym}
+
+        symbol_mapping = {
+            vocab_sym: vocab_sym,
+            embed_sym: embed_sym,
+            batch_sym: batch_sym,
+        }
         index_args = {1}
-        
+
         index_active_dims = collect_index_tensor_layouts(
             op_spec, symbol_mapping, index_args, mock_logger
         )
-        
+
         # Both dimensions should be -1 (not in index tensor)
         for dim, dev_size in [(vocab_sym, 1000), (embed_sym, 64)]:
             max_dim_size, _, _ = compute_indirect_max_dim_sizes(
@@ -259,7 +270,7 @@ class TestLayoutLabelAssignment:
             is_index_tensor=True,
             related_value_tensor_idx=0,
         )
-        
+
         assert index_tensor.is_index_tensor is True
         assert index_tensor.related_value_tensor_idx == 0
 
@@ -275,7 +286,7 @@ class TestLayoutLabelAssignment:
             is_index_tensor=False,
             related_value_tensor_idx=-1,
         )
-        
+
         assert value_tensor.is_index_tensor is False
         assert value_tensor.is_input is True
 
@@ -295,7 +306,7 @@ class TestIndirectAccessHelpers:
             is_index_tensor=False,
             related_value_tensor_idx=-1,
         )
-        
+
         index_tensor = TensorArg(
             arg_index=1,
             is_input=True,
@@ -306,7 +317,7 @@ class TestIndirectAccessHelpers:
             is_index_tensor=True,
             related_value_tensor_idx=0,
         )
-        
+
         output_tensor = TensorArg(
             arg_index=2,
             is_input=False,
@@ -317,7 +328,7 @@ class TestIndirectAccessHelpers:
             is_index_tensor=False,
             related_value_tensor_idx=-1,
         )
-        
+
         op_spec = OpSpec(
             op="identity",
             args=[value_tensor, index_tensor, output_tensor],
@@ -325,7 +336,7 @@ class TestIndirectAccessHelpers:
             is_reduction=False,
             op_info={"index_args": [1]},
         )
-        
+
         assert is_indirect_value_tensor(op_spec, 0) is True
         assert is_indirect_value_tensor(op_spec, 1) is False
         assert is_indirect_value_tensor(op_spec, 2) is False
@@ -333,17 +344,38 @@ class TestIndirectAccessHelpers:
     def test_get_indirect_tensor_address(self):
         """Test address assignment for indirect access tensors."""
         from torch_spyre._inductor.constants import SEGMENT_OFFSETS
-        
-        value_tensor = TensorArg(arg_index=0, is_input=True, device_size=[64], 
-                                device_coordinates=[], device_dtype=DataFormats.SEN169_FP16,
-                                allocation={}, is_index_tensor=False, related_value_tensor_idx=-1)
-        index_tensor = TensorArg(arg_index=1, is_input=True, device_size=[32],
-                                device_coordinates=[], device_dtype=DataFormats.SENUINT32,
-                                allocation={}, is_index_tensor=True, related_value_tensor_idx=0)
-        output_tensor = TensorArg(arg_index=2, is_input=False, device_size=[64],
-                                 device_coordinates=[], device_dtype=DataFormats.SEN169_FP16,
-                                 allocation={}, is_index_tensor=False, related_value_tensor_idx=-1)
-        
+
+        value_tensor = TensorArg(
+            arg_index=0,
+            is_input=True,
+            device_size=[64],
+            device_coordinates=[],
+            device_dtype=DataFormats.SEN169_FP16,
+            allocation={},
+            is_index_tensor=False,
+            related_value_tensor_idx=-1,
+        )
+        index_tensor = TensorArg(
+            arg_index=1,
+            is_input=True,
+            device_size=[32],
+            device_coordinates=[],
+            device_dtype=DataFormats.SENUINT32,
+            allocation={},
+            is_index_tensor=True,
+            related_value_tensor_idx=0,
+        )
+        output_tensor = TensorArg(
+            arg_index=2,
+            is_input=False,
+            device_size=[64],
+            device_coordinates=[],
+            device_dtype=DataFormats.SEN169_FP16,
+            allocation={},
+            is_index_tensor=False,
+            related_value_tensor_idx=-1,
+        )
+
         op_spec = OpSpec(
             op="identity",
             args=[value_tensor, index_tensor, output_tensor],
@@ -351,15 +383,15 @@ class TestIndirectAccessHelpers:
             is_reduction=False,
             op_info={"index_args": [1]},
         )
-        
+
         index_args = {1}
-        
+
         # Value tensor should get SEGMENT_OFFSETS[0]
         assert get_indirect_tensor_address(op_spec, index_args, 0) == SEGMENT_OFFSETS[0]
-        
+
         # Index tensor should get SEGMENT_OFFSETS[1]
         assert get_indirect_tensor_address(op_spec, index_args, 1) == SEGMENT_OFFSETS[1]
-        
+
         # Output tensor should get SEGMENT_OFFSETS[2]
         assert get_indirect_tensor_address(op_spec, index_args, 2) == SEGMENT_OFFSETS[2]
 
@@ -367,18 +399,20 @@ class TestIndirectAccessHelpers:
         """Test identification of positive indirect dimensions."""
         value_host_shape = {"out": 128, "mb": 128, "x": 8, "y": 2}
         index_host_shape = {"mb": 128, "x": 8, "y": 2}
-        
+
         positive_dims = get_positive_indirect_dims(value_host_shape, index_host_shape)
-        
+
         # Dimensions in both value and index with index_size < value_size
         # In this case, all shared dimensions have equal sizes, so no positive dims
         assert positive_dims == set()
-        
+
         # Test with different sizes
         value_host_shape2 = {"out": 128, "mb": 128}
         index_host_shape2 = {"mb": 64}  # mb in index is smaller
-        
-        positive_dims2 = get_positive_indirect_dims(value_host_shape2, index_host_shape2)
+
+        positive_dims2 = get_positive_indirect_dims(
+            value_host_shape2, index_host_shape2
+        )
         assert "mb" in positive_dims2
 
     def test_get_active_indirect_dims(self):
@@ -386,9 +420,11 @@ class TestIndirectAccessHelpers:
         all_dims = [Symbol("out"), Symbol("mb"), Symbol("x"), Symbol("y")]
         value_host_shape = {"out": 128, "mb": 128, "x": 8, "y": 2}
         index_host_shape = {"mb": 64, "x": 8, "y": 2}
-        
-        active_dims = get_active_indirect_dims(all_dims, value_host_shape, index_host_shape)
-        
+
+        active_dims = get_active_indirect_dims(
+            all_dims, value_host_shape, index_host_shape
+        )
+
         # Should include mb (positive indirect dim)
         assert Symbol("mb") in active_dims
 
@@ -408,7 +444,7 @@ class TestDataFormatHandling:
             is_index_tensor=True,
             related_value_tensor_idx=0,
         )
-        
+
         assert index_tensor.device_dtype == DataFormats.SENUINT32
 
     def test_value_tensor_preserves_original_dtype(self):
@@ -423,7 +459,7 @@ class TestDataFormatHandling:
             is_index_tensor=False,
             related_value_tensor_idx=-1,
         )
-        
+
         assert value_tensor.device_dtype == DataFormats.SEN169_FP16
 
 
@@ -432,7 +468,7 @@ class TestStrideAndOffsetComputation:
 
     def test_index_tensor_stride_zeroing(self):
         """Test that non-indexed dimensions have zero stride in index tensors.
-        
+
         For dimensions not present in the index tensor, strides should be zeroed
         to prevent incorrect address computation.
         """
@@ -448,7 +484,7 @@ class TestScatterOperation:
         """Test that scatter operations have correct indirect access metadata."""
         # Scatter: output[index[i]] = src[i]
         # src is value tensor, index is index tensor, output is output tensor
-        
+
         src_tensor = TensorArg(
             arg_index=0,
             is_input=True,
@@ -459,7 +495,7 @@ class TestScatterOperation:
             is_index_tensor=False,
             related_value_tensor_idx=-1,
         )
-        
+
         index_tensor = TensorArg(
             arg_index=1,
             is_input=True,
@@ -470,7 +506,7 @@ class TestScatterOperation:
             is_index_tensor=True,
             related_value_tensor_idx=2,  # Points to output
         )
-        
+
         output_tensor = TensorArg(
             arg_index=2,
             is_input=False,
@@ -481,7 +517,7 @@ class TestScatterOperation:
             is_index_tensor=False,
             related_value_tensor_idx=-1,
         )
-        
+
         op_spec = OpSpec(
             op="scatter",
             args=[src_tensor, index_tensor, output_tensor],
@@ -497,7 +533,7 @@ class TestScatterOperation:
                 ],
             },
         )
-        
+
         # Verify scatter metadata
         assert index_tensor.is_index_tensor is True
         assert index_tensor.related_value_tensor_idx == 2
@@ -506,4 +542,3 @@ class TestScatterOperation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
