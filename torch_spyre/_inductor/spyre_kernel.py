@@ -612,16 +612,13 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # Use a simple default index - compute_coordinates() will handle it
                 # The actual addressing is determined by device_coordinates in the layout
                 tensor_index = sympy.Integer(0)
-
                 tensor_access = TensorAccess(
                     name=tensor_name, layout=layout, index=tensor_index
                 )
-
                 is_index_tensor = arg_idx in index_args
                 related_value_idx = (
                     index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
                 )
-
                 indirect_args.append(
                     self.create_tensor_arg(
                         True,
