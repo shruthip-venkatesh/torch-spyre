@@ -266,6 +266,11 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
     return annotate
 
 
+@_runs(detect_indirect_access)
+def _maybe_detect_indirect_access(graph: GraphLowering) -> None:
+    detect_indirect_access(graph.operations)
+
+
 @_runs(chunk_large_tensors)
 def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
     if config.chunk_large_tensors:
@@ -316,7 +321,7 @@ class CustomPreSchedulingPasses:
     def __init__(self):
         self.passes = [
             deadcode_elimination,
-            detect_indirect_access,
+            _maybe_detect_indirect_access,
             #
             # Tensor Layout (Stickification)
             propagate_spyre_tensor_layouts,
