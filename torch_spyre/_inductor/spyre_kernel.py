@@ -609,9 +609,17 @@ class SpyreKernel(Kernel[CSEVariable]):
                 buf = V.graph.get_buffer(tensor_name)
                 layout = buf.get_layout()
 
-                # Use a simple default index - compute_coordinates() will handle it
-                # The actual addressing is determined by device_coordinates in the layout
+                # Compute the proper index for this tensor based on its layout
+                # The index should be computed from the iteration space and tensor strides
+                it_space = iteration_space(self.current_node)
+                it_space_syms = list(it_space.keys())
+
+                # Compute the linear index: sum of (dimension_symbol * stride)
                 tensor_index = sympy.Integer(0)
+                for dim_idx, dim_sym in enumerate(it_space_syms):
+                    if dim_idx < len(layout.stride):
+                        tensor_index += dim_sym * layout.stride[dim_idx]
+
                 tensor_access = TensorAccess(
                     name=tensor_name, layout=layout, index=tensor_index
                 )
