@@ -16,6 +16,7 @@ from typing import Any
 
 from torch._inductor.virtualized import V
 
+
 def get_labeled_layout_metadata(
     tensor_name: str,
     dim_labels: list[str],
