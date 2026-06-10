@@ -429,9 +429,8 @@ def _create_sdsc_tensors(
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
-            # Store original device dimension size
-            original_dev_dim_size = arg.device_size[-stride_idx - 2]
-            dev_dim_size = original_dev_dim_size
+            # Handling device dimension size
+            dev_dim_size = arg.device_size[-stride_idx - 2]
             it_dim_size = iteration_space[dim]
 
             if dim == stick_dim:
@@ -452,7 +451,7 @@ def _create_sdsc_tensors(
                     i,
                     dim,
                     stick_dim,
-                    original_dev_dim_size,
+                    dev_dim_size,
                     op_spec,
                     symbol_mapping,
                     index_args,
