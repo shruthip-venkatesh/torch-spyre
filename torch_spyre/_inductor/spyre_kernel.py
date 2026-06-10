@@ -55,6 +55,7 @@ from .op_spec import (
     TensorArg,
     UnimplementedOp as OpSpecUnimplementedOp,
 )
+from .indirect_access import enrich_indirect_index_value_pairs
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -404,6 +405,12 @@ class SpyreKernelOpsHandler(DefaultHandler):
         self.kernel.store_buffer_names.add(name)
         self.kernel.store_reduction(name, index, value)
 
+    def indirect_indexing(
+        self, index_var, size: int, check: bool = True, wrap_neg: bool = True
+    ) -> sympy.Symbol:
+        """Forward indirect_indexing calls to the kernel."""
+        return self.kernel.indirect_indexing(index_var, size, check, wrap_neg)
+
     def reduction(
         self,
         dtype: torch.dtype,
@@ -453,7 +460,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         return self
 
     def create_tensor_arg(
-        self, is_input: bool, name: str, tensor: TensorAccess
+        self,
+        is_input: bool,
+        name: str,
+        tensor: TensorAccess,
+        is_index_tensor: bool = False,
+        related_value_tensor_idx: int = -1,
     ) -> TensorArg:
         it_space = iteration_space(self.current_node)
         # With dynamic=True the host index may contain symbolic strides
@@ -476,6 +488,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.allocation,
             stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
+            is_index_tensor=is_index_tensor,
+            related_value_tensor_idx=related_value_tensor_idx,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -581,6 +595,18 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+
+        # Check if index contains any RValue objects (indirect access pattern)
+        # If so, don't try to sympify it - just use it as-is
+        if isinstance(index, RValue):
+            # This is an indirect access - the index is a loaded value
+            # Return a TensorAccess that will be handled specially in store()
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"kernel_load (indirect): {name}, index is RValue type {type(index).__name__}"
+                )
+            return TensorAccess(name, index, layout)
+
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         if "lx" not in layout.allocation and "pool" not in layout.allocation:
             _ = self.args.input(name)
@@ -592,6 +618,33 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
 
         return TensorAccess(name, index, layout)
+
+    def indirect_indexing(
+        self, index_var, size: int, check: bool = True, wrap_neg: bool = True
+    ) -> sympy.Symbol:
+        """
+        Handle indirect indexing operations created by PyTorch's inductor.
+
+        This is called when inductor detects an indirect access pattern like:
+            tmp0 = ops.load(index_tensor, i)
+            result = ops.load(data_tensor, tmp0)
+
+        Args:
+            index_var: The loaded index value (TensorAccess or sympy expression)
+            size: The size of the dimension being indexed
+            check: Whether to check bounds
+            wrap_neg: Whether to wrap negative indices
+
+        Returns a sympy symbol representing the indirect index. For TensorAccess
+        objects, we extract the underlying index expression.
+        """
+        # If index_var is a TensorAccess, extract its index expression
+        if isinstance(index_var, TensorAccess):
+            # Create a unique symbol to represent this indirect index
+            # The actual value will be loaded at runtime
+            return index_var.index
+        # Otherwise, return as-is (it's already a sympy expression)
+        return index_var
 
     def store(
         self,
@@ -616,6 +669,13 @@ class SpyreKernel(Kernel[CSEVariable]):
             # Skip allocating an output buffer; this name is an alias to another buffer
             V.graph.removed_buffers.add(name)
         op_info: dict[str, Any] = {}
+        ir_node = self.current_node.node
+        if (
+            hasattr(ir_node, "data")
+            and hasattr(ir_node.data, "op_info")
+            and isinstance(ir_node.data.op_info, dict)
+        ):
+            op_info.update(ir_node.data.op_info)
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
             logger.debug(
@@ -625,6 +685,83 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if isinstance(value, UnimplementedOp):
             self.op_specs.append(value)
+        elif op_info and "index_args" in op_info and "tensor_names" in op_info:
+            # Handle indirect access operations where op_info specifies tensor names and index positions
+            indirect_args: list[TensorArg] = []
+            index_args = set(op_info.get("index_args", []))
+            index_to_value_map = {}
+            if "index_value_pairs" in op_info:
+                for pair in op_info["index_value_pairs"]:
+                    index_to_value_map[pair["index_arg"]] = pair["value_arg"]
+
+            # Use tensor_names from op_info (includes both value and index tensors)
+            tensor_names = op_info["tensor_names"]
+            it_space_keys = list(iteration_space(self.current_node).keys())
+            dim_labels = [str(d) for d in it_space_keys]
+            enrich_indirect_index_value_pairs(op_info, dim_labels)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"Indirect access op: tensor_names={tensor_names}, index_args={index_args}, op_info={op_info}"
+                )
+
+            for arg_idx, tensor_name in enumerate(tensor_names):
+                # For indirect access, create a generic index that maps iteration variables to tensor dimensions
+                buf = V.graph.get_buffer(tensor_name)
+                layout = buf.get_layout()
+
+                # For indirect access, map iteration variables directly to tensor dimensions
+                # The last dimension will be handled specially by compute_coordinates for stickification
+                if len(layout.size) > 0 and len(it_space_keys) >= len(layout.size):
+                    # Direct mapping: iteration_var[i] * stride[i]
+                    # This will produce floor/mod coordinates for the stick dimension
+                    tensor_index = sum(
+                        it_space_keys[i] * concretize_expr(layout.stride[i])
+                        for i in range(len(layout.size))
+                    )
+                elif len(layout.size) > 0 and len(it_space_keys) > 0:
+                    # Fewer iteration vars than tensor dims - map what we can
+                    # Use last iteration var for last (stick) dimension
+                    tensor_index = sum(
+                        it_space_keys[min(i, len(it_space_keys) - 1)]
+                        * concretize_expr(layout.stride[i])
+                        for i in range(len(layout.size))
+                    )
+                else:
+                    tensor_index = sympy.Integer(0)
+
+                tensor_access = TensorAccess(
+                    name=tensor_name, layout=layout, index=tensor_index
+                )
+                is_index_tensor = arg_idx in index_args
+                related_value_idx = (
+                    index_to_value_map.get(arg_idx, -1) if is_index_tensor else -1
+                )
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"Creating TensorArg: arg_idx={arg_idx}, name={tensor_name}, "
+                        f"is_index_tensor={is_index_tensor}, related_value_idx={related_value_idx}"
+                    )
+
+                indirect_args.append(
+                    self.create_tensor_arg(
+                        True,
+                        tensor_name,
+                        tensor_access,
+                        is_index_tensor=is_index_tensor,
+                        related_value_tensor_idx=related_value_idx,
+                    )
+                )
+
+            # Add output tensor
+            indirect_args.append(self.create_tensor_arg(False, real_dst_name, dst))
+
+            # Create the op spec
+            op_name = op_info.get("op", "identity")
+            self.op_specs.append(
+                self.create_op_spec(op_name, False, indirect_args, op_info)
+            )
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops
             args: list[TensorArg] = []
@@ -744,13 +881,38 @@ class SpyreKernel(Kernel[CSEVariable]):
         pool_size = getattr(V.graph, "pool_size", 0)
         has_pool_allocations = pool_size > 0
 
-        for name, tensor_arg in self.spyre_kernel_args:
-            tensor_arg.arg_index = actuals.index(name)
-            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
-                tensor_arg.arg_index + 1
-                if has_pool_allocations
-                else tensor_arg.arg_index
-            ]
+        # Check if any op_spec has indirect access (index tensor present in args).
+        def has_indirect_access_recursive(op_spec):
+            """Recursively check if op_spec or its nested operations have indirect access."""
+            if isinstance(op_spec, UnimplementedOp):
+                return False
+            if isinstance(op_spec, LoopSpec):
+                return any(has_indirect_access_recursive(op) for op in op_spec.body)
+            # OpSpec case
+            return any(a.is_index_tensor for a in op_spec.args)
+
+        has_indirect_access = any(
+            has_indirect_access_recursive(op_spec) for op_spec in self.op_specs
+        )
+        # Cache for call_kernel, which runs after codegen_kernel returns.
+        self._has_indirect_access = has_indirect_access
+
+        for i, (name, tensor_arg) in enumerate(self.spyre_kernel_args):
+            if has_indirect_access:
+                # For indirect-access kernels, spyre_kernel_args is already ordered
+                # [value_tensor, index_tensor, output] by the store() routing logic.
+                # Use this position as arg_index so the generated TensorArg and the
+                # .run() call agree on slot assignment.
+                # We must NOT use actuals.index(name) here because actuals reflects
+                # the inner_fn load order (index loaded first for gathers → inverted).
+                tensor_arg.arg_index = i
+            else:
+                tensor_arg.arg_index = actuals.index(name)
+                tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
+                    tensor_arg.arg_index + 1
+                    if has_pool_allocations
+                    else tensor_arg.arg_index
+                ]
 
         buf = IndentedBuffer()
         buf.writeline("[")
@@ -767,8 +929,17 @@ class SpyreKernel(Kernel[CSEVariable]):
         if getattr(V.graph, "pool_size", 0) > 0:
             call_args.append("_pool")
 
-        # Add remaining kernel arguments
-        call_args.extend(self.args.python_argdefs()[1])
+        if getattr(self, "_has_indirect_access", False):
+            # Emit arguments in spyre_kernel_args order: [value_tensor, index_tensor, output].
+            # This matches the arg_index assignment in codegen_kernel and ensures the runtime
+            # binds each tensor to the correct SDSC slot (slot 0 = value, slot 1 = index).
+            # Using self.args.python_argdefs()[1] (actuals) would be wrong here: actuals
+            # reflects the inner_fn load order, which for gather-style ops is inverted
+            # (index loaded first, value second).
+            call_args.extend(n for n, _ in self.spyre_kernel_args)
+        else:
+            # Add remaining kernel arguments
+            call_args.extend(self.args.python_argdefs()[1])
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
@@ -860,12 +1031,27 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(f"stride_map={arg.stride_map!r},")
                             if arg.per_tile_fixed:
                                 buf.writeline("per_tile_fixed=True,")
+                            if arg.is_index_tensor:
+                                buf.writeline(f"is_index_tensor={arg.is_index_tensor},")
+                                buf.writeline(
+                                    f"related_value_tensor_idx={arg.related_value_tensor_idx},"
+                                )
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")
 
 
 def simplify_op_spec(op_spec):
+    # Skip tensor alignment for indirect access operations to avoid adding extra dimensions
+    # that cause mismatches between tensor rank and iteration space dimensionality.
+    # Use is_index_tensor on args (authoritative) rather than op_info['index_args']
+    # (which may be absent when the indirect path is driven by detect_indirect_access).
+    is_indirect_access = any(a.is_index_tensor for a in op_spec.args)
+    if is_indirect_access:
+        logger.debug(
+            f"Skipping align_tensors for indirect access operation: {op_spec.op}"
+        )
+        return
     new_op_space_splits, new_tensors = align_tensors(
         op_spec.iteration_space,
         [
