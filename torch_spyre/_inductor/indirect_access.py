@@ -365,39 +365,6 @@ def compute_index_tensor_layout(
         return [], None
 
 
-def should_zero_stride_offset(
-    tensor_idx: int,
-    dim: Any,
-    stick_dim: Any,
-    index_active_dims: dict[int, set],
-    is_value_tensor: bool,
-) -> bool:
-    """Determine if stride and offset should be zeroed for a dimension.
-
-    For value tensors in indirect access, dimensions that are not actively indexed
-    (i.e., used for work division only) should have zero stride and offset to prevent
-    work tile coordinates from corrupting address calculations.
-
-    Args:
-        tensor_idx: Index of the tensor
-        dim: The dimension to check
-        stick_dim: The stick dimension
-        index_active_dims: Mapping of index tensor idx to their active dimensions
-        is_value_tensor: Whether this is a value tensor
-
-    Returns:
-        True if stride and offset should be zeroed, False otherwise
-    """
-    if not is_value_tensor:
-        return False
-
-    if tensor_idx not in index_active_dims:
-        return False
-
-    active_dims = index_active_dims[tensor_idx]
-    return dim not in active_dims and dim != stick_dim
-
-
 def compute_index_tensor_max_dim_size(
     dim: Any,
     related_value_positive_dims: set[str],
@@ -524,8 +491,8 @@ def compute_indirect_max_dim_sizes(
     index_args: set[int],
     index_active_dims: dict,
     logger: Any,
-) -> tuple[int, int, int]:
-    """Compute max_dim_sizes and potentially modified stride/offset for indirect access.
+) -> int:
+    """Compute max_dim_sizes for indirect access tensors.
 
     Args:
         tensor_idx: Index of the tensor
@@ -539,8 +506,7 @@ def compute_indirect_max_dim_sizes(
         logger: Logger instance
 
     Returns:
-        Tuple of (max_dim_size, stride_modifier, offset_modifier)
-        where stride_modifier and offset_modifier are 0 if they should be zeroed, 1 otherwise.
+        max_dim_size
     """
     is_value_tensor_for_indirect = is_indirect_value_tensor(op_spec, tensor_idx)
 
@@ -550,7 +516,6 @@ def compute_indirect_max_dim_sizes(
         )
         indirect_value_host_shape = indirect_metadata["value_host_shape"]
         indirect_index_host_shape = indirect_metadata["index_host_shape"]
-
         max_dim_size = get_value_tensor_max_dim_size(
             tensor_idx,
             dim,
@@ -559,18 +524,7 @@ def compute_indirect_max_dim_sizes(
             indirect_value_host_shape,
             indirect_index_host_shape,
         )
-
-        # # Check if stride/offset should be zeroed for non-indexed dimensions
-        # if should_zero_stride_offset(
-        #     tensor_idx, dim, stick_dim, index_active_dims, is_value_tensor_for_indirect
-        # ):
-        #     logger.debug(
-        #         f"Tensor {tensor_idx} (value), dim={dim}: ZEROED stride/offset "
-        #         f"(not in active_indirect_dims={sorted(map(str, index_active_dims.get(tensor_idx, set())))})"
-        #     )
-        #     return max_dim_size, 0, 0
-
-        return max_dim_size, 1, 1
+        return max_dim_size
 
     elif tensor_idx in index_args:
         related_value_positive_dims = get_index_related_positive_dims(
@@ -579,14 +533,10 @@ def compute_indirect_max_dim_sizes(
         max_dim_size = compute_index_tensor_max_dim_size(
             dim, related_value_positive_dims
         )
-        logger.debug(
-            f"Tensor {tensor_idx} (index), dim={dim}: maxDimSize={max_dim_size}, "
-            f"related_value_positive_dims={sorted(related_value_positive_dims)}"
-        )
-        return max_dim_size, 1, 1
+        return max_dim_size
 
     # Output tensors keep max_dim_sizes as -1 (dynamic)
-    return -1, 1, 1
+    return -1
 
 
 def get_indirect_layout_label(
