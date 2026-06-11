@@ -365,39 +365,6 @@ def compute_index_tensor_layout(
         return [], None
 
 
-def should_zero_stride_offset(
-    tensor_idx: int,
-    dim: Any,
-    stick_dim: Any,
-    index_active_dims: dict[int, set],
-    is_value_tensor: bool,
-) -> bool:
-    """Determine if stride and offset should be zeroed for a dimension.
-
-    For value tensors in indirect access, dimensions that are not actively indexed
-    (i.e., used for work division only) should have zero stride and offset to prevent
-    work tile coordinates from corrupting address calculations.
-
-    Args:
-        tensor_idx: Index of the tensor
-        dim: The dimension to check
-        stick_dim: The stick dimension
-        index_active_dims: Mapping of index tensor idx to their active dimensions
-        is_value_tensor: Whether this is a value tensor
-
-    Returns:
-        True if stride and offset should be zeroed, False otherwise
-    """
-    if not is_value_tensor:
-        return False
-
-    if tensor_idx not in index_active_dims:
-        return False
-
-    active_dims = index_active_dims[tensor_idx]
-    return dim not in active_dims and dim != stick_dim
-
-
 def compute_index_tensor_max_dim_size(
     dim: Any,
     related_value_positive_dims: set[str],
