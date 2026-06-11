@@ -437,7 +437,7 @@ def _create_sdsc_tensors(
 
             # Compute max_dim_sizes (with indirect access modifications)
             if has_indirect_access:
-                max_dim_size = compute_indirect_max_dim_sizes(
+                max_dim_sizes[dim] = compute_indirect_max_dim_sizes(
                     i,
                     dim,
                     stick_dim,
@@ -448,7 +448,6 @@ def _create_sdsc_tensors(
                     index_active_dims,
                     logger,
                 )
-                max_dim_sizes[dim] = max_dim_size
             else:
                 max_dim_sizes[dim] = -1
 
