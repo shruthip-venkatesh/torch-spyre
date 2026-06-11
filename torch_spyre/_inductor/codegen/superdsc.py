@@ -369,12 +369,6 @@ def _create_sdsc_tensors(
         # For index tensors in indirect access, use pre-computed layout
         if has_indirect_access and i in index_tensor_layouts:
             dim_order, stick_dim = index_tensor_layouts[i]
-        # For value/output tensors in indirect access, use dims directly
-        elif has_indirect_access and (
-            is_indirect_value_tensor(op_spec, i) or i == len(op_spec.args) - 1
-        ):
-            dim_order = dims
-            stick_dim = dim_order[-1]
         else:
             dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
 
@@ -447,7 +441,7 @@ def _create_sdsc_tensors(
 
             # Compute max_dim_sizes (with indirect access modifications)
             if has_indirect_access:
-                max_dim_size, stride_mult, offset_mult = compute_indirect_max_dim_sizes(
+                max_dim_size = compute_indirect_max_dim_sizes(
                     i,
                     dim,
                     stick_dim,
@@ -459,9 +453,6 @@ def _create_sdsc_tensors(
                     logger,
                 )
                 max_dim_sizes[dim] = max_dim_size
-                # Apply stride/offset zeroing for non-indexed dimensions
-                strides[dim] *= stride_mult
-                offsets[dim] *= offset_mult
             else:
                 max_dim_sizes[dim] = -1
 
