@@ -18,9 +18,24 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Sequence
 
-from sympy import Symbol, Expr
+from sympy import Symbol, Expr, Function
 from torch_spyre._C import DataFormats
 import torch
+
+
+class IndexLoad(Function):
+    """Sympy function representing a gather: IndexLoad(tensor_name).
+
+    Used in TensorArg.device_coordinates to encode indirect (gather) access.
+    The argument is a Symbol whose name is the source tensor's name.
+    Means: "the value loaded from that tensor at the current iteration point".
+    Survives sympify round-trips when IndexLoad is in the local namespace.
+
+    """
+
+    @classmethod
+    def eval(cls, name):  # noqa: ARG003
+        return None  # keep unevaluated
 
 
 @dataclasses.dataclass
@@ -36,8 +51,6 @@ class TensorArg:
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
-        is_index_tensor: If True, this tensor contains indices for indirect access (KERNEL_IDX type).
-        related_value_tensor_idx: If this is an index tensor, the index of the value tensor it accesses.
     """
 
     is_input: bool
@@ -48,8 +61,7 @@ class TensorArg:
     allocation: Any
     stride_map: list[int] | None = None
     per_tile_fixed: bool = False
-    is_index_tensor: bool = False
-    related_value_tensor_idx: int = -1
+    name: str | None = None
 
 
 @dataclasses.dataclass
