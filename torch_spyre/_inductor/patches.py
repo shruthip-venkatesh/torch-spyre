@@ -100,27 +100,9 @@ def enable_spyre_context(
 
     from torch._inductor.ir import Loops
 
-    # Force all operations to be realized when LoopLevel IR is initially constructed,
-    # except gather-pattern ops (those with an indirect read dep) which are left
-    # uninlined so they can fuse with their consumer.
+    # Force all operations to be realized when LoopLevel IR is initially constructed
     old_loop = Loops.has_large_inner_fn
-
-    def _spyre_has_large_inner_fn(self, threshold=None):
-        # Fusion of indirect-load ops with their consumer is disabled until
-        # superdsc.py gains support for IndexLoad in device_coordinates.
-        # To enable, remove the early return below.
-        return True
-        try:
-            from torch._inductor.dependencies import MemoryDep
-
-            for dep in self.get_reads():
-                if isinstance(dep, MemoryDep) and dep.is_indirect():
-                    return False
-        except Exception:
-            pass
-        return True
-
-    Loops.has_large_inner_fn = _spyre_has_large_inner_fn
+    Loops.has_large_inner_fn = lambda self, threshold=None: True
 
     from torch._inductor.fx_passes import joint_graph
 

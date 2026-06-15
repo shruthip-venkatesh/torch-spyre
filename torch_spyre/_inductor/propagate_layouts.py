@@ -595,11 +595,6 @@ def _multi_arg_pointwise_layouts(
         and (stick_expr := device_coordinates(stl, arg.dep)[-1]) != 0
     }
 
-    if len(stick_exprs) > 1:
-        logger.info(
-            f"Multi-stick pointwise ({op.get_name()}): producing {len(stick_exprs)} output layouts."
-        )
-
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
     in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
@@ -749,64 +744,6 @@ def compute_layouts(
     1. Compute candidate output STLs given a set of STLs for each input arg.
     2. Attach a restick cost function based on the type of op.
     """
-    if logger.isEnabledFor(10):  # DEBUG
-        op_name = op.get_name() if hasattr(op, "get_name") else str(op)
-        aten_ops = (
-            [str(n.target) for n in op.data.origins]
-            if hasattr(op, "data") and hasattr(op.data, "origins")
-            else []
-        )
-        logger.debug(f"--- compute_layouts: op={op_name} aten={aten_ops}")
-        try:
-            indirect_load_subs = indirect_load_subs_from_op(op)
-        except Exception:
-            indirect_load_subs = {}
-        indirect_index_names = indirect_index_dep_names(op)
-
-        def _fmt_arg(label, dep, layout, layouts):
-            h_coords = host_coordinates(layout, dep)
-            lines = (
-                f"  {label} name={dep.name}\n"
-                f"    index={dep.index}  ranges={dict(dep.ranges)}\n"
-                f"    host_size={[concretize_expr(s) for s in layout.size]}\n"
-                f"    host_stride={[concretize_expr(s) for s in layout.stride]}\n"
-                f"    host_coordinates={h_coords}\n"
-            )
-            dep_indirect_load_subs = (
-                indirect_load_subs if dep.name not in indirect_index_names else {}
-            )
-            for j, stl in enumerate(layouts):
-                try:
-                    dc_raw = device_coordinates(stl, dep)
-                    dc_sub = (
-                        device_coordinates(stl, dep, dep_indirect_load_subs)
-                        if dep_indirect_load_subs
-                        else None
-                    )
-                except Exception as e:
-                    dc_raw = f"<error: {e}>"
-                    dc_sub = None
-                dc_str = f"{dc_raw}" + (f"  ->  {dc_sub}" if dc_sub is not None else "")
-                lines += (
-                    f"    STL[{j}]:\n"
-                    f"      device_size={list(stl.device_size)}\n"
-                    f"      stride_map={list(stl.stride_map)}\n"
-                    f"      device_coordinates={dc_str}\n"
-                )
-            return lines
-
-        for i, arg in enumerate(args):
-            logger.debug(_fmt_arg(f"input[{i}]", arg.dep, arg.layout, arg.layouts))
-
-        out_h_coords = host_coordinates(output, output_dep)
-        logger.debug(
-            f"  output name={output_dep.name}\n"
-            f"    index={output_dep.index}  ranges={dict(output_dep.ranges)}\n"
-            f"    host_size={[concretize_expr(s) for s in output.size]}\n"
-            f"    host_stride={[concretize_expr(s) for s in output.stride]}\n"
-            f"    host_coordinates={out_h_coords}\n"
-        )
-
     data = op.data
 
     if len(args) > 1 and isinstance(data, Pointwise):
