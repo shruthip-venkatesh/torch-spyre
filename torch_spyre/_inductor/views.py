@@ -22,6 +22,8 @@ from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
 from torch._inductor.virtualized import V
 
+from .errors import Unsupported
+
 
 def find_repeat_vars(index_exprs, var_ranges):
     repeat_info = {}
@@ -236,7 +238,10 @@ def compute_coordinates(
                 None,
             )
             if inferred is None:
-                continue
+                raise Unsupported(
+                    f"indirect symbol {var} (coeff={coeff}) in index {index} "
+                    f"has no matching stride in layout {list(zip(stride, size))}"
+                )
             range_val = inferred
         else:
             range_val = var_ranges[var]

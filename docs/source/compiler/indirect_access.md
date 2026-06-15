@@ -29,9 +29,6 @@ result = x[i]         # aten.index
 result = x[i].exp()   # aten.index fused with aten.exp
 ```
 
-The canonical example in the codebase is
-[`examples/gather_exp.py`](https://github.com/torch-spyre/torch-spyre/blob/main/examples/gather_exp.py).
-
 ---
 
 ## How Inductor represents indirect access

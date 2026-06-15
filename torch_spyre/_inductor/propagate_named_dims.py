@@ -245,7 +245,9 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(label: str, dep: MemoryDep, op: "ComputedBuffer | None") -> None:
+def _log_dep_debug(
+    label: str, dep: MemoryDep
+) -> None:  # TODO: thread indirect_load_subs to show IndexLoad in device_coordinates
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
@@ -380,10 +382,10 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
             if logger.isEnabledFor(logging.DEBUG):
                 for dep in inputs:
-                    _log_dep_debug("input", dep, op)
+                    _log_dep_debug("input", dep)
                 for dep in rw.writes:
                     if isinstance(dep, MemoryDep):
-                        _log_dep_debug("output", dep, op)
+                        _log_dep_debug("output", dep)
             if isinstance(op.data, (Pointwise, Reduction)):
                 _compute_named_dims(op, inputs)
             else:

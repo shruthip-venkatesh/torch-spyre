@@ -276,6 +276,8 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:
+        # Indirect deps are index tensors (e.g. gather indices) whose access
+        # pattern is data-dependent; they cannot drive work-division planning.
         if isinstance(arg, MemoryDep) and not arg.is_indirect():
             buf = V.graph.get_buffer(arg.name)
             res.append(SchedNodeArg(arg, _fixed_read_layout(buf)))
@@ -323,6 +325,9 @@ class _IndirectIndexFinder:
         return _LoadSentinel(name)
 
     def indirect_indexing(self, index_var, size, check=True, wrap_neg=True):
+        # Assumes load() is called immediately after — Inductor's aten.index
+        # lowering always emits indirect_indexing() directly before the
+        # consuming load(), so the single slot is never overwritten in between.
         if isinstance(index_var, _LoadSentinel):
             self._pending_indirect_index_buf = index_var.name
         return sympy.S.Zero

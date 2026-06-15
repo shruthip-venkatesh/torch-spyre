@@ -800,8 +800,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             simplify_op_spec(op_spec)
 
         def sympy_str(x: sympy.Expr) -> str:
-            from torch_spyre._inductor.op_spec import IndexLoad
-
             if isinstance(x, IndexLoad):
                 name_sym = x.args[0]
                 return f"IndexLoad('{name_sym}')"
