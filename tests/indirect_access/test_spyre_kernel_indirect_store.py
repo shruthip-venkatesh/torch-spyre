@@ -451,15 +451,6 @@ def test_op_spec_with_complex_device_coordinates():
         name="complex_tensor",
     )
 
-    op_spec = OpSpec(
-        op="identity",
-        is_reduction=False,
-        iteration_space={x0: (sympy.Integer(128), 1), x1: (sympy.Integer(256), 1)},
-        args=[arg],
-        op_info={},
-        tiled_symbols=[],
-    )
-
     assert len(arg.device_coordinates) == 3
     assert isinstance(arg.device_coordinates[0], sympy.floor)
     assert isinstance(arg.device_coordinates[2], sympy.Mod)

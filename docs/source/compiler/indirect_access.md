@@ -9,7 +9,7 @@ value loaded at runtime from a separate index tensor.
 - [What is indirect access?](#what-is-indirect-access)
 - [How Inductor represents indirect access](#how-inductor-represents-indirect-access)
 - [The challenge: coordinates that depend on runtime values](#the-challenge-coordinates-that-depend-on-runtime-values)
-- [Solution: IndexLoad and device_coordinates](#solution-indexload-and-device-coordinates)
+- [Solution: IndexLoad and device coordinates](#solution-indexload-and-device-coordinates)
 - [Pipeline walkthrough](#pipeline-walkthrough)
 - [Stick compatibility for index tensors](#stick-compatibility-for-index-tensors)
 - [Op spec layout](#op-spec-layout)
@@ -67,7 +67,7 @@ crash, silently skip the symbol, or produce wrong layout decisions.
 
 ---
 
-## Solution: IndexLoad and device_coordinates
+## Solution: IndexLoad and device coordinates
 
 The PR introduces `IndexLoad`, a sympy `Function` subclass defined in
 [`op_spec.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/op_spec.py):
