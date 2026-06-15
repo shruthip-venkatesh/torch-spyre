@@ -61,7 +61,6 @@ from .pass_utils import (
     device_coordinates,
     is_stick_expr_offset_free,
     indirect_index_dep_names,
-    indirect_load_subs_from_op,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode

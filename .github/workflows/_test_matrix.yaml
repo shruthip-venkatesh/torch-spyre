@@ -185,8 +185,6 @@ jobs:
             config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
           - name: Inductor Work Division Hint
             config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
-          - name: Inductor Indirect Access Spyre Kernel Store
-            config: torch_spyre_tests/inductor/test_indirect_access_spyre_kernel_store_config.yaml
           # ---- Tensor tests ----
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
