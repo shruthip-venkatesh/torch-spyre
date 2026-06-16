@@ -407,25 +407,22 @@ def get_indirect_access_layout_label(
     is_output_tensor: bool,
     has_indirect_access: bool,
 ) -> str | None:
-    """Get the layout label for indirect access tensors.
+    """Return layout label for indirect access value/output tensors, or None.
 
-    Args:
-        tensor_idx: Index of the tensor
-        is_value_tensor: Whether this is a value tensor
-        is_output_tensor: Whether this is the output tensor
-        has_indirect_access: Whether the operation has indirect access
+    The indexed (IndexLoad-bearing) tensor is the value tensor in both directions:
+      * gather  (out[i] = values[idx[i]]):  the indexed tensor is an *input*  -> INPUT
+      * scatter (out[idx[i]] = src[i]):     the indexed tensor is the *output* -> OUTPUT
 
-    Returns:
-        Layout label string, or None if standard layout assignment should be used
+    Output is therefore checked first: a scatter's indexed tensor is simultaneously
+    an indirect value tensor and the output, and must be labeled OUTPUT. A gather's
+    value tensor is never the output, so this ordering leaves gather unchanged.
     """
     if not has_indirect_access:
         return None
-
+    if is_output_tensor:
+        return "OUTPUT"
     if is_value_tensor:
         return "INPUT"
-    elif is_output_tensor:
-        return "OUTPUT"
-
     return None
 
 
