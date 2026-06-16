@@ -54,6 +54,7 @@ class SDSCArgs:
     start_address: int | Symbol
     backGap: dict[Symbol, int]
     arg_index: int = -1
+    shared_base: bool = False
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -420,6 +421,8 @@ def _create_sdsc_tensors(
                 else arg.allocation.get("hbm"),
                 backGap=backGap,
                 arg_index=arg.arg_index,
+                #  TODO : Will be enabled after merging PR #2363
+                # shared_base=has_indirect_access and is_indirect_value_tensor(arg),
             )
         )
 

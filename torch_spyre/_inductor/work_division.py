@@ -32,10 +32,12 @@ from torch._inductor.ir import (
 
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch._inductor.virtualized import V
 
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
+from .op_spec import IndexLoad
 from .pass_utils import (
     SchedNodeArg,
     _finite_upper_or_none,
@@ -47,6 +49,8 @@ from .pass_utils import (
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
+    indirect_load_subs_from_op,
+    _fixed_read_layout,
 )
 from .propagate_hints import get_op_hints
 from typing import Callable
@@ -347,6 +351,17 @@ def get_per_core_span(
     device_size = td.layout.device_layout.device_size
     itemsize = td.layout.dtype.itemsize
     for d, coord in enumerate(td.device_coords[:-1]):
+        if hasattr(coord, "has") and coord.has(IndexLoad):
+            # Data-dependent gather axis: any core may address any row, so the
+            # whole device extent counts toward the span and this axis is never
+            # split. Returning the full extent here also avoids looking up the
+            # index-tensor name symbol (IndexLoad's argument), which is not an
+            # iteration variable and is absent from it_space_orig.
+            per_core_size = device_size[d]
+            if per_core_size > 1:
+                stride_elems = math.prod(device_size[d + 1 :])
+                return per_core_size * stride_elems * itemsize
+            continue
         if not coord.free_symbols:
             continue
         per_core_max = 0
@@ -616,6 +631,63 @@ def collect_tensor_deps(
     return input_tds, output_td
 
 
+def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
+    """Build TensorDeps for indirect (gather) value reads with IndexLoad-aware
+    device coordinates.
+
+    Indirect reads are dropped from the normal `args` list
+    (`get_mem_deps_from_rw` filters `arg.is_indirect()`), so the span check
+    would otherwise never see the shared value tensor. These TensorDeps are used
+    only for the per-core span/overflow check; the value tensor is never split.
+    """
+    subs = indirect_load_subs_from_op(op)
+    if not subs:
+        return []
+    tds: list[TensorDep] = []
+    for d in op.get_read_writes().reads:
+        if isinstance(d, MemoryDep) and d.is_indirect():
+            layout = _fixed_read_layout(V.graph.get_buffer(d.name))
+            td = TensorDep.__new__(TensorDep)
+            td.dep = d
+            td.layout = layout
+            td.device_coords = device_coordinates(layout.device_layout, d, subs)
+            tds.append(td)
+    return tds
+
+
+def indirect_value_data_syms(op: ComputedBuffer) -> set[Symbol]:
+    """Iteration symbols that index the SHARED value tensor's data dims.
+
+    These are the value tensor's non-gather coordinate symbols (its stick/column
+    dims). Here it must not split them: the value tensor is shared at a fixed
+    base across all cores, so a split on a value-data dim would force a per-core
+    base offset on a tensor that must stay at the same address everywhere.
+
+    Returns an empty set for non-indirect ops.
+    """
+    syms: set[Symbol] = set()
+    for td in collect_indirect_value_tds(op):
+        for coord in td.device_coords:
+            if hasattr(coord, "has") and coord.has(IndexLoad):
+                continue
+            syms |= coord.free_symbols
+    return syms
+
+
+def _first_non_indirect_read_index(rw, default):
+    """Return the index of the first non-indirect read, falling back to default.
+
+    Indirect reads carry data-dependent symbols whose coefficients are not a
+    stable identity key, so they must not be used as the reduction-split
+    reference index in splits_by_index_coeff / apply_splits_from_index_coeff.
+    """
+    for d in rw.reads:
+        if isinstance(d, MemoryDep) and not d.is_indirect():
+            return d.index
+    first = next(iter(rw.reads), None)
+    return first.index if first is not None else default
+
+
 def apply_splits(
     op: ComputedBuffer,
     splits: dict,
@@ -631,8 +703,7 @@ def apply_splits(
 
     rw = op.get_read_writes()
     write_index = output_td.dep.index
-    first_read = next(iter(rw.reads), None)
-    read_index = first_read.index if first_read is not None else write_index
+    read_index = _first_non_indirect_read_index(rw, write_index)
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
 
 
@@ -799,11 +870,17 @@ def _default_split(
     committed_splits: dict[Symbol, int],
     max_cores: int,
     symbol_meta: SymbolMeta,
+    forbidden_split_syms: set[Symbol] | None = None,
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
     """Distribute max_cores by priority on top of span_reduction's commits.
 
     Returns the chosen splits and the (output, reduction) priority dims the
     caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
+
+    forbidden_split_syms: iteration symbols that must never be split (e.g. the
+    data dims of a shared indirect-access value tensor). They are removed from
+    both the output and reduction priority lists so the distributor leaves them
+    at split=1.
     """
     # TODO: The final dim committed by span_reduction_pass holds the minimum
     #       split that gets the span under the limit, so it may have headroom
@@ -817,6 +894,10 @@ def _default_split(
     output_dims, reduction_dims = prioritize_dimensions(
         output_td, it_space_remaining, symbol_meta
     )
+
+    if forbidden_split_syms:
+        output_dims = [d for d in output_dims if d not in forbidden_split_syms]
+        reduction_dims = [d for d in reduction_dims if d not in forbidden_split_syms]
 
     # If span_reduction_pass already committed a reduction split, suppress further
     # reduction splitting so the final result never exceeds one reduction dim split.
@@ -850,18 +931,24 @@ def work_distribution_pass(
     """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
-    all_tds = input_tds + [output_td]
+    # Indirect (gather) value reads are filtered out of `args`; pull them in
+    # separately so the per-core span warning accounts for the shared value
+    # tensor. They are never split (see indirect_value_data_syms).
+    value_tds = collect_indirect_value_tds(op)
+    all_tds = input_tds + [output_td] + value_tds
 
     symbol_meta = _collect_symbol_metadata(it_space)
 
-    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds, symbol_meta)
+    it_space_adjusted, _ = adjust_it_space_for_sticks(
+        it_space, input_tds + [output_td], symbol_meta
+    )
 
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.
     if hasattr(op, "op_it_space_splits"):
         rw = op.get_read_writes()
         write_index = next(iter(rw.writes)).index
-        read_index = next((d.index for d in rw.reads), write_index)
+        read_index = _first_non_indirect_read_index(rw, write_index)
         min_splits = apply_splits_from_index_coeff(
             op.op_it_space_splits, write_index, read_index, it_space
         )
@@ -907,7 +994,12 @@ def work_distribution_pass(
             return
 
     splits, output_dims, reduction_dims = _default_split(
-        it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta
+        it_space_adjusted,
+        output_td,
+        committed_splits,
+        max_cores,
+        symbol_meta,
+        forbidden_split_syms=indirect_value_data_syms(op),
     )
 
     apply_splits(op, splits, output_td)
@@ -1260,7 +1352,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     # runs after and skips the ops this pass claims.
     if hasattr(op, "op_it_space_splits"):
         write_index = next(iter(rw.writes)).index
-        read_index = next((d.index for d in rw.reads), write_index)
+        read_index = _first_non_indirect_read_index(rw, write_index)
         span_splits = apply_splits_from_index_coeff(
             op.op_it_space_splits, write_index, read_index, it_space
         )

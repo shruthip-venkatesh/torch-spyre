@@ -26,6 +26,7 @@ from torch._inductor.codegen.common import (
     Kernel,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
@@ -538,7 +539,16 @@ class SpyreKernel(Kernel[CSEVariable]):
         work_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
             write_index = next(iter(self.current_node.read_writes.writes)).index
-            read_index = next(iter(self.current_node.read_writes.reads)).index
+            # Match the encoding in work_division.apply_splits: an indirect
+            # (gather) read carries data-dependent symbols whose coefficients are
+            # not a stable identity key, so prefer the first non-indirect read as
+            # the reduction-split reference index.
+            reads = self.current_node.read_writes.reads
+            read_dep = next(
+                (d for d in reads if isinstance(d, MemoryDep) and not d.is_indirect()),
+                next(iter(reads), None),
+            )
+            read_index = read_dep.index if read_dep is not None else write_index
             work_division = apply_splits_from_index_coeff(
                 ir_node.op_it_space_splits,
                 write_index,
