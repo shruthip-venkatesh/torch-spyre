@@ -3,7 +3,7 @@
 ## Summary
 
 A gather (`out = x[i]`) reads rows from a value table `x` at positions chosen
-at runtime by an index tensor `i`. This page describes **proposed implementation** 
+at runtime by an index tensor `i`. This page describes **proposed implementation**
 of running gathers across multiple Spyre cores: making them **correct** under
 work division.
 
@@ -13,7 +13,7 @@ restriction, a gather whose value table is divided across cores along a data
 dimension (e.g. the hidden dim of an embedding, the head dim of a KV cache)
 silently returns wrong results — every core reads column 0 of the shared table.
 
-Proposed implementation makes such gathers correct. It does **not** attempt to 
+Proposed implementation makes such gathers correct. It does **not** attempt to
 parallelise the value-data dimensions themselves; that is future work (see
 [Limitations](#limitations-and-future-work)).
 
@@ -157,7 +157,7 @@ isolating one behavior by changing only the value-table contents:
 | `column_addressing` | `x[r,k,n] = k` | K-column addressing | pass (exact) | fail (all read col 0) |
 | `row_addressing` | `x[r,k,n] = r` | gather-axis selection | pass (exact) | pass (row never split) |
 
-`row_addressing` pass either way and are included to show, respectively, 
+`row_addressing` pass either way and are included to show, respectively,
 that the gather axis is always correct and hides the defect.
  `column_addressing` and `realistic_random` are the correctness signal.
 

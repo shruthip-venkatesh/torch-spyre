@@ -421,7 +421,7 @@ def _create_sdsc_tensors(
                 else arg.allocation.get("hbm"),
                 backGap=backGap,
                 arg_index=arg.arg_index,
-                #  TODO : Will be enabled after merging PR #2363
+                #  TODO : Will be enabled after merging PR #2623
                 # shared_base=has_indirect_access and is_indirect_value_tensor(arg),
             )
         )
