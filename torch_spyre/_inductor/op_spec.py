@@ -51,8 +51,6 @@ class TensorArg:
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
-        is_index_tensor: If True, this tensor contains indices for indirect access (KERNEL_IDX type).
-        related_value_tensor_idx: If this is an index tensor, the index of the value tensor it accesses.
     """
 
     is_input: bool
