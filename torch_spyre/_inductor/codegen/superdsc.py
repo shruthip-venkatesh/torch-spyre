@@ -42,7 +42,7 @@ from torch_spyre._inductor.indirect_access import (
     is_indirect_value_tensor,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import IndexLoad, OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import IndirectAccess, OpSpec, TensorArg
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 from .compute_ops import SymbolKind, generate_sdsc
@@ -240,8 +240,8 @@ def _get_device_dim_order(
     dim_order: list[Symbol] = []
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
         coord = arg.device_coordinates[i]
-        # Handle coordinates containing IndexLoad — extract symbols from index tensor.
-        if hasattr(coord, "has") and coord.has(IndexLoad):
+        # Handle coordinates containing IndirectAccess — extract symbols from index tensor.
+        if hasattr(coord, "has") and coord.has(IndirectAccess):
             if op_spec is not None and is_indirect_value_tensor(arg):
                 index_arg = get_index_tensor_for_value(op_spec, arg)
                 if index_arg is not None:
@@ -358,8 +358,8 @@ def _create_sdsc_tensors(
     use_op_dims = not _is_matmul(op_spec.op)
 
     # Detect indirect access from device_coordinates: index tensors are those
-    # whose name is referenced by an IndexLoad in another tensor's coordinates,
-    # and value tensors are those that contain IndexLoad in their coordinates.
+    # whose name is referenced by an IndirectAccess in another tensor's coordinates,
+    # and value tensors are those that contain IndirectAccess in their coordinates.
     index_tensor_indices = {
         i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
     }
@@ -378,7 +378,7 @@ def _create_sdsc_tensors(
 
     for i, arg in enumerate(op_spec.args):
         # Step 1: Determine dimension order and stick dimension.
-        # Index tensors use their pre-computed layout (their coords have no IndexLoad).
+        # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
             dim_order, stick_dim = index_tensor_layouts[i]
         else:
@@ -453,7 +453,7 @@ def _create_sdsc_tensors(
                 max_dim_sizes[dim] = -1
 
             dim_coord = arg.device_coordinates[-stride_idx - 2]
-            if not isinstance(dim_coord, IndexLoad) and dev_dim_size > it_dim_size:
+            if not isinstance(dim_coord, IndirectAccess) and dev_dim_size > it_dim_size:
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size

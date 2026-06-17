@@ -16,36 +16,36 @@ from typing import Callable
 
 from sympy import Symbol
 
-from .op_spec import IndexLoad, OpSpec, TensorArg
+from .op_spec import IndirectAccess, OpSpec, TensorArg
 
 
 def has_index_load(arg: TensorArg) -> bool:
-    """Return True if any of arg's device_coordinates contains an IndexLoad node."""
+    """Return True if any of arg's device_coordinates contains an IndirectAccess node."""
     return any(
-        coord.has(IndexLoad)
+        coord.has(IndirectAccess)
         for coord in arg.device_coordinates
         if hasattr(coord, "has")
     )
 
 
 def get_index_load_names(arg: TensorArg) -> set[str]:
-    """Return the set of tensor names referenced by IndexLoad nodes in arg's coordinates."""
+    """Return the set of tensor names referenced by IndirectAccess nodes in arg's coordinates."""
     names: set[str] = set()
     for coord in arg.device_coordinates:
         if not hasattr(coord, "atoms"):
             continue
-        for node in coord.atoms(IndexLoad):
+        for node in coord.atoms(IndirectAccess):
             names.add(str(node.args[0]))
     return names
 
 
 def is_indirect_value_tensor(arg: TensorArg) -> bool:
-    """Return True if this tensor is accessed via indirect indexing (has IndexLoad in coords)."""
+    """Return True if this tensor is accessed via indirect indexing (has IndirectAccess in coords)."""
     return has_index_load(arg)
 
 
 def is_index_tensor(arg: TensorArg, op_spec: OpSpec) -> bool:
-    """Return True if this tensor's name is referenced by an IndexLoad in any other arg."""
+    """Return True if this tensor's name is referenced by an IndirectAccess in any other arg."""
     name = getattr(arg, "name", "")
     if not name:
         return False
@@ -60,7 +60,7 @@ def is_index_tensor(arg: TensorArg, op_spec: OpSpec) -> bool:
 def get_index_tensor_for_value(
     op_spec: OpSpec, value_arg: TensorArg
 ) -> TensorArg | None:
-    """Find the index TensorArg referenced by an IndexLoad in value_arg's coordinates."""
+    """Find the index TensorArg referenced by an IndirectAccess in value_arg's coordinates."""
     names = get_index_load_names(value_arg)
     for arg in op_spec.args:
         if getattr(arg, "name", "") in names:
@@ -69,12 +69,12 @@ def get_index_tensor_for_value(
 
 
 def get_indirect_stride_idx(arg: TensorArg) -> int | None:
-    """Find the stride_idx (from right, 0-indexed) of the IndexLoad in this arg's coordinates.
+    """Find the stride_idx (from right, 0-indexed) of the IndirectAccess in this arg's coordinates.
 
     Returns the position counting from the right (where 0 is the rightmost element).
     """
     for idx, coord in enumerate(reversed(arg.device_coordinates)):
-        if isinstance(coord, IndexLoad):
+        if isinstance(coord, IndirectAccess):
             return idx
     return None
 
@@ -82,7 +82,7 @@ def get_indirect_stride_idx(arg: TensorArg) -> int | None:
 def get_indirect_dim_symbols(
     value_arg: TensorArg, index_arg: TensorArg, symbol_mapping: dict
 ) -> set[Symbol]:
-    """Extract symbols from the index tensor at the position where value tensor has IndexLoad.
+    """Extract symbols from the index tensor at the position where value tensor has IndirectAccess.
 
     Returns the set of symbols that should be in the value tensor's dim_order for the indirect dimension.
     """
