@@ -291,6 +291,8 @@ def _get_indirect_access_info(
         - alloc_type: "index_tensor", "value_tensor", or "no_indirection"
         - related_alloc_or_none: allocation name of related tensor, or None
     """
+    # Index tensors and value tensors involved in indirect access must reside in HBM;
+    # the Spyre engine does not support indirect addressing through LX scratchpad.
     if tensor.is_index_tensor:
         alloc_type = "index_tensor"
         related_alloc = (
@@ -317,9 +319,11 @@ def _build_indirect_access_fields(sdsc_spec, tensor, tensor_idx: int) -> dict:
     """Build the indirect access fields for a tensor allocation.
 
     Returns a dictionary containing:
-    - indirectAllocType_: The allocation type ("index_tensor", "value_tensor", or "no_indirection")
+    - indirectAllocType_: The allocation type ("index_tensor", "value_tensor",
+      or "no_indirection")
     - relatedIndirectAccessAlloc_: The related allocation name (only if applicable)
-    - indexTensorType_: The index tensor type ("address" or "index") - only for index tensors
+    - indexTensorType_: The index tensor type - only for index tensors; the
+      backend supports "address" and "index" but we only generate "index"
     """
     alloc_type, related_alloc = _get_indirect_access_info(sdsc_spec, tensor, tensor_idx)
 
@@ -682,6 +686,9 @@ def generate_sdsc(
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
+                                    # Index tensors must reside in HBM; the Spyre
+                                    # engine does not support indirect addressing
+                                    # through LX scratchpad.
                                     "memOrg_": {"hbm": {"isPresent": 1}}
                                     if tensor.is_index_tensor
                                     else {

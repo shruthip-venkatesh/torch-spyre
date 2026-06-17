@@ -20,7 +20,8 @@ from .op_spec import IndirectAccess, OpSpec, TensorArg
 
 
 def has_index_load(arg: TensorArg) -> bool:
-    """Return True if any of arg's device_coordinates contains an IndirectAccess node."""
+    """Return True if any of arg's device_coordinates contains an IndirectAccess
+    node."""
     return any(
         coord.has(IndirectAccess)
         for coord in arg.device_coordinates
@@ -29,7 +30,8 @@ def has_index_load(arg: TensorArg) -> bool:
 
 
 def get_index_load_names(arg: TensorArg) -> set[str]:
-    """Return the set of tensor names referenced by IndirectAccess nodes in arg's coordinates."""
+    """Return the set of tensor names referenced by IndirectAccess nodes in
+    arg's coordinates."""
     names: set[str] = set()
     for coord in arg.device_coordinates:
         if not hasattr(coord, "atoms"):
@@ -40,12 +42,14 @@ def get_index_load_names(arg: TensorArg) -> set[str]:
 
 
 def is_indirect_value_tensor(arg: TensorArg) -> bool:
-    """Return True if this tensor is accessed via indirect indexing (has IndirectAccess in coords)."""
+    """Return True if this tensor is accessed via indirect indexing (has
+    IndirectAccess in coords)."""
     return has_index_load(arg)
 
 
 def is_index_tensor(arg: TensorArg, op_spec: OpSpec) -> bool:
-    """Return True if this tensor's name is referenced by an IndirectAccess in any other arg."""
+    """Return True if this tensor's name is referenced by an IndirectAccess in
+    any other arg."""
     name = getattr(arg, "name", "")
     if not name:
         return False
@@ -60,7 +64,8 @@ def is_index_tensor(arg: TensorArg, op_spec: OpSpec) -> bool:
 def get_index_tensor_for_value(
     op_spec: OpSpec, value_arg: TensorArg
 ) -> TensorArg | None:
-    """Find the index TensorArg referenced by an IndirectAccess in value_arg's coordinates."""
+    """Find the index TensorArg referenced by an IndirectAccess in
+    value_arg's coordinates."""
     names = get_index_load_names(value_arg)
     for arg in op_spec.args:
         if getattr(arg, "name", "") in names:
@@ -69,7 +74,8 @@ def get_index_tensor_for_value(
 
 
 def get_indirect_stride_idx(arg: TensorArg) -> int | None:
-    """Find the stride_idx (from right, 0-indexed) of the IndirectAccess in this arg's coordinates.
+    """Find the stride_idx (from right, 0-indexed) of the IndirectAccess in
+    this arg's coordinates.
 
     Returns the position counting from the right (where 0 is the rightmost element).
     """
@@ -82,9 +88,10 @@ def get_indirect_stride_idx(arg: TensorArg) -> int | None:
 def get_indirect_dim_symbols(
     value_arg: TensorArg, index_arg: TensorArg, symbol_mapping: dict
 ) -> set[Symbol]:
-    """Extract symbols from the index tensor at the position where value tensor has IndirectAccess.
+    """Extract all free symbols from the index tensor's device coordinates.
 
-    Returns the set of symbols that should be in the value tensor's dim_order for the indirect dimension.
+    Returns the set of symbols that should be in the value tensor's dim_order
+    for the indirect dimension.
     """
     all_symbols: set[Symbol] = set()
     for coord in index_arg.device_coordinates:
@@ -109,42 +116,12 @@ def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
     return -1
 
 
-def collect_index_tensor_layouts(
-    op_spec: OpSpec,
-    symbol_mapping: dict,
-    index_tensor_indices: set[int],
-    logger: object,
-) -> tuple[dict, dict]:
-    """First pass: compute (dim_order, stick_dim) for each index tensor.
-
-    Returns:
-        index_tensor_layouts: dict mapping tensor_idx -> (dim_order, stick_dim)
-        index_active_dims: dict mapping tensor_idx -> set of active (non-stick) dims
-    """
-    from torch_spyre._inductor.codegen.superdsc import _get_device_dim_order
-
-    index_tensor_layouts: dict[int, tuple[list, object]] = {}
-    index_active_dims: dict[int, set] = {}
-
-    for i in index_tensor_indices:
-        arg = op_spec.args[i]
-        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
-        index_tensor_layouts[i] = (dim_order, stick_dim)
-        active_dims = {d for d in dim_order if d is not stick_dim}
-        index_active_dims[i] = active_dims
-        logger.debug(
-            f"Index tensor {i}: dim_order={dim_order}, stick_dim={stick_dim}, "
-            f"active_dims={sorted(map(str, active_dims))}"
-        )
-
-    return index_tensor_layouts, index_active_dims
-
-
 def _get_index_tensor_device_size_at(
     index_arg: TensorArg,
     stride_idx: int,
 ) -> int | None:
-    """Return index_arg.device_size at the same stride position, or None if out of range."""
+    """Return index_arg.device_size at the same stride position, or None if
+    out of range."""
     pos = -stride_idx - 2
     if abs(pos) <= len(index_arg.device_size):
         return index_arg.device_size[pos]

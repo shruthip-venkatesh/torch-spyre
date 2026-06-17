@@ -32,7 +32,6 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.indirect_access import (
-    collect_index_tensor_layouts,
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
     get_indirect_dim_symbols,
@@ -345,6 +344,35 @@ def _get_data_format(op, device_dtype):
     return data_format.get((op, device_dtype), device_dtype)
 
 
+def _collect_index_tensor_layouts(
+    op_spec: OpSpec,
+    symbol_mapping: dict,
+    index_tensor_indices: set[int],
+    logger: object,
+) -> tuple[dict, dict]:
+    """First pass: compute (dim_order, stick_dim) for each index tensor.
+
+    Returns:
+        index_tensor_layouts: dict mapping tensor_idx -> (dim_order, stick_dim)
+        index_active_dims: dict mapping tensor_idx -> set of active (non-stick) dims
+    """
+    index_tensor_layouts: dict[int, tuple[list, object]] = {}
+    index_active_dims: dict[int, set] = {}
+
+    for i in index_tensor_indices:
+        arg = op_spec.args[i]
+        dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
+        index_tensor_layouts[i] = (dim_order, stick_dim)
+        active_dims = {d for d in dim_order if d is not stick_dim}
+        index_active_dims[i] = active_dims
+        logger.debug(
+            f"Index tensor {i}: dim_order={dim_order}, stick_dim={stick_dim}, "
+            f"active_dims={sorted(map(str, active_dims))}"
+        )
+
+    return index_tensor_layouts, index_active_dims
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -369,7 +397,7 @@ def _create_sdsc_tensors(
     index_tensor_layouts: dict[int, tuple[list, Any]] = {}
     index_active_dims: dict[int, set] = {}
     if has_indirect_access:
-        index_tensor_layouts, index_active_dims = collect_index_tensor_layouts(
+        index_tensor_layouts, index_active_dims = _collect_index_tensor_layouts(
             op_spec, symbol_mapping, index_tensor_indices, logger
         )
 
