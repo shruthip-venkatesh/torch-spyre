@@ -309,6 +309,11 @@ def _get_indirect_access_info(
     if tensor_idx in value_tensor_indices:
         alloc_type = "value_tensor"
         index_tensor_idx = _find_index_tensor_for_value(sdsc_spec, tensor_idx)
+        if index_tensor_idx < 0:
+            raise ValueError(
+                f"Tensor {tensor_idx} is listed as a value tensor but no index "
+                "tensor claims it — sdsc_spec is malformed"
+            )
         related_alloc = f"allocate-Tensor{index_tensor_idx}_hbm"
         return alloc_type, related_alloc
 
