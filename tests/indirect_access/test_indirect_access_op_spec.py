@@ -41,6 +41,7 @@ from indirect_access_common import (  # noqa: E402
 
 from torch_spyre._C import DataFormats  # noqa: E402
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
+from torch_spyre._inductor import config  # noqa: E402
 
 
 class TestGatherOpSpec(IndirectAccessTestCase):
@@ -333,6 +334,7 @@ class TestGatherOpSpec(IndirectAccessTestCase):
         self._compile_gather(lambda x, i: torch.relu(x[i]))
 
 
+@config.patch({"sencores": 1})
 class TestScatterOpSpec(IndirectAccessTestCase):
     """Tests for scatter (indirect store) OpSpec structure.
 

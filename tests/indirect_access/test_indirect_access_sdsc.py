@@ -55,6 +55,7 @@ from torch_spyre._inductor.op_spec import (  # noqa: E402
     find_unimplemented,
 )
 from torch_spyre.execution.async_compile import SpyreAsyncCompile  # noqa: E402
+from torch_spyre._inductor import config  # noqa: E402
 
 # Mock target to disable actual kernel execution on device
 _LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
@@ -176,6 +177,7 @@ class TestSuperDscGenerationGather(IndirectAccessTestCase):
                 torch.compile(kernel)(x_dev, i_dev)
 
 
+@config.patch({"sencores": 1})
 class TestSdscBoundaryScatter(IndirectAccessTestCase):
     """Scatter now reaches the SDSC layer."""
 
@@ -475,6 +477,7 @@ class TestSdscGenerationGatherFields(IndirectAccessTestCase):
                         self.assertRegex(related, r"^allocate-Tensor\d+_hbm$")
 
 
+@config.patch({"sencores": 1})
 class TestSdscGenerationScatter(IndirectAccessTestCase):
     """Scatter now generates SDSC bundles (Python generate_bundle succeeds).
 

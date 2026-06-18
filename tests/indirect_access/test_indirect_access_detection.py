@@ -50,6 +50,7 @@ from torch_spyre._inductor.op_spec import (  # noqa: E402
     OpSpec,
     TensorArg,
 )
+from torch_spyre._inductor import config  # noqa: E402
 
 
 def _tensor_arg(is_input, coords, name=None):
@@ -309,6 +310,7 @@ class TestCompileTimeDetection(IndirectAccessTestCase):
             "gather index buffer was never detected during layout propagation",
         )
 
+    @config.patch({"sencores": 1})
     def test_scatter_index_not_flagged_by_layout_detection(self):
         """``indirect_index_dep_names`` flags gather *loads* but returns empty
         for scatter *stores*.

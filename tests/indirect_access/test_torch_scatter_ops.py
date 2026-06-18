@@ -46,6 +46,8 @@ from indirect_access_common import (  # noqa: E402
     classify_compile,
 )
 
+from torch_spyre._inductor import config  # noqa: E402
+
 # Observed lowering outcome per scatter op (validated on the hardware build).
 EXPECTED = {
     "index_put": SCATTER_OP_SPEC,  # VALIDATED
@@ -58,6 +60,7 @@ EXPECTED = {
 }
 
 
+@config.patch({"sencores": 1})
 class TestTorchScatterOps(IndirectAccessTestCase):
     def test_index_put(self):
         """``out[idx] = src`` -- the standard advanced-indexing store."""
