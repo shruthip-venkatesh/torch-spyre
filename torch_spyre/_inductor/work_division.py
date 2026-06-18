@@ -37,7 +37,7 @@ from torch._inductor.virtualized import V
 from .errors import Unsupported
 from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
-from .op_spec import IndexLoad
+from .op_spec import IndirectAccess
 from .pass_utils import (
     SchedNodeArg,
     _finite_upper_or_none,
@@ -49,7 +49,7 @@ from .pass_utils import (
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
-    indirect_load_subs_from_op,
+    indirect_access_subs_from_op,
     _fixed_read_layout,
 )
 from .propagate_hints import get_op_hints
@@ -351,11 +351,11 @@ def get_per_core_span(
     device_size = td.layout.device_layout.device_size
     itemsize = td.layout.dtype.itemsize
     for d, coord in enumerate(td.device_coords[:-1]):
-        if hasattr(coord, "has") and coord.has(IndexLoad):
+        if hasattr(coord, "has") and coord.has(IndirectAccess):
             # Data-dependent gather axis: any core may address any row, so the
             # whole device extent counts toward the span and this axis is never
             # split. Returning the full extent here also avoids looking up the
-            # index-tensor name symbol (IndexLoad's argument), which is not an
+            # index-tensor name symbol (IndirectAccess's argument), which is not an
             # iteration variable and is absent from it_space_orig.
             per_core_size = device_size[d]
             if per_core_size > 1:
@@ -632,7 +632,7 @@ def collect_tensor_deps(
 
 
 def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
-    """Build TensorDeps for indirect (gather) value reads with IndexLoad-aware
+    """Build TensorDeps for indirect (gather) value reads with IndirectAccess-aware
     device coordinates.
 
     Indirect reads are dropped from the normal `args` list
@@ -640,7 +640,7 @@ def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
     would otherwise never see the shared value tensor. These TensorDeps are used
     only for the per-core span/overflow check; the value tensor is never split.
     """
-    subs = indirect_load_subs_from_op(op)
+    subs = indirect_access_subs_from_op(op)
     if not subs:
         return []
     tds: list[TensorDep] = []
@@ -668,7 +668,7 @@ def indirect_value_data_syms(op: ComputedBuffer) -> set[Symbol]:
     syms: set[Symbol] = set()
     for td in collect_indirect_value_tds(op):
         for coord in td.device_coords:
-            if hasattr(coord, "has") and coord.has(IndexLoad):
+            if hasattr(coord, "has") and coord.has(IndirectAccess):
                 continue
             syms |= coord.free_symbols
     return syms

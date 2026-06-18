@@ -25,10 +25,10 @@ arguments:
 | Arg | Role | Device coordinates |
 |---|---|---|
 | index | the positions to read, tagged `KERNEL_IDX` | regular, statically known |
-| value | the table being read from (shared) | carries an `IndexLoad(name)` node at the gathered dimension |
+| value | the table being read from (shared) | carries an `IndirectAccess(name)` node at the gathered dimension |
 | output | the gathered result | regular, statically known |
 
-The `IndexLoad(name)` node (see `op_spec.IndexLoad`) marks the value tensor's
+The `IndirectAccess(name)` node (see `op_spec.IndirectAccess`) marks the value tensor's
 **gather axis** — the dimension whose row is selected at runtime by the index.
 That axis has **no iteration-space symbol**; its address is resolved on the
 device via `SEGMENT_OFFSETS`, with `maxDimSizes == 1` for that dimension.
@@ -101,15 +101,15 @@ marks the value tensor. In `core_idx_to_slice_offset`
 ([codegen/compute_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/compute_ops.py))
 a `shared_base` tensor keeps its per-core base at the static offset (address 0)
 instead of advancing with the work-division slice. The gather row comes from the
-runtime `IndexLoad`; the index and output tensors keep the normal per-core base
+runtime `IndirectAccess`; the index and output tensors keep the normal per-core base
 advance. This makes the shared-table addressing correct by construction rather
 than relying on the backend to tolerate a stale per-core base.
 
 ### 3. Value-table span guard (defensive)
 
 `collect_indirect_value_tds` rebuilds the value `TensorDep` with
-`IndexLoad`-aware coordinates so the value table is visible to the per-core
-span check, and `get_per_core_span` treats an `IndexLoad` coordinate as
+`IndirectAccess`-aware coordinates so the value table is visible to the per-core
+span check, and `get_per_core_span` treats an `IndirectAccess` coordinate as
 contributing its full device extent (any core may touch any row) and never
 splits it. `warn_if_per_core_overflow` then logs a critical message if the
 value table would exceed the documented 256 MB per-core span.
@@ -132,7 +132,7 @@ decode sites (`work_distribution_pass`, `create_op_spec`) now prefer the first
 
 `out = x[i]` with `x : [128, 64, 512]`, `i : [256]`, `SENCORES=32`. Iteration
 space `{d0 = Q = 256, d1 = K = 64, d2 = N = 512}`; the value's gather axis
-`M = 128` is addressed by `IndexLoad` and is not an iteration symbol. The index
+`M = 128` is addressed by `IndirectAccess` and is not an iteration symbol. The index
 stickifies to `256 / 32 = 8` sticks on `d0`.
 
 | | Without the fix | With the proposed fix |
@@ -184,7 +184,7 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/gather_multicor
   bases are interpreted. This needs the DeepTools/backend team and is out of
   scope for current proposal.
 
-- **Scatter is not addressed.** For a scatter (`out[i] = src`), the `IndexLoad`
+- **Scatter is not addressed.** For a scatter (`out[i] = src`), the `IndirectAccess`
   is on the output, so splitting index-entry dims gives data-dependent
   destinations: two cores can write the same output row. Multi-core scatter is
   only safe under an index-uniqueness guarantee and is left for future work.
@@ -193,7 +193,7 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/gather_multicor
 
 | File | Change |
 |---|---|
-| `_inductor/work_division.py` | `indirect_value_data_syms`, `collect_indirect_value_tds`, `IndexLoad` span guard, `forbidden_split_syms` in `_default_split`, `_first_non_indirect_read_index` |
+| `_inductor/work_division.py` | `indirect_value_data_syms`, `collect_indirect_value_tds`, `IndirectAccess` span guard, `forbidden_split_syms` in `_default_split`, `_first_non_indirect_read_index` |
 | `_inductor/codegen/superdsc.py` | `SDSCArgs.shared_base`, set for the value tensor |
 | `_inductor/codegen/compute_ops.py` | `core_idx_to_slice_offset` honours `shared_base` |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
