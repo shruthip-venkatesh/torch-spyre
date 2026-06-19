@@ -926,7 +926,7 @@ def _default_split(
     forbidden_split_syms: set[Symbol] | None = None,
     force_output_syms: set[Symbol] | None = None,
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
-    """Distribute remaining cores across dimensions by priority.
+    """Distribute max_cores by priority on top of span_reduction's commits.
 
     Takes the splits already committed by span reduction and fills in the rest
     by splitting output dimensions first, then reduction dimensions. Returns the
@@ -938,6 +938,9 @@ def _default_split(
     force_output_syms: Dimensions to treat as high-priority output dimensions
     even if they don't appear directly in the output coordinates (like a scatter's
     index-entry dimension). These get promoted to the front of the output list.
+
+    Returns the chosen splits and the (output, reduction) priority dims the
+    caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
     """
     # TODO: The final dim committed by span_reduction_pass holds the minimum
     #       split that gets the span under the limit, so it may have headroom
@@ -990,7 +993,7 @@ def work_distribution_pass(
     args: list[SchedNodeArg],
     max_cores: int,
 ) -> None:
-    """Distribute remaining cores across the operation's dimensions.
+    """Optional per-op pass: distribute remaining cores to maximize parallelism.
 
     Reads any splits already committed by span reduction, then allocates the
     remaining cores by splitting output dimensions first, then reduction
