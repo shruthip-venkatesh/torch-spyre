@@ -38,6 +38,7 @@ from indirect_access_common import (  # noqa: E402
     UNIMPLEMENTED,
     IndirectAccessTestCase,
     _label_for,
+    alloc_node_index,
     arg_has_indirect_access,
     capture_op_specs,
     capture_sdsc_calls,
@@ -47,6 +48,7 @@ from indirect_access_common import (  # noqa: E402
     indirect_access_target_names,
     iter_schedule_tree_nodes,
     iter_sdsc_op_bodies,
+    labeled_ds_index,
     op_spec_has_indirect_access,
     op_spec_has_indirect_input,
     op_spec_has_indirect_output,
@@ -208,7 +210,7 @@ class TestDetectionHelpers(IndirectAccessTestCase):
         self.assertEqual({str(a.args[0]) for a in atoms}, {"idx_buf"})
 
     def test_coord_atoms_tolerates_non_sympy_coordinate(self):
-        """A bare ``0`` coord has no .atoms() but must not error."""
+        """A bare `0` coord has no .atoms() but must not error."""
         ia = IndirectAccess(sympy.Symbol("idx_buf"))
         arg = _tensor_arg(True, [0, ia, sympy.Symbol("c0")])
         self.assertTrue(arg_has_indirect_access(arg))
@@ -460,6 +462,224 @@ class TestClassificationLogic(IndirectAccessTestCase):
         op specs captured before the failure."""
         spec = self._spec(self._arg(True, indirect=True), self._arg(False))
         self.assertEqual(_label_for(ValueError("x"), [spec], [spec]), CRASHED)
+
+
+# ===========================================================================
+# SDSC label / allocation-name parsing
+# ===========================================================================
+class TestLabelParsing(IndirectAccessTestCase):
+    def test_labeled_ds_index(self):
+        self.assertEqual(labeled_ds_index("Tensor0-idx0"), 0)
+        self.assertEqual(labeled_ds_index("Tensor12-idx12"), 12)
+
+    def test_labeled_ds_index_rejects_garbage(self):
+        for bad in ("Tensor3", "tensor3-idx3", "Tensor3-idx", "allocate-Tensor3_hbm"):
+            with self.assertRaises(ValueError):
+                labeled_ds_index(bad)
+
+    def test_alloc_node_index(self):
+        self.assertEqual(alloc_node_index("allocate-Tensor0_hbm"), 0)
+        self.assertEqual(alloc_node_index("allocate-Tensor7_lx"), 7)
+
+    def test_alloc_node_index_rejects_garbage(self):
+        for bad in ("Tensor3-idx3", "allocate-Tensor_hbm", "allocateTensor3_hbm"):
+            with self.assertRaises(ValueError):
+                alloc_node_index(bad)
+
+
+# ===========================================================================
+# assert_indirect_sdsc_fields on synthetic SDSC bundles (no device, no compile)
+# ===========================================================================
+def _alloc(idx, *, indirect="no_indirection", related=None, component="hbm"):
+    """A synthetic scheduleTree_ allocate node."""
+    node = {
+        "nodeType_": "allocate",
+        "name_": f"allocate-Tensor{idx}_{component}",
+        "ldsIdx_": idx,
+        "component_": component,
+        "indirectAllocType_": indirect,
+    }
+    if related is not None:
+        node["relatedIndirectAccessAlloc_"] = related
+    if indirect == "index_tensor":
+        node["indexTensorType_"] = "index"
+    return node
+
+
+def _lds(idx, *, hbm_only=False, word=2):
+    """A synthetic labeledDs_ entry."""
+    mem = (
+        {"hbm": {"isPresent": 1}}
+        if hbm_only
+        else {"hbm": {"isPresent": 1}, "lx": {"isPresent": 1}}
+    )
+    return {
+        "ldsIdx_": idx,
+        "dsName_": f"Tensor{idx}",
+        "memOrg_": mem,
+        "wordLength": word,
+        "dataFormat_": "SEN169_FP16",
+    }
+
+
+def _body(sched, labeled, *, inputs, output, indices):
+    """Assemble a synthetic op body (the inner dsc value)."""
+    compute = {
+        "opFuncName": "op",
+        "inputLabeledDs": [f"Tensor{i}-idx{i}" for i in inputs],
+        "outputLabeledDs": [f"Tensor{output}-idx{output}"],
+    }
+    if indices:
+        compute["indirectAccessIndexLabeledDs"] = [f"Tensor{i}-idx{i}" for i in indices]
+    return {
+        "N_": {"name_": "n"},
+        "scheduleTree_": sched,
+        "labeledDs_": labeled,
+        "computeOp_": [compute],
+    }
+
+
+def _bundle(body, opfunc="op", fname="sdsc_0.json"):
+    """Wrap an op body in the full sdsc-json envelope iter_sdsc_op_bodies expects."""
+    return {fname: {f"0_{opfunc}": {"dscs_": [{opfunc: body}]}}}
+
+
+def _gather_bundle():
+    """index=Tensor0, value-input=Tensor1, output=Tensor2 (value is an input)."""
+    sched = [
+        _alloc(0, indirect="index_tensor", related="allocate-Tensor1_hbm"),
+        _alloc(1, indirect="value_tensor", related="allocate-Tensor0_hbm"),
+        _alloc(2),
+    ]
+    labeled = [_lds(0, hbm_only=True, word=4), _lds(1), _lds(2)]
+    return _bundle(_body(sched, labeled, inputs=[1], output=2, indices=[0]))
+
+
+def _scatter_bundle():
+    """index=Tensor0, src-input=Tensor1, output=Tensor2 (output is the value)."""
+    sched = [
+        _alloc(0, indirect="index_tensor", related="allocate-Tensor2_hbm"),
+        _alloc(1),
+        _alloc(2, indirect="value_tensor", related="allocate-Tensor0_hbm"),
+    ]
+    labeled = [_lds(0, hbm_only=True, word=4), _lds(1), _lds(2)]
+    return _bundle(_body(sched, labeled, inputs=[1], output=2, indices=[0]))
+
+
+class TestIndirectSdscValidator(IndirectAccessTestCase):
+    """Drive assert_indirect_sdsc_fields with hand-built bundles, so the
+    validator's own logic is covered without a device or compiler."""
+
+    def test_valid_gather_passes(self):
+        self.assert_indirect_sdsc_fields(_gather_bundle(), "gather")
+
+    def test_valid_scatter_passes(self):
+        self.assert_indirect_sdsc_fields(_scatter_bundle(), "scatter")
+
+    def test_gather_validated_as_scatter_fails(self):
+        """A gather (value tensor is an input) must not pass scatter validation."""
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(_gather_bundle(), "scatter")
+
+    def test_scatter_validated_as_gather_fails(self):
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(_scatter_bundle(), "gather")
+
+    def test_empty_bundle_fails(self):
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields({}, "gather")
+
+    def test_unknown_kind_fails(self):
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(_gather_bundle(), "sideways")
+
+    def test_index_also_listed_as_input_fails(self):
+        sched = [
+            _alloc(0, indirect="index_tensor", related="allocate-Tensor1_hbm"),
+            _alloc(1, indirect="value_tensor", related="allocate-Tensor0_hbm"),
+            _alloc(2),
+        ]
+        labeled = [_lds(0, hbm_only=True, word=4), _lds(1), _lds(2)]
+        # Index Tensor0 wrongly appears in inputLabeledDs.
+        bundle = _bundle(_body(sched, labeled, inputs=[0, 1], output=2, indices=[0]))
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(bundle, "gather")
+
+    def test_missing_indirect_index_labeled_ds_fails(self):
+        sched = [
+            _alloc(0, indirect="index_tensor", related="allocate-Tensor1_hbm"),
+            _alloc(1, indirect="value_tensor", related="allocate-Tensor0_hbm"),
+            _alloc(2),
+        ]
+        labeled = [_lds(0, hbm_only=True, word=4), _lds(1), _lds(2)]
+        bundle = _bundle(_body(sched, labeled, inputs=[1], output=2, indices=[]))
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(bundle, "gather")
+
+    def test_dangling_cross_link_fails(self):
+        sched = [
+            # Index points at a value tensor that does not exist.
+            _alloc(0, indirect="index_tensor", related="allocate-Tensor9_hbm"),
+            _alloc(1, indirect="value_tensor", related="allocate-Tensor0_hbm"),
+            _alloc(2),
+        ]
+        labeled = [_lds(0, hbm_only=True, word=4), _lds(1), _lds(2)]
+        bundle = _bundle(_body(sched, labeled, inputs=[1], output=2, indices=[0]))
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(bundle, "gather")
+
+    def test_index_in_lx_fails(self):
+        sched = [
+            _alloc(0, indirect="index_tensor", related="allocate-Tensor1_hbm"),
+            _alloc(1, indirect="value_tensor", related="allocate-Tensor0_hbm"),
+            _alloc(2),
+        ]
+        # Index labeledDs wrongly allows LX.
+        labeled = [_lds(0, hbm_only=False, word=4), _lds(1), _lds(2)]
+        bundle = _bundle(_body(sched, labeled, inputs=[1], output=2, indices=[0]))
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(bundle, "gather")
+
+    def test_non_integer_index_word_length_fails(self):
+        sched = [
+            _alloc(0, indirect="index_tensor", related="allocate-Tensor1_hbm"),
+            _alloc(1, indirect="value_tensor", related="allocate-Tensor0_hbm"),
+            _alloc(2),
+        ]
+        # Index with fp16 word length (2) is invalid for an index tensor.
+        labeled = [_lds(0, hbm_only=True, word=2), _lds(1), _lds(2)]
+        bundle = _bundle(_body(sched, labeled, inputs=[1], output=2, indices=[0]))
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(bundle, "gather")
+
+    def test_value_without_index_fails(self):
+        sched = [
+            _alloc(0),
+            _alloc(1, indirect="value_tensor", related="allocate-Tensor0_hbm"),
+            _alloc(2),
+        ]
+        labeled = [_lds(0), _lds(1), _lds(2)]
+        bundle = _bundle(_body(sched, labeled, inputs=[1], output=2, indices=[]))
+        with self.assertRaises(AssertionError):
+            self.assert_indirect_sdsc_fields(bundle, "gather")
+
+    def test_auxiliary_direct_op_is_tolerated(self):
+        """A direct op sharing the bundle is skipped, not failed, as long as the
+        bundle still contains a valid indirect op somewhere."""
+        direct = _bundle(
+            _body(
+                [_alloc(0), _alloc(1)],
+                [_lds(0), _lds(1)],
+                inputs=[0],
+                output=1,
+                indices=[],
+            ),
+            opfunc="exp",
+            fname="sdsc_1.json",
+        )
+        # Merge a direct op file with the gather op file (distinct filenames).
+        merged = {**direct, **_gather_bundle()}
+        self.assert_indirect_sdsc_fields(merged, "gather")
 
 
 if __name__ == "__main__":

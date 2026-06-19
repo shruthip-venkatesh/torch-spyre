@@ -19,6 +19,13 @@ Each scenario compiles once and makes all relevant assertions in one place
 spreading the same kernel across detection/op_spec/sdsc stage files.
 Slice by stage with the optional check(...) parameters.
 
+Every gather scenario now carries through to SDSC generation: check() (and the
+capture-based tests via bundle_jsons_from_captured) validate the indirect-access
+encoding of the produced bundle, not just that op specs were generated.
+
+TestGatherE2E (opt-in via SPYRE_RUN_E2E=1) runs the real backend end-to-end and
+warns that the device result diverges from the CPU reference.
+
 Status (validated on hardware build): gather reaches op-spec and SDSC
 generation; the deeptools backend still rejects the bundle.
 """
@@ -36,6 +43,7 @@ from indirect_access_common import (  # noqa: E402
     GATHER_OP_SPEC,
     NO_SPYRE_OP,
     IndirectAccessTestCase,
+    bundle_jsons_from_captured,
     capture_op_specs,
     capture_sdsc_calls,
     classify_compile,
@@ -47,6 +55,7 @@ from indirect_access_common import (  # noqa: E402
     op_spec_has_indirect_access,
     op_spec_has_indirect_input,
     op_spec_has_indirect_output,
+    run_e2e,
 )
 
 from torch._inductor.exc import InductorError  # noqa: E402
@@ -135,6 +144,9 @@ class TestGather(IndirectAccessTestCase):
         self.assertTrue(spec.args[0].is_input, "index arg should be an input")
         self.assertFalse(spec.args[-1].is_input, "last arg should be the output")
         self.assertEqual(len([a for a in spec.args if not a.is_input]), 1)
+        # Carry the same scenario through to SDSC and validate the indirect
+        # encoding of the copy op (not just that op specs were produced).
+        self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
 
     def test_gather_supported_unaries(self):
         """A gather fused with each supported unary keeps the gather signature.
@@ -164,6 +176,11 @@ class TestGather(IndirectAccessTestCase):
                     any(op_spec_has_indirect_input(s) for s in op_specs),
                     f"{label}: gather signature lost",
                 )
+                # Each supported unary must also lower to a well-formed
+                # indirect-access SDSC bundle, not just an op spec.
+                self.assert_indirect_sdsc_fields(
+                    bundle_jsons_from_captured(captured), "gather"
+                )
 
     def test_gather_chained_unaries(self):
         """x[i].exp().tanh(): both unaries stay on Spyre, gather keeps its indirect access."""
@@ -175,6 +192,8 @@ class TestGather(IndirectAccessTestCase):
         self.assertIn("exp", ops)
         self.assertIn("tanh", ops)
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
+        # The fused chain must still emit a valid indirect-access SDSC bundle.
+        self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
 
     # -- classification of torch gather ops -------------------------------
     def test_advanced_indexing(self):
@@ -311,11 +330,16 @@ class TestGather(IndirectAccessTestCase):
 
     def test_unsupported_unary_after_gather_falls_back_to_cpu(self):
         """x[i].sin(): sin has no Spyre lowering so it falls back to CPU.
-        The gather still compiles (GATHER_OP_SPEC) and 'sin' is not a Spyre op."""
+        The gather still compiles (GATHER_OP_SPEC) and 'sin' is not a Spyre op.
+        The Spyre-side gather must still lower to a valid indirect SDSC bundle."""
         x, i = self._xi(P=32)
         label, op_specs = classify_compile(lambda x, i: x[i].sin(), x, i)
         self.assertEqual(label, GATHER_OP_SPEC)
         self.assertNotIn("sin", [s.op for s in op_specs])
+
+        with capture_op_specs() as captured:
+            torch.compile(lambda x, i: x[i].sin())(x, i)
+        self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
 
     # -- SDSC generation field checks (one compile, all fields) -----------
     def _gen_sdsc(self):
@@ -449,6 +473,47 @@ class TestGather(IndirectAccessTestCase):
         with patch(_LAUNCH_KERNEL):
             with self.assertRaises(InductorError):
                 torch.compile(lambda x, i: x[i].exp())(x, i)
+
+
+@unittest.skipUnless(
+    os.environ.get("SPYRE_RUN_E2E") == "1",
+    "E2E gather runs the real backend (dxp_standalone + on-device launch), which "
+    "requires Spyre hardware and is expected to diverge from / abort on the CPU "
+    "reference; opt in with SPYRE_RUN_E2E=1.",
+)
+class TestGatherE2E(IndirectAccessTestCase):
+    """End-to-end gather runs on the real backend (no mocking).
+
+    Mirrors the standalone tests/indirect_access/gather.py script: compile and
+    run on device, then compare against the CPU reference. The Spyre backend
+    does not yet implement indirect gather correctly, so run_e2e warns (rather
+    than fails) on the value divergence while still asserting the pipeline ran
+    end-to-end and returned a correctly shaped/typed tensor.
+    """
+
+    def _named_xi(self, P=3, two_d=False, M=128, N=256, Q=192):
+        """Device (x, i) gather operands with named dims, like TestGather._xi."""
+        x = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        shape = (P, Q) if two_d else (P,)
+        i = torch.randint(0, M, shape, dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P, "Q": Q} if two_d else {"P": P})
+        return x, i
+
+    def test_gather_exp_e2e_diverges(self):
+        """x[i].exp() end-to-end: warns that the device result diverges."""
+        x, i = self._named_xi(P=3, two_d=True)
+        run_e2e(self, lambda x, i: x[i].exp(), x, i)
+
+    def test_gather_bare_e2e_diverges(self):
+        """x[i] (bare gather copy) end-to-end."""
+        x, i = self._named_xi(P=32)
+        run_e2e(self, lambda x, i: x[i], x, i)
+
+    def test_index_select_e2e_diverges(self):
+        """torch.index_select(x, 0, i) end-to-end."""
+        x, i = self._named_xi(P=32)
+        run_e2e(self, lambda x, i: torch.index_select(x, 0, i), x, i)
 
 
 if __name__ == "__main__":

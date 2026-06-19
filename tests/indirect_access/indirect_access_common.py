@@ -27,12 +27,27 @@ and IndirectAccessTestCase.check (slice by stage with the op=, detected=,
 sdsc= parameters). The capture machinery intercepts the compiler before
 SuperDSC, records the generated OpSpecs, and returns a no-op runner -- so we
 test compiler output without actual hardware or numeric results.
+
+For a gather/scatter outcome, check does not stop at "the SDSC json exists":
+IndirectAccessTestCase.assert_indirect_sdsc_fields validates the full
+indirect-access encoding the backend depends on -- index/value allocation
+types, HBM-only index tensors, the index<->value cross-links, and the
+computeOp routing. bundle_jsons_from_captured lets a test that only captured
+op specs move on to that same SDSC validation without recompiling.
+
+run_e2e drives the real backend (no mocking), mirroring the standalone
+gather.py script: it compiles and runs on device, then warns -- rather than
+fails -- that the values diverge from the CPU reference, because the backend
+does not yet implement indirect access correctly. Only gather reaches this path
+today; the name is generic so scatter can reuse it later.
 """
 
 import contextlib
 import dataclasses
+import warnings
 from unittest.mock import patch
 
+import regex as re
 import torch
 from torch._inductor.test_case import TestCase as InductorTestCase
 
@@ -270,9 +285,133 @@ def iter_schedule_tree_nodes(jsons):
         yield from body.get("scheduleTree_", [])
 
 
-def _bundle_jsons_from_captured(captured) -> dict:
+# ---------------------------------------------------------------------------
+# SDSC label / allocation-name parsing
+# ---------------------------------------------------------------------------
+# computeOp labels look like "Tensor3-idx3"; allocate-node names and the
+# relatedIndirectAccessAlloc_ cross-links look like "allocate-Tensor3_hbm".
+_LABELED_DS_RE = re.compile(r"Tensor(\d+)-idx\d+")
+_ALLOC_NAME_RE = re.compile(r"allocate-Tensor(\d+)_")
+
+
+def labeled_ds_index(label: str) -> int:
+    """Parse the tensor index from a computeOp labeledDs reference.
+
+    e.g. `"Tensor3-idx3" -> 3`.  Raises ValueError on an unrecognized label
+    so a malformed SDSC bundle fails loudly rather than silently.
+    """
+    m = _LABELED_DS_RE.fullmatch(label)
+    if m is None:
+        raise ValueError(f"unrecognized labeledDs reference: {label!r}")
+    return int(m.group(1))
+
+
+def alloc_node_index(name: str) -> int:
+    """Parse the tensor index from an allocate-node name or cross-link.
+
+    e.g. `"allocate-Tensor3_hbm" -> 3`.  Raises ValueError on an
+    unrecognized name.
+    """
+    m = _ALLOC_NAME_RE.match(name)
+    if m is None:
+        raise ValueError(f"unrecognized allocate name: {name!r}")
+    return int(m.group(1))
+
+
+# ---------------------------------------------------------------------------
+# End-to-end execution (real backend)
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class E2EResult:
+    """The outcome of an end-to-end run compared against the CPU reference."""
+
+    result: torch.Tensor  # device result, moved back to CPU
+    reference: torch.Tensor  # eager CPU reference
+    max_abs_diff: float  # max |reference - result|
+    close: bool  # whether result matched reference within tolerance
+
+
+def run_e2e(
+    test,
+    kernel,
+    *dev_args,
+    atol: float = 0.01,
+    rtol: float = 0.01,
+    expect_close: bool | None = None,
+):
+    """Compile and run an indirect-access kernel end-to-end on the real Spyre
+    backend and validate the device result against the CPU reference.
+
+    Unlike the capture-based helpers, this mocks nothing: it drives the full
+    `bundle -> dxp_standalone -> launch_kernel` path, exactly like the
+    standalone `tests/indirect_access/gather.py` script.  `dev_args` are the
+    device tensors the kernel is invoked with; the CPU reference is computed
+    from their host copies.
+
+    Today only gather kernels reach the indirect path -- the name is
+    deliberately generic so scatter (and other indirect ops) can reuse it once
+    the backend supports them.
+
+    Result validation:
+      * the output is always checked for the correct shape and dtype;
+      * the values are compared against the golden CPU reference and the
+        max-abs-diff recorded;
+      * `expect_close` controls the value assertion:
+          - `True`  -> assert the result matches (use for CPU-fallback ops,
+                         whose results must be correct);
+          - `False` -> assert the result diverges (pin a known-bad path);
+          - `None`  -> do not fail on divergence; instead warn. This is the
+                         default for on-device indirect gather, which the
+                         backend does not yet implement correctly, so a hard
+                         equality assert would fail today and a hard inequality
+                         assert would become a false alarm the day it is fixed.
+
+    Returns an `E2EResult`.
+    """
+    reference = kernel(
+        *[a.cpu() if isinstance(a, torch.Tensor) else a for a in dev_args]
+    )
+
+    # Recompile from scratch so the run exercises a fresh bundle.
+    torch._dynamo.reset()
+    result = torch.compile(kernel)(*dev_args).cpu()
+
+    test.assertEqual(
+        result.shape, reference.shape, "e2e run produced the wrong output shape"
+    )
+    test.assertEqual(
+        result.dtype, reference.dtype, "e2e run produced the wrong output dtype"
+    )
+
+    diff = torch.abs(reference.float() - result.float()).amax().item()
+    close = torch.allclose(result, reference, atol=atol, rtol=rtol, equal_nan=True)
+
+    if expect_close is True:
+        test.assertTrue(
+            close, f"e2e result must match the CPU reference (max abs diff {diff:.4g})"
+        )
+    elif expect_close is False:
+        test.assertFalse(close, "e2e result unexpectedly matched the CPU reference")
+    elif not close:
+        warnings.warn(
+            "e2e result diverges from the CPU reference "
+            f"(max abs diff {diff:.4g}); the Spyre backend does not yet "
+            "implement indirect access correctly, so this divergence is "
+            "expected. The pipeline compiled and ran end-to-end.",
+            stacklevel=2,
+        )
+    return E2EResult(result=result, reference=reference, max_abs_diff=diff, close=close)
+
+
+def bundle_jsons_from_captured(captured) -> dict:
     """Run the real generate_bundle on already-captured op specs (no recompile)
-    and return {relpath: parsed_json}."""
+    and return {relpath: parsed_json}.
+
+    This is the bridge that lets a test which only captured op specs (via
+    `capture_op_specs`) move on to the SDSC stage without recompiling: hand it
+    the captured spec lists and it returns the parsed `sdsc_*.json` bundle so
+    the indirect-access fields can be asserted (see
+    `IndirectAccessTestCase.assert_indirect_sdsc_fields`)."""
     import glob
     import json
     import os
@@ -351,7 +490,7 @@ def run_scenario(kernel, *dev_args, build_sdsc: bool = True) -> ScenarioResult:
         op_specs=op_specs,
         entries=entries,
         detected_index_names=set().union(*seen) if seen else set(),
-        sdsc_jsons=_bundle_jsons_from_captured(captured) if build_sdsc else {},
+        sdsc_jsons=bundle_jsons_from_captured(captured) if build_sdsc else {},
         exc=exc,
     )
 
@@ -431,8 +570,11 @@ class IndirectAccessTestCase(InductorTestCase):
             op: If given, assert this op name appears among the produced specs
             detected: If True/False, assert the index buffer was/wasn't flagged
                 by indirect_index_dep_names during layout propagation
-            sdsc: If True, also build the SDSC bundle and assert its op bodies
-                carry the core structural fields (only when an op spec exists)
+            sdsc: If True, also build the SDSC bundle. For a gather/scatter
+                outcome the bundle's indirect-access encoding is fully validated
+                (index/value allocation types, HBM-only index tensors, the
+                index<->value cross-links, and the computeOp routing); see
+                assert_indirect_sdsc_fields.
 
         Returns the ScenarioResult for any further per-test assertions.
         """
@@ -450,8 +592,205 @@ class IndirectAccessTestCase(InductorTestCase):
                 r.detected_index_names, "index buffer unexpectedly detected"
             )
         if sdsc and r.label in (GATHER_OP_SPEC, SCATTER_OP_SPEC):
-            self.assertTrue(r.sdsc_jsons, "no SDSC json generated")
-            for opfunc, body in iter_sdsc_op_bodies(r.sdsc_jsons):
-                for field in ("N_", "scheduleTree_", "labeledDs_", "computeOp_"):
-                    self.assertIn(field, body, f"{opfunc} SDSC body missing {field}")
+            kind = "gather" if r.label == GATHER_OP_SPEC else "scatter"
+            self.assert_indirect_sdsc_fields(r.sdsc_jsons, kind)
         return r
+
+    # -- SDSC indirect-access field validation ---------------------------
+    def assert_indirect_sdsc_fields(self, sdsc_jsons, kind: str):
+        """Assert the SDSC bundle encodes a structurally valid indirect access.
+
+        Goes beyond "the json exists with the core fields": it verifies the
+        indirect-access contract that the backend relies on, so a regression in
+        SDSC generation surfaces here instead of at backend-compile time.
+
+        `kind` is "gather" (indirect read -- the value tensor is an input) or
+        "scatter" (indirect write -- the value tensor is the output).
+
+        For every compiled op in the bundle:
+
+          * the core structural fields are present and `scheduleTree_` /
+            `labeledDs_` are the same length (one entry per tensor arg), and
+            every allocate node is well-formed.
+
+        For every op that actually carries indirect access (auxiliary direct
+        ops sharing the bundle are skipped):
+
+          * it has at least one `index_tensor` node *and* its referenced
+            `value_tensor` node -- one cannot appear without the other;
+          * each index tensor declares `indexTensorType_ == "index"`, lives in
+            HBM only (the engine cannot indirectly address through LX), carries
+            an int32/int64 word length, and cross-links to a real value tensor;
+          * each value tensor cross-links back to its index tensor
+            (bidirectionally consistent);
+          * the computeOp routes exactly the index tensors through
+            `indirectAccessIndexLabeledDs` and never lists them as a plain
+            `inputLabeledDs`;
+          * the value tensor is an input for a gather and the output for a
+            scatter.
+
+        Finally, at least one index tensor and one value tensor must appear
+        somewhere in the bundle, so an empty/degenerate bundle cannot pass.
+        """
+        self.assertIn(kind, ("gather", "scatter"), f"unknown kind {kind!r}")
+        self.assertTrue(sdsc_jsons, "no SDSC json generated for an indirect-access op")
+
+        saw_index = False
+        saw_value = False
+        for opfunc, body in iter_sdsc_op_bodies(sdsc_jsons):
+            for field in ("N_", "scheduleTree_", "labeledDs_", "computeOp_"):
+                self.assertIn(field, body, f"{opfunc}: SDSC body missing {field}")
+            sched = body["scheduleTree_"]
+            labeled = body["labeledDs_"]
+            self.assertEqual(
+                len(sched),
+                len(labeled),
+                f"{opfunc}: scheduleTree_/labeledDs_ length mismatch",
+            )
+            for n in sched:
+                self.assertEqual(
+                    n["nodeType_"], "allocate", f"{opfunc}: non-allocate schedule node"
+                )
+                self.assertTrue(
+                    n["name_"].startswith("allocate-Tensor"),
+                    f"{opfunc}: malformed allocate name {n.get('name_')!r}",
+                )
+                self.assertIn(
+                    n["component_"], ("hbm", "lx"), f"{opfunc}: bad component_"
+                )
+                self.assertIn(
+                    n.get("indirectAllocType_"),
+                    ("index_tensor", "value_tensor", "no_indirection"),
+                    f"{opfunc}: node {n.get('ldsIdx_')} bad indirectAllocType_",
+                )
+
+            index_nodes = [
+                n for n in sched if n.get("indirectAllocType_") == "index_tensor"
+            ]
+            value_nodes = [
+                n for n in sched if n.get("indirectAllocType_") == "value_tensor"
+            ]
+            if not index_nodes and not value_nodes:
+                # A direct op sharing the bundle -- nothing indirect to check.
+                continue
+
+            # An indirect op must encode both halves of the access.
+            self.assertTrue(
+                index_nodes, f"{opfunc}: value_tensor present without an index_tensor"
+            )
+            self.assertTrue(
+                value_nodes, f"{opfunc}: index_tensor present without a value_tensor"
+            )
+            saw_index = True
+            saw_value = True
+
+            nodes_by_idx = {n["ldsIdx_"]: n for n in sched}
+            lds_by_idx = {ld["ldsIdx_"]: ld for ld in labeled}
+
+            compute = body["computeOp_"][0]
+            out_idxs = {labeled_ds_index(x) for x in compute["outputLabeledDs"]}
+            self.assertEqual(
+                len(out_idxs), 1, f"{opfunc}: expected exactly one output label"
+            )
+            out_idx = next(iter(out_idxs))
+
+            # computeOp must route the index tensors as indirect indices, never
+            # as ordinary inputs.
+            ia_labels = compute.get("indirectAccessIndexLabeledDs")
+            self.assertTrue(
+                ia_labels,
+                f"{opfunc}: computeOp missing indirectAccessIndexLabeledDs",
+            )
+            ia_idxs = {labeled_ds_index(x) for x in ia_labels}
+            self.assertEqual(
+                ia_idxs,
+                {n["ldsIdx_"] for n in index_nodes},
+                f"{opfunc}: indirectAccessIndexLabeledDs must name exactly the "
+                "index tensors",
+            )
+            in_idxs = {labeled_ds_index(x) for x in compute["inputLabeledDs"]}
+            self.assertFalse(
+                ia_idxs & in_idxs,
+                f"{opfunc}: an index tensor must not also be a plain input",
+            )
+
+            # Index tensors: HBM-only, integer word length, linked to a value.
+            for n in index_nodes:
+                i = n["ldsIdx_"]
+                self.assertEqual(
+                    n.get("indexTensorType_"),
+                    "index",
+                    f"{opfunc}: index {i} must declare indexTensorType_ 'index'",
+                )
+                self.assertIn(
+                    "relatedIndirectAccessAlloc_",
+                    n,
+                    f"{opfunc}: index {i} missing relatedIndirectAccessAlloc_",
+                )
+                related = n["relatedIndirectAccessAlloc_"]
+                self.assertRegex(related, r"^allocate-Tensor\d+_hbm$")
+                v = alloc_node_index(related)
+                self.assertIn(
+                    v,
+                    nodes_by_idx,
+                    f"{opfunc}: index {i} references absent value alloc {related!r}",
+                )
+                self.assertEqual(
+                    nodes_by_idx[v].get("indirectAllocType_"),
+                    "value_tensor",
+                    f"{opfunc}: index {i}'s related alloc must be a value_tensor",
+                )
+                lds = lds_by_idx[i]
+                self.assertIn(
+                    "hbm", lds["memOrg_"], f"{opfunc}: index {i} labeledDs not in HBM"
+                )
+                self.assertNotIn(
+                    "lx", lds["memOrg_"], f"{opfunc}: index {i} must be HBM only"
+                )
+                self.assertIn(
+                    lds["wordLength"],
+                    (4, 8),
+                    f"{opfunc}: index {i} wordLength must be int32/int64",
+                )
+
+            # Value tensors: cross-link back, and obey the gather/scatter shape.
+            for n in value_nodes:
+                v = n["ldsIdx_"]
+                self.assertIn(
+                    "relatedIndirectAccessAlloc_",
+                    n,
+                    f"{opfunc}: value {v} missing relatedIndirectAccessAlloc_",
+                )
+                related = n["relatedIndirectAccessAlloc_"]
+                self.assertRegex(related, r"^allocate-Tensor\d+_hbm$")
+                i = alloc_node_index(related)
+                self.assertIn(
+                    i,
+                    nodes_by_idx,
+                    f"{opfunc}: value {v} references absent index alloc {related!r}",
+                )
+                self.assertEqual(
+                    nodes_by_idx[i].get("indirectAllocType_"),
+                    "index_tensor",
+                    f"{opfunc}: value {v}'s related alloc must be an index_tensor",
+                )
+                back = nodes_by_idx[i].get("relatedIndirectAccessAlloc_")
+                self.assertIsNotNone(
+                    back, f"{opfunc}: index {i} missing back-link to value {v}"
+                )
+                self.assertEqual(
+                    alloc_node_index(back),
+                    v,
+                    f"{opfunc}: index/value cross-link is not bidirectional",
+                )
+                if kind == "scatter":
+                    self.assertEqual(
+                        v, out_idx, f"{opfunc}: scatter value tensor must be the output"
+                    )
+                else:
+                    self.assertNotEqual(
+                        v, out_idx, f"{opfunc}: gather value tensor must be an input"
+                    )
+
+        self.assertTrue(saw_index, "no index_tensor nodes anywhere in the SDSC bundle")
+        self.assertTrue(saw_value, "no value_tensor nodes anywhere in the SDSC bundle")
