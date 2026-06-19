@@ -1,0 +1,457 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Consolidated gather-style indirect-access tests (one file per op family).
+
+Each scenario compiles once and makes all relevant assertions in one place
+(classification, op-spec structure, detection, SDSC fields), instead of
+spreading the same kernel across detection/op_spec/sdsc stage files.
+Slice by stage with the optional check(...) parameters.
+
+Status (validated on hardware build): gather reaches op-spec and SDSC
+generation; the deeptools backend still rejects the bundle.
+"""
+
+import os
+import sys
+import unittest
+from unittest.mock import patch
+
+import torch
+
+sys.path.insert(0, os.path.dirname(__file__))
+from indirect_access_common import (  # noqa: E402
+    DIRECT_OP_SPEC,
+    GATHER_OP_SPEC,
+    NO_SPYRE_OP,
+    IndirectAccessTestCase,
+    capture_op_specs,
+    capture_sdsc_calls,
+    classify_compile,
+    flatten_op_specs,
+    generate_sdsc_jsons,
+    indirect_access_target_names,
+    iter_schedule_tree_nodes,
+    iter_sdsc_op_bodies,
+    op_spec_has_indirect_access,
+    op_spec_has_indirect_input,
+    op_spec_has_indirect_output,
+)
+
+from torch._inductor.exc import InductorError  # noqa: E402
+from torch_spyre._C import DataFormats  # noqa: E402
+from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
+from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
+
+# Mock target to disable actual kernel execution on device.
+_LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
+
+
+class TestGather(IndirectAccessTestCase):
+    """torch gather-family ops: one compile + all-stage checks per scenario."""
+
+    def _xi(self, P=32, two_d=False, dtype=torch.int32, M=128, N=256, Q=192):
+        """Named (x[M,N], idx) gather operands. two_d means idx[P,Q]."""
+        x = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        shape = (P, Q) if two_d else (P,)
+        i = torch.randint(0, M, shape, dtype=dtype).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P, "Q": Q} if two_d else {"P": P})
+        return x, i
+
+    # -- core x[i].exp(): op-spec structure + detection (one compile) ------
+    def test_gather_exp_op_spec(self):
+        """x[i].exp(): GATHER op spec with IndirectAccess on an input, a named
+        index arg matching the IndirectAccess target, one output, a well-formed
+        iteration space and TensorArg metadata, and the index is detected."""
+        x, i = self._xi(P=3, two_d=True)
+        r = self.check(
+            lambda x, i: x[i].exp(),
+            x,
+            i,
+            expect=GATHER_OP_SPEC,
+            op="exp",
+            detected=True,
+        )
+        op_specs = r.op_specs
+        self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
+        self.assertFalse(any(op_spec_has_indirect_output(s) for s in op_specs))
+
+        named = [
+            a for s in op_specs for a in s.args if a.is_input and a.name is not None
+        ]
+        self.assertTrue(named, "no named index arg found")
+        targets = indirect_access_target_names(op_specs)
+        self.assertTrue(any(a.name in targets for a in named))
+        for a in named:
+            self.assertIsInstance(a.name, str)
+            self.assertTrue(a.name)
+        self.assertTrue(
+            any(a.is_input and a.name is None for s in op_specs for a in s.args),
+            "expected a value (non-index) input arg",
+        )
+        for s in op_specs:
+            self.assertEqual(len([a for a in s.args if not a.is_input]), 1)
+            self.assertGreaterEqual(len([a for a in s.args if a.is_input]), 1)
+            self.assertTrue(s.iteration_space)
+            for _rng, work in s.iteration_space.values():
+                self.assertGreaterEqual(int(work), 1)
+            for a in s.args:
+                self.assertIsInstance(a.device_dtype, DataFormats)
+                self.assertTrue(a.device_size, "device_size should be non-empty")
+                self.assertIsNotNone(a.stride_map, "stride_map should be populated")
+                self.assertEqual(len(a.device_coordinates), len(a.device_size))
+
+    def test_gather_bare_index(self):
+        """x[i] (no unary) produces an identity/restickify copy op.
+        Arg ordering is: index first, value, then output."""
+        x, i = self._xi(P=3, two_d=True)
+        with capture_op_specs() as captured:
+            torch.compile(lambda x, i: x[i])(x, i)
+        op_specs = self.assert_reaches_op_spec(captured)
+        gather_specs = [
+            s
+            for s in op_specs
+            if s.op in (IDENTITY_OP, RESTICKIFY_OP) and op_spec_has_indirect_input(s)
+        ]
+        self.assertTrue(
+            gather_specs,
+            f"expected an indirect copy op ({IDENTITY_OP}/{RESTICKIFY_OP}); "
+            f"got ops={[s.op for s in op_specs]}",
+        )
+        spec = gather_specs[0]
+        self.assertIsNotNone(spec.args[0].name, "first arg should be the named index")
+        self.assertTrue(spec.args[0].is_input, "index arg should be an input")
+        self.assertFalse(spec.args[-1].is_input, "last arg should be the output")
+        self.assertEqual(len([a for a in spec.args if not a.is_input]), 1)
+
+    def test_gather_supported_unaries(self):
+        """A gather fused with each supported unary keeps the gather signature.
+        The op name may differ if a unary decomposes, so we check the signature.
+        """
+        M, N, P = 128, 256, 32
+        unaries = {
+            "abs": torch.abs,
+            "neg": torch.neg,
+            "exp": torch.exp,
+            "tanh": torch.tanh,
+            "sqrt": torch.sqrt,
+            "sigmoid": torch.sigmoid,
+            "relu": torch.relu,
+        }
+        for label, fn in unaries.items():
+            with self.subTest(unary=label):
+                torch._dynamo.reset()
+                x = torch.rand(M, N, dtype=torch.float16).to("spyre")
+                idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+                self.name_dims(x, {"M": M, "N": N})
+                self.name_dims(idx, {"P": P})
+                with capture_op_specs() as captured:
+                    torch.compile(lambda x, i, _fn=fn: _fn(x[i]))(x, idx)
+                op_specs = self.assert_reaches_op_spec(captured)
+                self.assertTrue(
+                    any(op_spec_has_indirect_input(s) for s in op_specs),
+                    f"{label}: gather signature lost",
+                )
+
+    def test_gather_chained_unaries(self):
+        """x[i].exp().tanh(): both unaries stay on Spyre, gather keeps its indirect access."""
+        x, i = self._xi(P=32)
+        with capture_op_specs() as captured:
+            torch.compile(lambda x, i: x[i].exp().tanh())(x, i)
+        op_specs = self.assert_reaches_op_spec(captured)
+        ops = [s.op for s in op_specs]
+        self.assertIn("exp", ops)
+        self.assertIn("tanh", ops)
+        self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
+
+    # -- classification of torch gather ops -------------------------------
+    def test_advanced_indexing(self):
+        x, i = self._xi(P=32)
+        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_advanced_indexing_int64_index(self):
+        x, i = self._xi(P=32, dtype=torch.int64)
+        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_advanced_indexing_2d_index(self):
+        x, i = self._xi(P=3, two_d=True)
+        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_advanced_indexing_single_row(self):
+        x, i = self._xi(P=1)
+        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_advanced_indexing_with_tanh(self):
+        x, i = self._xi(P=32)
+        self.check(lambda x, i: x[i].tanh(), x, i, expect=GATHER_OP_SPEC, op="tanh")
+
+    def test_advanced_indexing_with_abs(self):
+        x, i = self._xi(P=32)
+        self.check(lambda x, i: x[i].abs(), x, i, expect=GATHER_OP_SPEC, op="abs")
+
+    def test_index_select(self):
+        x, i = self._xi(P=32)
+        self.check(
+            lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
+        )
+
+    def test_index_select_with_exp(self):
+        x, i = self._xi(P=32)
+        self.check(
+            lambda x, i: torch.index_select(x, 0, i).exp(),
+            x,
+            i,
+            expect=GATHER_OP_SPEC,
+            op="exp",
+        )
+
+    def test_index_select_larger_index(self):
+        x, i = self._xi(P=96)
+        self.check(
+            lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
+        )
+
+    def test_torch_gather(self):
+        """torch.gather(x, 0, index) with a same-rank [M,K] index tensor."""
+        M, N, K = 128, 256, 64
+        x = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        index = torch.randint(0, N, (M, K), dtype=torch.int64).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(index, {"M": M, "K": K})
+        self.check(
+            lambda x, index: torch.gather(x, 0, index), x, index, expect=GATHER_OP_SPEC
+        )
+
+    def test_embedding(self):
+        """torch.embedding(weight, idx) currently falls back to CPU."""
+        V, E, P = 256, 128, 32
+        weight = torch.rand(V, E, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, V, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": P})
+        self.check(lambda w, i: torch.embedding(w, i), weight, idx, expect=NO_SPYRE_OP)
+
+    # -- additional real gather scenarios ---------------------------------
+    def test_gather_3d_data(self):
+        """x[i] where x is 3-D [A,B,C] -- gather rows of higher-rank data."""
+        A, B, C, P = 64, 8, 64, 16
+        x = torch.rand(A, B, C, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, A, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"A": A, "B": B, "C": C})
+        self.name_dims(idx, {"P": P})
+        self.check(lambda x, i: x[i], x, idx, expect=GATHER_OP_SPEC)
+
+    def test_gather_then_scalar_mul(self):
+        """x[i] * 2.0 -- gather fused with a scalar binary op."""
+        x, i = self._xi(P=32)
+        self.check(lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_then_scalar_add(self):
+        """x[i] + 1.0 -- gather fused with a scalar add."""
+        x, i = self._xi(P=32)
+        self.check(lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_two_indices_added(self):
+        """x[i] + x[j] -- two independent gathers feeding a binary op."""
+        M, N, P = 128, 256, 32
+        x = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        j = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P})
+        self.name_dims(j, {"P": P})
+        self.check(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
+
+    def test_gather_then_sum_reduction(self):
+        """x[i].sum(dim=1) -- a reduction over gathered rows."""
+        x, i = self._xi(P=32)
+        self.check(lambda x, i: x[i].sum(dim=1), x, i, expect=GATHER_OP_SPEC)
+
+    def test_functional_embedding(self):
+        """torch.nn.functional.embedding(idx, weight) -- like torch.embedding."""
+        V, E, P = 256, 128, 32
+        weight = torch.rand(V, E, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, V, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": P})
+        self.check(
+            lambda i, w: torch.nn.functional.embedding(i, w),
+            idx,
+            weight,
+            expect=NO_SPYRE_OP,
+        )
+
+    # -- negative / control scenarios -------------------------------------
+    def test_direct_access_control(self):
+        """x.exp() (no indexing): direct op spec, no IndirectAccess, no named
+        index arg, and not flagged by detection."""
+        M, N = 128, 256
+        x = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        r = self.check(
+            lambda x: x.exp(), x, expect=DIRECT_OP_SPEC, op="exp", detected=False
+        )
+        self.assertFalse(any(op_spec_has_indirect_access(s) for s in r.op_specs))
+        self.assertFalse(
+            any(a.name is not None for s in r.op_specs for a in s.args),
+            "direct access should have no named index arg",
+        )
+
+    def test_unsupported_unary_after_gather_falls_back_to_cpu(self):
+        """x[i].sin(): sin has no Spyre lowering so it falls back to CPU.
+        The gather still compiles (GATHER_OP_SPEC) and 'sin' is not a Spyre op."""
+        x, i = self._xi(P=32)
+        label, op_specs = classify_compile(lambda x, i: x[i].sin(), x, i)
+        self.assertEqual(label, GATHER_OP_SPEC)
+        self.assertNotIn("sin", [s.op for s in op_specs])
+
+    # -- SDSC generation field checks (one compile, all fields) -----------
+    def _gen_sdsc(self):
+        x, i = self._xi(P=3, two_d=True)
+        return generate_sdsc_jsons(lambda x, i: x[i].exp(), x, i)
+
+    def test_gather_sdsc_fields(self):
+        """Real SDSC generation for x[i].exp(): checks structure, indirect encoding,
+        index-tensor HBM-only, wordLength, dsName, node fields, and cross-links.
+        """
+        jsons = self._gen_sdsc()
+        self.assertTrue(jsons, "no SDSC JSON files generated")
+        for fname, top in jsons.items():
+            self.assertTrue(fname.endswith(".json"))
+            self.assertEqual(len(top), 1, "expected one top-level operation key")
+            self.assertRegex(next(iter(top)), r"^\d+_.+")
+
+        index_nodes, value_nodes = [], []
+        for opfunc, body in iter_sdsc_op_bodies(jsons):
+            for field in (
+                "N_",
+                "scheduleTree_",
+                "labeledDs_",
+                "computeOp_",
+                "numCoresUsed_",
+            ):
+                self.assertIn(field, body, f"{opfunc} missing field: {field}")
+            self.assertEqual(len(body["labeledDs_"]), len(body["scheduleTree_"]))
+            self.assertGreaterEqual(body["numCoresUsed_"], 1)
+            self.assertLessEqual(body["numCoresUsed_"], 32)
+            cop = body["computeOp_"][0]
+            self.assertTrue(cop["opFuncName"])
+            self.assertIsInstance(cop["inputLabeledDs"], list)
+            self.assertTrue(cop["outputLabeledDs"], "output label missing")
+
+            idx_ldsidx = {
+                node["ldsIdx_"]
+                for node in body["scheduleTree_"]
+                if node.get("indirectAllocType_") == "index_tensor"
+            }
+            for lds in body["labeledDs_"]:
+                for key in (
+                    "ldsIdx_",
+                    "dsName_",
+                    "dsType_",
+                    "dataFormat_",
+                    "wordLength",
+                    "memOrg_",
+                ):
+                    self.assertIn(key, lds)
+                self.assertIsInstance(lds["dsName_"], str)
+                self.assertIsInstance(lds["dataFormat_"], str)
+                self.assertEqual(lds["dsName_"], f"Tensor{lds['ldsIdx_']}")
+                if lds["ldsIdx_"] in idx_ldsidx:
+                    self.assertIn("hbm", lds["memOrg_"])
+                    self.assertNotIn("lx", lds["memOrg_"], "index must be HBM only")
+                    self.assertEqual(
+                        lds["wordLength"], 4, "index int32 -> wordLength 4"
+                    )
+                else:
+                    self.assertEqual(lds["wordLength"], 2, "value fp16 -> wordLength 2")
+
+            index_nodes += [
+                n
+                for n in body["scheduleTree_"]
+                if n.get("indirectAllocType_") == "index_tensor"
+            ]
+            value_nodes += [
+                n
+                for n in body["scheduleTree_"]
+                if n.get("indirectAllocType_") == "value_tensor"
+            ]
+
+        for node in iter_schedule_tree_nodes(jsons):
+            self.assertEqual(node["nodeType_"], "allocate")
+            self.assertTrue(node["name_"].startswith("allocate-Tensor"))
+            self.assertIn(node["component_"], ("hbm", "lx"))
+            self.assertIn(
+                node["indirectAllocType_"],
+                ("index_tensor", "value_tensor", "no_indirection"),
+            )
+
+        self.assertTrue(index_nodes, "no index_tensor nodes found")
+        self.assertTrue(value_nodes, "no value_tensor nodes found")
+        for n in index_nodes:
+            self.assertEqual(n.get("indexTensorType_"), "index")
+            self.assertIn("relatedIndirectAccessAlloc_", n)
+            related = n.get("relatedIndirectAccessAlloc_")
+            if related is not None:
+                self.assertRegex(related, r"^allocate-Tensor\d+_hbm$")
+
+    # -- SDSC handoff -----------------------------------------------------
+    def test_gather_sdsc_handoff(self):
+        """sdsc is invoked with an 'sdsc'-named kernel and a non-empty, fully
+        implemented spec list carrying a real OpSpec."""
+        x, i = self._xi(P=3, two_d=True)
+        with capture_sdsc_calls() as calls:
+            torch.compile(lambda x, i: x[i].exp())(x, i)
+
+        self.assertTrue(calls, "sdsc was never called")
+        for kernel_name, specs in calls:
+            self.assertIsInstance(kernel_name, str)
+            self.assertTrue(kernel_name, "kernel name is empty")
+            self.assertTrue(specs, "spec list is empty")
+            self.assertIsNone(
+                find_unimplemented(specs),
+                "supported gather should not contain an UnimplementedOp",
+            )
+        self.assertTrue(
+            any("sdsc" in name.lower() for name, _ in calls),
+            f"expected an 'sdsc'-named kernel; got {[n for n, _ in calls]}",
+        )
+        all_specs = [s for _, specs in calls for s in specs]
+        self.assertTrue(flatten_op_specs([all_specs]))
+
+    def test_python_bundle_generation_succeeds(self):
+        """Real generate_bundle runs end-to-end with the backend mocked."""
+        x, i = self._xi(P=3, two_d=True)
+        with patch("subprocess.run"), patch(_LAUNCH_KERNEL):
+            result = torch.compile(lambda x, i: x[i].exp())(x, i)
+        self.assertIsNotNone(result, "gather compile returned nothing")
+
+    @unittest.skip(
+        "MANUAL TEST ONLY: Runs real backend which aborts and corrupts memory. "
+        "Run in isolation: pytest -k test_real_backend_compile_for_gather_aborts. "
+        "Remove this skip once the backend supports indirect gather."
+    )
+    def test_real_backend_compile_for_gather_aborts(self):
+        """SENTINEL: the deeptools backend aborts on indirect-gather bundles."""
+        x, i = self._xi(P=3, two_d=True)
+        with patch(_LAUNCH_KERNEL):
+            with self.assertRaises(InductorError):
+                torch.compile(lambda x, i: x[i].exp())(x, i)
+
+
+if __name__ == "__main__":
+    from torch._inductor.test_case import run_tests
+
+    run_tests()

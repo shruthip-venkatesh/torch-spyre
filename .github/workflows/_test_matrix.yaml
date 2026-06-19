@@ -186,16 +186,12 @@ jobs:
           - name: Inductor Work Division Hint
             config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
           # ---- Indirect Access tests ----
-          - name: Indirect Access Detection
-            config: torch_spyre_tests/inductor/test_indirect_access_detection_config.yaml
-          - name: Indirect Access OpSpec
-            config: torch_spyre_tests/inductor/test_indirect_access_op_spec_config.yaml
-          - name: Indirect Access SDSC
-            config: torch_spyre_tests/inductor/test_indirect_access_sdsc_config.yaml
-          - name: Indirect Access Torch Gather Ops
-            config: torch_spyre_tests/inductor/test_indirect_access_torch_gather_ops_config.yaml
-          - name: Indirect Access Torch Scatter Ops
-            config: torch_spyre_tests/inductor/test_indirect_access_torch_scatter_ops_config.yaml
+          - name: Indirect Access Gather
+            config: torch_spyre_tests/inductor/test_indirect_access_gather_config.yaml
+          - name: Indirect Access Scatter
+            config: torch_spyre_tests/inductor/test_indirect_access_scatter_config.yaml
+          - name: Indirect Access Internals
+            config: torch_spyre_tests/inductor/test_indirect_access_internals_config.yaml
           # ---- Tensor tests ----
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml

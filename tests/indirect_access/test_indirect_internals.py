@@ -12,45 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for detecting indirect-access patterns (gather and scatter).
+"""Device-free unit tests for the indirect-access harness and helpers.
 
-Three test layers:
+These need no compilation, no Spyre device -- they exercise the primitives the
+op-family tests (test_gather.py / test_scatter.py) are built on:
 
-  1. IndirectAccess sympy atom - Basic building block (no device/compile needed)
-  2. Detection on synthetic OpSpecs - Distinguish gather vs scatter patterns
-  3. Compile-time detection - Test that indirect_index_dep_names correctly
-     identifies index buffers during layout propagation (before work-division)
+  * the IndirectAccess sympy atom,
+  * the detection helpers on synthetic OpSpecs,
+  * the capture-harness patch/restore behavior,
+  * the spec-tree flattening / sdsc-json navigation utilities.
 """
 
-import contextlib
 import os
 import sys
-from unittest.mock import patch
 
 import sympy
-import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
+    CRASHED,
+    DIRECT_OP_SPEC,
+    GATHER_OP_SPEC,
+    NO_SPYRE_OP,
+    SCATTER_OP_SPEC,
+    UNIMPLEMENTED,
     IndirectAccessTestCase,
+    _label_for,
     arg_has_indirect_access,
     capture_op_specs,
+    capture_sdsc_calls,
     coord_atoms,
     flatten_entries,
+    flatten_op_specs,
     indirect_access_target_names,
+    iter_schedule_tree_nodes,
+    iter_sdsc_op_bodies,
     op_spec_has_indirect_access,
     op_spec_has_indirect_input,
     op_spec_has_indirect_output,
 )
 
-import torch_spyre._inductor.propagate_layouts as _pl  # noqa: E402
 from torch_spyre._C import DataFormats  # noqa: E402
 from torch_spyre._inductor.op_spec import (  # noqa: E402
     IndirectAccess,
+    LoopSpec,
     OpSpec,
     TensorArg,
+    UnimplementedOp,
 )
-from torch_spyre._inductor import config  # noqa: E402
+from torch_spyre.execution.async_compile import SpyreAsyncCompile  # noqa: E402
 
 
 def _tensor_arg(is_input, coords, name=None):
@@ -66,23 +76,8 @@ def _tensor_arg(is_input, coords, name=None):
     )
 
 
-@contextlib.contextmanager
-def spy_indirect_detection():
-    """Capture all calls to indirect_index_dep_names during compilation.
-
-    This patches the function in propagate_layouts to record what index buffers
-    are detected during layout propagation (before work-division).
-    """
-    real = _pl.indirect_index_dep_names
-    seen: list[set] = []
-
-    def wrapper(op):
-        names = real(op)
-        seen.append(set(names))
-        return names
-
-    with patch.object(_pl, "indirect_index_dep_names", wrapper):
-        yield seen
+def _op(name):
+    return OpSpec(op=name, is_reduction=False, iteration_space={}, args=[], op_info={})
 
 
 # ===========================================================================
@@ -96,7 +91,7 @@ class TestIndirectAccessAtom(IndirectAccessTestCase):
         self.assertEqual(str(ia.args[0]), "arg1_1")
 
     def test_atom_found_inside_compound_expression(self):
-        """Test that IndirectAccess can be found within complex sympy expressions."""
+        """IndirectAccess can be found within complex sympy expressions."""
         c1 = sympy.Symbol("c1")
         ia = IndirectAccess(sympy.Symbol("arg1_1"))
         expr = sympy.floor(c1 / 64) + ia * 128
@@ -105,16 +100,13 @@ class TestIndirectAccessAtom(IndirectAccessTestCase):
         self.assertIn(ia, found)
 
     def test_direct_expression_has_no_indirect_atom(self):
-        """Test that regular expressions without IndirectAccess return empty set."""
+        """Regular expressions without IndirectAccess return an empty set."""
         c0, c1 = sympy.symbols("c0 c1")
         expr = sympy.floor(c1 / 64) + c0
         self.assertEqual(expr.atoms(IndirectAccess), set())
 
     def test_xreplace_substitutes_indirect_symbol(self):
-        """Test that we can replace a symbol with IndirectAccess in an expression.
-
-        This mimics how compute_coordinates works.
-        """
+        """Replace a symbol with IndirectAccess (mimics compute_coordinates)."""
         c1, tmp0 = sympy.symbols("c1 tmp0")
         coord = sympy.floor(c1 / 64) + tmp0 * 128
         out = coord.xreplace({tmp0: IndirectAccess(sympy.Symbol("arg1_1"))})
@@ -209,26 +201,20 @@ class TestDetectionHelpers(IndirectAccessTestCase):
         self.assertFalse(op_spec_has_indirect_output(op))
 
     def test_coord_atoms_extracts_target_name(self):
-        """Test that coord_atoms correctly extracts buffer names from IndirectAccess."""
+        """coord_atoms extracts buffer names from IndirectAccess."""
         ia = IndirectAccess(sympy.Symbol("idx_buf"))
         arg = _tensor_arg(True, [ia, sympy.Symbol("c0")])
         atoms = coord_atoms(arg, IndirectAccess)
         self.assertEqual({str(a.args[0]) for a in atoms}, {"idx_buf"})
 
     def test_coord_atoms_tolerates_non_sympy_coordinate(self):
-        """Test that coord_atoms handles non-sympy coordinates (like bare 0).
-
-        Scalar/broadcast coordinates don't have .atoms() but shouldn't cause errors.
-        """
+        """A bare ``0`` coord has no .atoms() but must not error."""
         ia = IndirectAccess(sympy.Symbol("idx_buf"))
         arg = _tensor_arg(True, [0, ia, sympy.Symbol("c0")])
         self.assertTrue(arg_has_indirect_access(arg))
 
     def test_multiple_index_tensors_all_detected(self):
-        """Test that we detect all index buffers in multi-dimensional indexing.
-
-        A 2-D advanced index uses two index buffers - both should be found.
-        """
+        """A 2-D advanced index uses two index buffers - both are found."""
         ia0 = IndirectAccess(sympy.Symbol("idx0"))
         ia1 = IndirectAccess(sympy.Symbol("idx1"))
         arg = _tensor_arg(True, [ia0, ia1, sympy.Symbol("c0")])
@@ -280,159 +266,200 @@ class TestDetectionHelpers(IndirectAccessTestCase):
         self.assertTrue(op_spec_has_indirect_output(scatter))
         self.assertFalse(op_spec_has_indirect_input(scatter))
 
-
-# ===========================================================================
-# Layer 3: Compile-time detection tests
-# ===========================================================================
-class TestCompileTimeDetection(IndirectAccessTestCase):
-    def test_gather_index_is_detected(self):
-        """Test that gather index buffers are detected during layout propagation.
-
-        We capture sdsc to avoid hitting the backend (which doesn't support
-        indirect gather yet).
-        """
-        M, N, P, Q = 128, 256, 3, 192
-        x = torch.rand(M, N, dtype=torch.float16)
-        i = torch.randint(0, M, (P, Q), dtype=torch.int32)
-
-        def kernel(x, i):
-            return x[i].exp()
-
-        x_dev, i_dev = x.to("spyre"), i.to("spyre")
-        self.name_dims(x_dev, {"M": M, "N": N})
-        self.name_dims(i_dev, {"P": P, "Q": Q})
-
-        with capture_op_specs(), spy_indirect_detection() as seen:
-            torch.compile(kernel)(x_dev, i_dev)
-
-        self.assertTrue(
-            any(names for names in seen),
-            "gather index buffer was never detected during layout propagation",
+    def test_op_spec_indirect_on_both_input_and_output(self):
+        """An op with IndirectAccess on a distinct input and output trips both
+        the input and output helpers."""
+        ia = IndirectAccess(sympy.Symbol("idx"))
+        op = self._op(
+            [
+                _tensor_arg(True, [ia, sympy.Symbol("c0")]),
+                _tensor_arg(False, [ia, sympy.Symbol("c0")]),
+            ]
         )
+        self.assertTrue(op_spec_has_indirect_input(op))
+        self.assertTrue(op_spec_has_indirect_output(op))
+        self.assertTrue(op_spec_has_indirect_access(op))
 
-    @config.patch({"sencores": 1})
-    def test_scatter_index_not_flagged_by_layout_detection(self):
-        """``indirect_index_dep_names`` flags gather *loads* but returns empty
-        for scatter *stores*.
+    def test_coord_atoms_empty_coords(self):
+        """An arg with no coordinates yields no atoms and no indirect access."""
+        arg = _tensor_arg(True, [])
+        self.assertEqual(coord_atoms(arg, IndirectAccess), set())
+        self.assertFalse(arg_has_indirect_access(arg))
 
-        A property of that (reads-only) helper, unchanged by the scatter fixes:
-        a scatter's output is recognized later in superdsc (via is_output_tensor),
-        not by this layout-propagation pass. Captured so we stop before the
-        backend.
-        """
-        M, N, P = 128, 256, 3
-        y = torch.zeros(M, N, dtype=torch.float16)
-        src = torch.rand(P, N, dtype=torch.float16)
-        index = torch.randint(0, M, (P, N), dtype=torch.int32)
-
-        def kernel(y, src, index):
-            return y.scatter_(0, index, src.exp())
-
-        y_dev, src_dev, index_dev = y.to("spyre"), src.to("spyre"), index.to("spyre")
-        self.name_dims(y_dev, {"M": M, "N": N})
-        self.name_dims(src_dev, {"P": P, "N": N})
-        self.name_dims(index_dev, {"P": P, "N": N})
-
-        with capture_op_specs(), spy_indirect_detection() as seen:
-            torch.compile(kernel)(y_dev, src_dev, index_dev)
-
-        self.assertFalse(
-            any(names for names in seen),
-            "scatter store index unexpectedly flagged by layout detection",
-        )
-
-    def test_direct_op_not_detected_as_indirect(self):
-        """Test that direct operations don't trigger indirect index detection."""
-        M, N = 128, 256
-        x = torch.rand(M, N, dtype=torch.float16)
-
-        def kernel(x):
-            return x.exp()
-
-        x_dev = x.to("spyre")
-
-        with capture_op_specs(), spy_indirect_detection() as seen:
-            torch.compile(kernel)(x_dev)
-
-        self.assertFalse(
-            any(names for names in seen),
-            "direct op wrongly flagged as having an indirect index",
-        )
+    def test_target_names_across_multiple_op_specs(self):
+        """indirect_access_target_names unions index names across op specs."""
+        a = self._op([_tensor_arg(True, [IndirectAccess(sympy.Symbol("ia"))])])
+        b = self._op([_tensor_arg(True, [IndirectAccess(sympy.Symbol("ib"))])])
+        self.assertEqual(indirect_access_target_names([a, b]), {"ia", "ib"})
 
 
 # ===========================================================================
-# Compile-level control tests
+# Capture harness self-checks (patch/restore)
 # ===========================================================================
-class TestDirectVsIndirect(IndirectAccessTestCase):
-    def test_gather_produces_indirect_op_spec(self):
-        """Test that gather operations generate OpSpecs with IndirectAccess."""
-        M, N, P, Q = 128, 256, 3, 192
-        x = torch.rand(M, N, dtype=torch.float16)
-        i = torch.randint(0, M, (P, Q), dtype=torch.int32)
-
-        def kernel(x, i):
-            return x[i].exp()
-
-        x_dev, i_dev = x.to("spyre"), i.to("spyre")
-        self.name_dims(x_dev, {"M": M, "N": N})
-        self.name_dims(i_dev, {"P": P, "Q": Q})
-
+class TestCaptureHarness(IndirectAccessTestCase):
+    def test_capture_restores_sdsc(self):
+        """capture_op_specs patches and restores sdsc."""
+        original = SpyreAsyncCompile.sdsc
         with capture_op_specs() as captured:
-            torch.compile(kernel)(x_dev, i_dev)
+            self.assertIsNot(SpyreAsyncCompile.sdsc, original, "should be patched")
+            self.assertEqual(captured, [], "nothing compiled yet")
+        self.assertIs(SpyreAsyncCompile.sdsc, original, "must be restored")
 
-        op_specs = self.assert_reaches_op_spec(captured)
-        self.assertTrue(any(op_spec_has_indirect_access(s) for s in op_specs))
+    def test_capture_sdsc_calls_restores_on_exception(self):
+        """sdsc is restored even when the body raises."""
+        original = SpyreAsyncCompile.sdsc
+        with self.assertRaises(ValueError):
+            with capture_sdsc_calls():
+                raise ValueError("boom")
+        self.assertIs(SpyreAsyncCompile.sdsc, original, "must be restored after error")
 
-    def test_direct_access_has_no_indirect(self):
-        """Test that direct operations don't trigger indirect access detection.
 
-        A plain x.exp() should have no IndirectAccess atoms (no false positives).
-        """
-        M, N = 128, 256
-        x = torch.rand(M, N, dtype=torch.float16)
+# ===========================================================================
+# Spec-tree flattening / sdsc-json navigation utilities (no device)
+# ===========================================================================
+class TestSpecTreeUtils(IndirectAccessTestCase):
+    def test_flatten_descends_into_loopspec(self):
+        """flatten_op_specs extracts ops from nested LoopSpecs."""
+        inner = LoopSpec(count=2, body=[_op("exp")])
+        loop = LoopSpec(count=4, body=[_op("identity"), inner])
+        specs = flatten_op_specs([[loop, _op("tanh")]])
+        self.assertEqual([s.op for s in specs], ["identity", "exp", "tanh"])
 
-        def kernel(x):
-            return x.exp()
+    def test_flatten_op_specs_drops_unimplemented(self):
+        """flatten_op_specs ignores UnimplementedOps."""
+        specs = flatten_op_specs([[_op("exp"), UnimplementedOp("sin")]])
+        self.assertEqual([s.op for s in specs], ["exp"])
 
-        x_dev = x.to("spyre")
+    def test_flatten_entries_keeps_unimplemented(self):
+        """flatten_entries includes UnimplementedOps."""
+        entries = flatten_entries([[_op("exp"), UnimplementedOp("sin")]])
+        kinds = [type(e).__name__ for e in entries]
+        self.assertIn("UnimplementedOp", kinds)
+        self.assertIn("OpSpec", kinds)
 
-        with capture_op_specs() as captured:
-            torch.compile(kernel)(x_dev)
+    def test_flatten_multiple_sdsc_calls(self):
+        """Multiple sdsc calls (multiple kernels) flatten correctly."""
+        specs = flatten_op_specs([[_op("identity")], [_op("exp")]])
+        self.assertEqual([s.op for s in specs], ["identity", "exp"])
 
-        op_specs = self.assert_reaches_op_spec(captured)
-        self.assertIn("exp", [s.op for s in op_specs])
-        self.assertFalse(any(op_spec_has_indirect_access(s) for s in op_specs))
-        self.assertFalse(any(a.name is not None for s in op_specs for a in s.args))
+    def test_classification_labels_are_distinct(self):
+        """All classification outcome labels are unique."""
+        labels = {
+            CRASHED,
+            GATHER_OP_SPEC,
+            SCATTER_OP_SPEC,
+            DIRECT_OP_SPEC,
+            UNIMPLEMENTED,
+            NO_SPYRE_OP,
+        }
+        self.assertEqual(len(labels), 6, "classification labels must be unique")
 
-    def test_unsupported_unary_after_gather_falls_back_to_cpu(self):
-        """Test that unsupported ops after gather fall back to CPU.
+    def test_flatten_empty(self):
+        self.assertEqual(flatten_op_specs([]), [])
+        self.assertEqual(flatten_op_specs([[]]), [])
 
-        x[i].sin() - sin isn't supported on Spyre, so it runs on CPU.
-        The gather still compiles to Spyre though.
-        """
-        M, N, P, Q = 128, 256, 3, 192
-        x = torch.rand(M, N, dtype=torch.float16)
-        i = torch.randint(0, M, (P, Q), dtype=torch.int32)
+    def test_flatten_entries_empty(self):
+        self.assertEqual(flatten_entries([]), [])
 
-        def kernel(x, i):
-            return x[i].sin()
+    def test_flatten_deeply_nested_loopspec(self):
+        deep = LoopSpec(count=2, body=[LoopSpec(count=2, body=[_op("exp")])])
+        outer = LoopSpec(count=4, body=[_op("identity"), deep])
+        specs = flatten_op_specs([[outer]])
+        self.assertEqual([s.op for s in specs], ["identity", "exp"])
 
-        x_dev, i_dev = x.to("spyre"), i.to("spyre")
-        self.name_dims(x_dev, {"M": M, "N": N})
-        self.name_dims(i_dev, {"P": P, "Q": Q})
-
-        with capture_op_specs() as captured:
-            torch.compile(kernel)(x_dev, i_dev)
-
-        op_specs = self.assert_reaches_op_spec(captured)
-        self.assertTrue(
-            any(op_spec_has_indirect_access(s) for s in op_specs),
-            "gather should still produce an IndirectAccess op spec",
+    def test_flatten_entries_mixed(self):
+        entries = flatten_entries(
+            [[_op("a"), LoopSpec(count=2, body=[UnimplementedOp("sin"), _op("b")])]]
         )
-        self.assertFalse(
-            any(getattr(e, "op", None) == "sin" for e in flatten_entries(captured)),
-            "unsupported 'sin' must not appear as a Spyre op (it falls back to CPU)",
+        self.assertEqual([getattr(e, "op", None) for e in entries], ["a", "sin", "b"])
+
+    def test_iter_sdsc_op_bodies_synthetic(self):
+        fake = {
+            "sdsc_0.json": {
+                "0_exp": {"dscs_": [{"exp": {"scheduleTree_": [{"ldsIdx_": 0}]}}]}
+            }
+        }
+        bodies = list(iter_sdsc_op_bodies(fake))
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(bodies[0][0], "exp")
+
+    def test_iter_schedule_tree_nodes_synthetic(self):
+        fake = {
+            "sdsc_0.json": {
+                "0_exp": {
+                    "dscs_": [
+                        {"exp": {"scheduleTree_": [{"ldsIdx_": 0}, {"ldsIdx_": 1}]}}
+                    ]
+                }
+            }
+        }
+        self.assertEqual(len(list(iter_schedule_tree_nodes(fake))), 2)
+
+
+# ===========================================================================
+# Classification logic (_label_for) -- the core of classify_compile /
+# run_scenario, tested directly on synthetic outcomes (no compile)
+# ===========================================================================
+class TestClassificationLogic(IndirectAccessTestCase):
+    def _arg(self, is_input, indirect=False):
+        coords = (
+            [IndirectAccess(sympy.Symbol("idx")), sympy.Symbol("c0")]
+            if indirect
+            else list(sympy.symbols("c0 c1"))
         )
+        return _tensor_arg(is_input, coords)
+
+    def _spec(self, *args):
+        return OpSpec(
+            op="identity",
+            is_reduction=False,
+            iteration_space={},
+            args=list(args),
+            op_info={},
+        )
+
+    def test_label_crashed_on_exception(self):
+        self.assertEqual(_label_for(RuntimeError("boom"), [], []), CRASHED)
+
+    def test_label_no_spyre_when_empty(self):
+        self.assertEqual(_label_for(None, [], []), NO_SPYRE_OP)
+
+    def test_label_direct_op_spec(self):
+        spec = self._spec(self._arg(True), self._arg(False))
+        self.assertEqual(_label_for(None, [spec], [spec]), DIRECT_OP_SPEC)
+
+    def test_label_gather_on_indirect_input(self):
+        spec = self._spec(self._arg(True, indirect=True), self._arg(False))
+        self.assertEqual(_label_for(None, [spec], [spec]), GATHER_OP_SPEC)
+
+    def test_label_scatter_on_indirect_output(self):
+        spec = self._spec(self._arg(True), self._arg(False, indirect=True))
+        self.assertEqual(_label_for(None, [spec], [spec]), SCATTER_OP_SPEC)
+
+    def test_label_unimplemented(self):
+        u = UnimplementedOp("sin")
+        self.assertEqual(_label_for(None, [], [u]), UNIMPLEMENTED)
+
+    def test_label_scatter_takes_priority_over_gather(self):
+        """An op with IndirectAccess on both an input and an output classifies
+        as scatter (output is checked first)."""
+        spec = self._spec(
+            self._arg(True, indirect=True), self._arg(False, indirect=True)
+        )
+        self.assertEqual(_label_for(None, [spec], [spec]), SCATTER_OP_SPEC)
+
+    def test_label_unimplemented_takes_priority_over_direct(self):
+        """A direct op spec alongside an UnimplementedOp classifies as
+        unimplemented."""
+        spec = self._spec(self._arg(True), self._arg(False))
+        entries = [spec, UnimplementedOp("sin")]
+        self.assertEqual(_label_for(None, [spec], entries), UNIMPLEMENTED)
+
+    def test_label_crashed_wins_even_with_op_specs(self):
+        """If an exception is present, the outcome is CRASHED regardless of any
+        op specs captured before the failure."""
+        spec = self._spec(self._arg(True, indirect=True), self._arg(False))
+        self.assertEqual(_label_for(ValueError("x"), [spec], [spec]), CRASHED)
 
 
 if __name__ == "__main__":
