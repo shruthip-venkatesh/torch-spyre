@@ -2,22 +2,35 @@
 
 ## Summary
 
-A gather (`out = x[i]`) reads rows from a value table `x` at positions chosen
-at runtime by an index tensor `i`. This page describes **proposed implementation**
-of running gathers across multiple Spyre cores: making them **correct** under
+Indirect access reads or writes rows of a table at positions chosen at runtime
+by an index tensor:
+
+* **gather** (`out = x[i]`) reads rows from a value table `x`;
+* **scatter** (`out[i] = src`) writes rows into a destination table `out`.
+
+This page describes running both across multiple Spyre cores **correctly** under
 work division.
 
-The single load-bearing change is: **the work-division planner must never split
-a gather along one of the value table's data dimensions.** Without that
-restriction, a gather whose value table is divided across cores along a data
-dimension (e.g. the hidden dim of an embedding, the head dim of a KV cache)
-silently returns wrong results — every core reads column 0 of the shared table.
+The single load-bearing rule, in both directions, is: **the work-division
+planner must never split along one of the shared indirect table's data
+dimensions.** That table — the value table for a gather, the destination table
+for a scatter — is shared at a single base across cores: every core must be able
+to address any row. Slicing one of its data dimensions (e.g. the hidden dim of
+an embedding, the head dim of a KV cache) per core silently returns wrong
+results — every core addresses column 0 of the shared table.
 
-Proposed implementation makes such gathers correct. It does **not** attempt to
-parallelise the value-data dimensions themselves; that is future work (see
+The fix makes such ops correct. It does **not** parallelise the data dimensions
+themselves; that is future work (see
 [Limitations](#limitations-and-future-work)).
 
-## Background: how a gather is compiled
+Scatter carries **one extra condition** gather does not: because the
+data-dependent index sits on the *output*, parallelising the index-entry
+dimension is only safe when no two cores target the same destination row. We
+enable it for **overwrite** scatters and leave **accumulating** scatters serial.
+
+## Background: how indirect access is compiled
+
+### Gather — indirect on a load
 
 A gather is lowered to a **Pointwise `identity` op** with three tensor
 arguments:
@@ -28,178 +41,299 @@ arguments:
 | value | the table being read from (shared) | carries an `IndirectAccess(name)` node at the gathered dimension |
 | output | the gathered result | regular, statically known |
 
-The `IndirectAccess(name)` node (see `op_spec.IndirectAccess`) marks the value tensor's
-**gather axis** — the dimension whose row is selected at runtime by the index.
-That axis has **no iteration-space symbol**; its address is resolved on the
-device via `SEGMENT_OFFSETS`, with `maxDimSizes == 1` for that dimension.
+The indirection lives in a **load**: `inner_fn` reads the value table at a
+runtime-computed index.
+
+### Scatter — indirect on a store
+
+A scatter (`out[i] = src`) is lowered to a **`Scatter` IR node** whose
+`inner_fn` reads the source **directly**; the data-dependent destination lives
+in `Scatter.output_indexer`:
+
+```python
+def inner_fn(index):
+    i0, i1, i2 = index
+    tmp0 = ops.load(arg2_1, i2 + 512*i1 + 32768*i0)   # reads src directly
+    return tmp0
+# the indirection is in Scatter.output_indexer, keyed on the `indices` closure
+```
+
+Its three tensor arguments mirror the gather, with the roles of value and output
+swapped:
+
+| Arg | Role | Device coordinates |
+|---|---|---|
+| index | the positions to write, tagged `KERNEL_IDX` | regular, statically known |
+| src (input) | the values being written | regular — per-core base advances with the split |
+| output | the destination table (shared) | carries an `IndirectAccess(name)` node at the scattered dimension |
+
+### The shared model
+
+In both cases the `IndirectAccess(name)` node (see `op_spec.IndirectAccess`)
+marks the shared table's **indirect axis** — the dimension whose row is selected
+at runtime by the index. That axis has **no iteration-space symbol**; its address
+is resolved on the device via `SEGMENT_OFFSETS`, with `maxDimSizes == 1` for that
+dimension.
 
 Work division splits the op's iteration space across cores. For a gather over
 `x : [M, K, N]` with `i : [Q]`, the iteration space is `{d0 = Q, d1 = K,
-d2 = N}` and the output is `[Q, K, N]`. Note that the value's gather axis `M`
-is **not** an iteration variable — the iteration dims are the index-entry
-dim (`Q`) and the value's data dims (`K`, `N`).
+d2 = N}` and the output is `[Q, K, N]`. The value's gather axis `M` is **not** an
+iteration variable — the iteration dims are the index-entry dim (`Q`) and the
+value's data dims (`K`, `N`). A scatter over `out : [M, K, N]` with `i : [Q]` has
+the same iteration space `{d0 = Q, d1 = K, d2 = N}`; the destination's scatter
+axis `M` is the indirect axis.
 
 ### The gather already parallelises along the index — by construction
 
-`get_mem_deps_from_rw` ([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py))
+`get_mem_deps_from_rw`
+([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py))
 filters indirect reads out of work division's inputs, so the planner only ever
 sees the **index read** and the **output write** — both regular tensors. It
 naturally distributes cores over their dimensions, which include the index-entry
-dim. So index-driven parallelism works without special handling. The problem is
-purely that nothing stops the planner from *also* splitting a value-data dim.
+dim. So index-driven parallelism works for a gather without special handling.
+
+For a scatter : its index-entry dim is **absent** from the
+destination's direct coordinates (the row is data-dependent), so it needs an
+explicit nudge to become a split axis — see
+[fix #2](#2-parallelise-over-the-index-entry-dim) below.
 
 ## The defect
 
-The planner ranks dimensions by size and splits the largest. When a value-data
-dim (`K` or `N`) is the largest — the common case for **wide rows** (embedding
-`hidden`, expert weight matrices, attention `head_dim`) — it splits that
-dimension. That is wrong, because the value table is **shared**: every core
-must be able to read any row, so it cannot be sliced per core.
+The planner ranks dimensions by size and splits the largest. When a shared
+table's data dim (`K` or `N`) is the largest — the common case for **wide rows**
+(embedding `hidden`, expert weight matrices, attention `head_dim`) — it splits
+that dimension. That is wrong, because the table is **shared**: every core must
+address any row, so it cannot be sliced per core.
 
-Concretely, under a K-split the output advances its per-core base across `K`
-(core `c` writes columns `[2c, 2c+2)`), but the shared value tensor's per-core
-base does **not** advance. So every core reads value columns `[0, 2)` and writes
-them into its own output columns:
+Concretely, under a `K`-split the regular tensor advances its per-core base
+across `K` (core `c` uses columns `[2c, 2c+2)`), but the shared table's per-core
+base does **not** advance. So for a gather every core reads value columns
+`[0, 2)`, and for a scatter every core writes destination columns `[0, 2)`:
 
 ```text
-out[:, 2c : 2c+2, :] = value[:, 0 : 2, :]    for every core c
+gather:   out[:, 2c : 2c+2, :] = value[:, 0 : 2, :]    for every core c
+scatter:  out[idx[...], 0 : 2, :] = src[..., 2c : 2c+2, :]    for every core c
 ```
 
-Core 0 is correct by coincidence; the other 31 write core-0's columns into their
-slices.
+Core 0 is correct by coincidence; the others use core-0's columns.
 
-### Why it was not caught earlier
+## The scatter-only correctness condition: index uniqueness
 
-The defect is **silent** — wrong numbers, no crash — and is **masked by
-constant data**: if every column of a value row holds the same number, reading
-the wrong column is indistinguishable from reading the right one. It only
-surfaces when the value varies along the split dimension, which is true of all
-real tables but not of a constant-filled test.
+Splitting the index-entry dim `Q` hands each core a disjoint set of source rows /
+index entries. For a gather the dimension being split is the *output*, so the
+slices are trivially disjoint. For a scatter the destination rows are `idx[j]` —
+*data-dependent*. Disjoint `Q`-ranges map to disjoint destination rows **if
+`idx` is injective**. If two entries on different cores collide
+(`idx[j1] == idx[j2]`), they race. Gather has no analogue — reads never conflict.
 
-Validated on hardware (`x : [128, 64, 512]`, `i : [256]`, `SENCORES=32`):
+We therefore enable the index-entry split for **overwrite** scatters
+(`Scatter.scatter_mode is None`, e.g. `index_put`): PyTorch already leaves
+duplicate-index overwrites non-deterministic, so a per-core split stays within
+that contract. **Accumulating** scatters (`atomic_add`, e.g. `scatter_add_`)
+would need atomic writes to remain correct under duplicate indices, so they are
+left for a single core.
 
 ## The proposed fix
 
-Four changes, in order of importance.
+Five changes, in order of importance.
 
-### 1. Forbid splitting the value-data dims — the correctness fix
+### 1. Forbid splitting the shared table's data dims — the correctness fix
 
-`indirect_value_data_syms` ([work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py))
-returns the iteration symbols that index the value tensor's non-gather (data)
-dimensions. `_default_split` removes them from the output and reduction priority
+Both directions are unified behind `collect_shared_indirect_tds`
+([work_division.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py)),
+which returns every shared indirect tensor of an op with `IndirectAccess`-aware
+coordinates:
+
+* gather — each indirect value *read*, via `collect_indirect_value_tds`;
+* scatter — the indirect destination *write*, built by `_build_output_td`
+  applying `indirect_store_subs_from_op` so the row axis becomes an
+  `IndirectAccess` and only its data dims remain as coordinate symbols.
+
+`shared_indirect_data_syms` then takes the non-`IndirectAccess` coordinate
+symbols of those tensors — the same extraction for both directions — and
+`_default_split` removes them from the output and reduction priority
 lists, so the core budget is distributed only over the index-entry dims —
-**divide by the index tensor, not the value tensor.**
+**divide by the index, not the table.**
 
-When the index dim cannot absorb all the cores, the gather falls back to fewer
-cores rather than splitting a value-data dim. **Correct-but-serial is the
-intended trade-off; silent corruption is not.**
+When the index dim cannot absorb all the cores, the op falls back to fewer cores
+rather than splitting a data dim. **Correct-but-serial is the intended
+trade-off; silent corruption is not.**
 
-### 2. Shared-base value addressing
+### 2. Parallelise over the index-entry dim
 
-`SDSCArgs.shared_base` ([codegen/superdsc.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/superdsc.py))
-marks the value tensor. In `core_idx_to_slice_offset`
+A gather's index-entry dim is already an output coordinate, so it is a split axis
+by default. A scatter's index-entry dim is **absent** from the destination's
+direct coordinates (the row is data-dependent), so `prioritize_dimensions`
+classifies it as a *reduction* dim, which a non-reduction op never splits.
+`indirect_store_entry_syms` returns those entry dims (the iteration symbols left
+after removing the data dims), and `_default_split`'s `force_output_syms`
+promotes them to output priority so the distributor splits them.
+
+The split round-trips through the existing coefficient encoding without new
+machinery: a scatter's entry dim has coefficient 0 in the (indirect) write index,
+so `splits_by_index_coeff` encodes it via the first **non-indirect** read — the
+direct `src` load selected by `_first_non_indirect_read_index` — and
+`apply_splits_from_index_coeff` decodes it the same way at codegen.
+
+This is gated on the [uniqueness condition](#the-scatter-only-correctness-condition-index-uniqueness):
+`indirect_store_entry_syms` returns dims only for overwrite scatters.
+
+### 3. Shared-base addressing
+
+`SDSCArgs.shared_base`
+([codegen/superdsc.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/superdsc.py))
+marks the shared table — set for any tensor carrying `IndirectAccess`, which is
+the value table for a gather and the destination for a scatter. In
+`core_idx_to_slice_offset`
 ([codegen/compute_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/codegen/compute_ops.py))
 a `shared_base` tensor keeps its per-core base at the static offset (address 0)
-instead of advancing with the work-division slice. The gather row comes from the
-runtime `IndirectAccess`; the index and output tensors keep the normal per-core base
-advance. This makes the shared-table addressing correct by construction rather
-than relying on the backend to tolerate a stale per-core base.
+instead of advancing with the work-division slice. The addressed row comes from
+the runtime `IndirectAccess`; the index and the regular tensor (output for
+gather, src for scatter) keep the normal per-core base advance. This makes the
+shared-table addressing correct by construction rather than relying on the
+backend to tolerate a stale per-core base.
 
-### 3. Value-table span guard (defensive)
+This change required no scatter-specific work: `is_indirect_value_tensor` already
+recognizes any `IndirectAccess`-carrying tensor, so the scatter destination gets
+`shared_base` through the same path as the gather value table.
 
-`collect_indirect_value_tds` rebuilds the value `TensorDep` with
-`IndirectAccess`-aware coordinates so the value table is visible to the per-core
-span check, and `get_per_core_span` treats an `IndirectAccess` coordinate as
-contributing its full device extent (any core may touch any row) and never
-splits it. `warn_if_per_core_overflow` then logs a critical message if the
-value table would exceed the documented 256 MB per-core span.
+### 4. Shared-table span guard (defensive)
 
-This is conservative: a 512 MB value table read correctly in testing, so the
-limit's applicability to indirect value tensors is not firmly established. The
-guard surfaces a potential hardware-limit violation as a compile-time warning
-rather than failing.
+The shared table's coordinates carry `IndirectAccess` (via
+`collect_indirect_value_tds` for a gather, `_build_output_td` for a scatter), so
+it is visible to the per-core span check with `get_per_core_span` treating an
+`IndirectAccess` coordinate as contributing its full device extent (any core may
+touch any row) and never splitting it. A gather's value table is pulled in as an
+extra TensorDep (it is not in `args`); a scatter's destination is the output
+TensorDep, already covered. `warn_if_per_core_overflow` then logs a
+critical message if the table would exceed the documented 256 MB per-core span.
 
-### 4. Deterministic split round-trip
+This is conservative: a 512 MB table read correctly in testing, so the limit's
+applicability to indirect tables is not firmly established. The guard surfaces a
+potential hardware-limit violation as a compile-time warning rather than failing.
+
+### 5. Deterministic split round-trip
 
 The split plan is encoded with the coefficients of the read/write index
 expressions. An indirect read carries data-dependent symbols whose coefficients
 are not a stable identity key, so the encode side (`apply_splits`) and both
-decode sites (`work_distribution_pass`, `create_op_spec`) now prefer the first
+decode sites (`work_distribution_pass`, `create_op_spec`) prefer the first
 **non-indirect** read as the reduction-split reference index, via
-`_first_non_indirect_read_index`.
+`_first_non_indirect_read_index`. This same reference also carries a scatter's
+entry-dim split (fix #2).
 
-## Worked example
+## Detection: load side vs. store side
+
+Both directions discover their indirect symbols before scheduling via
+`indirect_access_subs_from_op`
+([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)),
+which merges:
+
+* `_build_indirect_load_subs` — re-executes `inner_fn` with `_IndirectIndexFinder`
+  to learn which buffer's **load** produced each indirect index (gather);
+* `_build_indirect_store_subs` — recovers the scatter index buffer from the
+  `Scatter.output_indexer` closure (via `_find_scatter_index_buf_names`) and maps
+  each indirect symbol in the **write** dep to it (scatter).
+
+Both map an indirect symbol to `IndirectAccess(name)`, which `device_coordinates`
+substitutes into the shared table's coordinates.
+
+## Worked examples
+
+### Gather
 
 `out = x[i]` with `x : [128, 64, 512]`, `i : [256]`, `SENCORES=32`. Iteration
 space `{d0 = Q = 256, d1 = K = 64, d2 = N = 512}`; the value's gather axis
-`M = 128` is addressed by `IndirectAccess` and is not an iteration symbol. The index
-stickifies to `256 / 32 = 8` sticks on `d0`.
+`M = 128` is addressed by `IndirectAccess`. The index stickifies to `256 / 32 =
+8` sticks on `d0`.
 
-| | Without the fix | With the proposed fix |
+| | Without the fix | With the fix |
 |---|---|---|
 | Largest dim | `K = 64` | (forbidden) |
 | Split | `K`, 32 cores | `d0` (index), 8 cores |
 | Value tensor | per-core column base diverges | shared at base 0 |
 | Result | wrong (every core reads column 0) | correct |
 
-Parallelism with the fix is set by the index size in sticks:
+### Scatter
+
+`out[i] = src` with `out, src : [5, 64, 512]`, `i : [5]` (a permutation),
+`SENCORES=32`. Iteration space `{d0 = Q = 5, d1 = K = 64, d2 = N = 512}`; the
+destination's scatter axis `M = 5` is addressed by `IndirectAccess`. The index
+stickifies `d0` to `ceil(5 / 32) = 1` stick.
+
+| | Without the fix | With the fix |
+|---|---|---|
+| Largest dim | `K = 64` | (forbidden) |
+| Split | `K`, 32 cores | `d0` (index), 1 core (Q stickifies to 1) |
+| Destination | per-core column base pinned, all cores write columns `[0,2)` | shared at base 0, row from `IndirectAccess` |
+| Result | wrong / backend abort | correct (serial — index too small to split) |
+
+In both cases parallelism is set by the index size in sticks:
 `cores = min(Q / 32, 32)` for a 1-D index (`Q = 256 → 8`, `Q = 1024 → 32`), or a
-spatial (non-stick) index dimension splits directly.
+spatial (non-stick) index dimension splits directly. A small index (the scatter
+`Q = 5` here) runs correct-but-serial.
 
 ## Validation
 
-`examples/gather_multicore_exp.py` runs three scenarios at the shapes above, each
-isolating one behavior by changing only the value-table contents:
+`examples/gather_multicore_exp.py` (gather) and `examples/scatter_multicore_exp.py`
+(scatter) each run three scenarios at the shapes above, isolating one behavior by
+changing only the table contents:
 
-| Scenario | Table contents | Isolates | With proposed fix | Without fix |
+| Scenario | Table contents | Isolates | With fix | Without fix |
 |---|---|---|---|---|
-| `realistic_random` | `rand()` | real-world gather | pass | fail (~97% wrong) |
-| `column_addressing` | `x[r,k,n] = k` | K-column addressing | pass (exact) | fail (all read col 0) |
-| `row_addressing` | `x[r,k,n] = r` | gather-axis selection | pass (exact) | pass (row never split) |
+| `realistic_random` | `rand()` | real-world indirect access | pass | fail (~97% wrong) / abort |
+| `column_addressing` | `[r,k,n] = k` | K-column integrity | pass  | fail (all use col 0) |
+| `row_addressing` | `[r,k,n] = r` | indirect-axis selection | pass | pass (axis never split) |
 
-`row_addressing` pass either way and are included to show, respectively,
-that the gather axis is always correct and hides the defect.
- `column_addressing` and `realistic_random` are the correctness signal.
+`row_addressing` passes either way and is included to show the indirect axis is
+always correct and hides the data-dim defect; `column_addressing` and
+`realistic_random` are the correctness signal.
 
 ```bash
 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/gather_multicore_exp.py
+TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/scatter_multicore_exp.py
 ```
 
 ## Limitations and future work
 
-- **Parallelism is capped by the index size.** Current proposal parallelises only over
-  the index dimension. Workloads with a small, fixed index but wide rows — MoE
-  expert gathers (top-k routing), paged-attention KV reads (short block tables),
-  wide embedding lookups at small batch — get few cores (often 1–2). They are
-  **correct**, but not maximally parallel.
+* **Parallelism is capped by the index size.** The current implementation
+  parallelises only over the index dimension. Workloads with a small, fixed index
+  but wide rows — MoE expert gathers (top-k routing), paged-attention KV reads
+  (short block tables), wide embedding lookups at small batch — get few cores
+  (often 1–2). They are **correct**, but not maximally parallel.
 
-- **Next phase (parallelising the value-data dims) is deferred.** A prototype
-  let the planner split a value-data dim and advanced the value tensor's per-core
-  base along it. On hardware the per-core base of a `value_tensor` allocation is
-  interpreted as an absolute offset into the table *where the gather happens*, so
-  advancing it shifts the gathered **row**, not the **column** — there is no
-  per-core base value that expresses "different columns per core" for a value
-  tensor. Making the data-dim split correct requires carrying the per-core column
-  offset in the coordinate folds and/or a backend change to how `value_tensor`
-  bases are interpreted. This needs the DeepTools/backend team and is out of
-  scope for current proposal.
+* **Accumulating scatters run serially.** `scatter_add_` / `index_put(...,
+  accumulate=True)` are left on a single core because a multi-core split would
+  need atomic accumulate to stay correct under duplicate indices. Enabling them
+  requires backend atomic-add support.
 
-- **Scatter is not addressed.** For a scatter (`out[i] = src`), the `IndirectAccess`
-  is on the output, so splitting index-entry dims gives data-dependent
-  destinations: two cores can write the same output row. Multi-core scatter is
-  only safe under an index-uniqueness guarantee and is left for future work.
+* **Multi-index scatter is not divided.** When the destination index is built
+  from more than one index tensor, `_build_indirect_store_subs` cannot
+  unambiguously map each indirect symbol to its source buffer, so it returns no
+  subs and the op stays unsplit (correct, serial).
+
+* **Parallelising the data dims is deferred.** A prototype let the planner split
+  a data dim and advanced the table's per-core base along it. On hardware the
+  per-core base of a `value_tensor` allocation is interpreted as an absolute
+  offset into the table *where the indirect access happens*, so advancing it
+  shifts the addressed **row**, not the **column** — there is no per-core base
+  that expresses "different columns per core." Making the data-dim split correct
+  requires carrying the per-core column offset in the coordinate folds and/or a
+  backend change to how `value_tensor` bases are interpreted. This needs the
+  DeepTools/backend team and is out of scope here.
 
 ## Implementation
 
 | File | Change |
 |---|---|
-| `_inductor/work_division.py` | `indirect_value_data_syms`, `collect_indirect_value_tds`, `IndirectAccess` span guard, `forbidden_split_syms` in `_default_split`, `_first_non_indirect_read_index` |
-| `_inductor/codegen/superdsc.py` | `SDSCArgs.shared_base`, set for the value tensor |
+| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index` |
+| `_inductor/work_division.py` | `collect_shared_indirect_tds` (gather reads + scatter destination), `shared_indirect_data_syms`, `_non_indirect_coord_syms`, `_build_output_td`, `collect_indirect_value_tds`, `indirect_store_entry_syms`, `forbidden_split_syms` + `force_output_syms` in `_default_split`, `IndirectAccess` span guard |
+| `_inductor/codegen/superdsc.py` | `SDSCArgs.shared_base`, set for any `IndirectAccess`-carrying tensor (gather value, scatter destination) |
 | `_inductor/codegen/compute_ops.py` | `core_idx_to_slice_offset` honours `shared_base` |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
-| `examples/gather_multicore_exp.py` | three-scenario validation example |
+| `examples/gather_multicore_exp.py`, `examples/scatter_multicore_exp.py` | three-scenario validation examples |
 
 ## See also
 
-- [Work Division Planning](work_division_planning.md) — the three-pass planner
+* [Work Division Planning](work_division_planning.md) — the three-pass planner
   this builds on.

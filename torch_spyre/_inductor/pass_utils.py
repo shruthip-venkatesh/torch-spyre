@@ -436,20 +436,83 @@ def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Ex
     return result
 
 
-def indirect_access_subs_from_op(
-    op: ComputedBuffer,
-) -> "dict[sympy.Symbol, sympy.Expr]":
-    """Build {indirect_sym → IndirectAccess(name)} for a ComputedBuffer (pre-scheduler).
+def _build_indirect_store_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
+    """Map indirect symbols in WRITE MemoryDep.index to IndexedBase[index] exprs.
 
-    Used before scheduling, when indirect_vars is not yet available.
-    Re-executes inner_fn via _IndirectIndexFinder to discover which buffer's
-    load produced each indirect index. The resulting subs can be passed to
-    device_coordinates() to replace indirect symbols with IndirectAccess(name).
+    Store-side mirror of ``_build_indirect_load_subs``. Extracts which index
+    buffer feeds each indirect symbol from the scatter's output indexer. Only
+    handles single-index scatters; returns empty for multi-index cases.
     """
-    raw = _build_indirect_load_subs(op)
+    from sympy import IndexedBase
+    from torch._inductor.ir import Scatter
+
+    if not isinstance(op.data, Scatter):
+        return {}
+    idx_names = _find_scatter_index_buf_names(op)
+    if len(idx_names) != 1:
+        return {}
+    idx_name = next(iter(idx_names))
+
+    rw = op.get_read_writes()
+    # Find how the index tensor is accessed. We need this to match the pattern
+    # used on the load side. Only the buffer name matters downstream, so if we
+    # can't find the index dependency, we just use a constant placeholder.
+    idx_dep = next(
+        (d for d in rw.reads if isinstance(d, MemoryDep) and d.name == idx_name),
+        None,
+    )
+    idx_index = idx_dep.index if idx_dep is not None else sympy.Integer(0)
+
+    result: dict[sympy.Symbol, sympy.Expr] = {}
+    for d in rw.writes:
+        if not (isinstance(d, MemoryDep) and d.is_indirect()):
+            continue
+        for sym in d.index.free_symbols:
+            if sym not in d.ranges:
+                result[sym] = IndexedBase(idx_name)[idx_index]
+    return result
+
+
+def _wrap_indirect_subs(
+    raw: dict[sympy.Symbol, sympy.Expr],
+) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Convert index buffer references to IndirectAccess markers.
+
+    Takes mappings like {sym → IndexedBase(name)[index]} and converts them to
+    {sym → IndirectAccess(name)}. Used by both load and store builders to mark
+    which dimensions are accessed indirectly.
+    """
     return {
         sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()
     }
+
+
+def indirect_access_subs_from_op(
+    op: ComputedBuffer,
+) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Find all indirect accesses in an operation and mark them appropriately.
+
+    Called before scheduling to identify which dimensions are accessed through
+    runtime indices. Handles both gather (indirect reads) and scatter (indirect
+    writes). Returns substitutions that mark these dimensions with IndirectAccess
+    so the work division planner knows not to split them incorrectly.
+    """
+    raw = _build_indirect_load_subs(op)
+    raw.update(_build_indirect_store_subs(op))
+    return _wrap_indirect_subs(raw)
+
+
+def indirect_store_subs_from_op(
+    op: ComputedBuffer,
+) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Find indirect accesses in scatter writes only.
+
+    This is the write-only version of `indirect_access_subs_from_op`. Marks
+    the scatter destination's row dimension as IndirectAccess so it stays at a
+    shared base address across cores (same treatment as gather value tables).
+    Returns empty for non-scatter operations.
+    """
+    return _wrap_indirect_subs(_build_indirect_store_subs(op))
 
 
 def indirect_access_subs_from_kernel(

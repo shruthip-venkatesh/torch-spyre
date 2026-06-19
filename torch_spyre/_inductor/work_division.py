@@ -50,6 +50,7 @@ from .pass_utils import (
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
     indirect_access_subs_from_op,
+    indirect_store_subs_from_op,
     _fixed_read_layout,
 )
 from .propagate_hints import get_op_hints
@@ -621,24 +622,38 @@ def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
     return layout
 
 
+def _build_output_td(op: ComputedBuffer) -> TensorDep:
+    """Build the output tensor dependency, handling scatter destinations specially.
+
+    For scatter operations, the destination row is chosen at runtime, so we mark
+    it with IndirectAccess. This tells the work division planner to keep the row
+    dimension at full size (never split it) and only split the data dimensions.
+    Regular operations just get their normal coordinates unchanged.
+    """
+    output_td = TensorDep(next(iter(op.get_read_writes().writes)), _resolve_layout(op))
+    store_subs = indirect_store_subs_from_op(op)
+    if store_subs:
+        output_td.device_coords = device_coordinates(
+            output_td.layout.device_layout, output_td.dep, store_subs
+        )
+    return output_td
+
+
 def collect_tensor_deps(
     op: ComputedBuffer, args: list[SchedNodeArg]
 ) -> tuple[list[TensorDep], TensorDep]:
     """Build TensorDep lists for inputs and the output of op."""
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    rw = op.get_read_writes()
-    output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
-    return input_tds, output_td
+    return input_tds, _build_output_td(op)
 
 
 def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
-    """Build TensorDeps for indirect (gather) value reads with IndirectAccess-aware
-    device coordinates.
+    """Collect tensor dependencies for gather's value tables.
 
-    Indirect reads are dropped from the normal `args` list
-    (`get_mem_deps_from_rw` filters `arg.is_indirect()`), so the span check
-    would otherwise never see the shared value tensor. These TensorDeps are used
-    only for the per-core span/overflow check; the value tensor is never split.
+    Gather value tables are filtered out of the normal argument list, but we
+    still need to check if they fit in per-core memory. This function brings
+    them back in with proper IndirectAccess markers. The value table is never
+    split across cores - these dependencies are only used for memory size checks.
     """
     subs = indirect_access_subs_from_op(op)
     if not subs:
@@ -655,23 +670,61 @@ def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
     return tds
 
 
-def indirect_value_data_syms(op: ComputedBuffer) -> set[Symbol]:
-    """Iteration symbols that index the SHARED value tensor's data dims.
+def collect_shared_indirect_tds(op: ComputedBuffer) -> list[TensorDep]:
+    """Get all tensors that are shared across cores with runtime-chosen rows.
 
-    These are the value tensor's non-gather coordinate symbols (its stick/column
-    dims). Here it must not split them: the value tensor is shared at a fixed
-    base across all cores, so a split on a value-data dim would force a per-core
-    base offset on a tensor that must stay at the same address everywhere.
+    This covers both gather (reads from a shared value table) and scatter
+    (writes to a shared destination). These tensors stay at the same base
+    address on all cores, with the row selected at runtime. Their row dimension
+    is marked with IndirectAccess, and their data dimensions must not be split.
+    Returns empty for regular operations.
+    """
+    tds = collect_indirect_value_tds(op)
+    if indirect_store_subs_from_op(op):
+        tds.append(_build_output_td(op))
+    return tds
 
-    Returns an empty set for non-indirect ops.
+
+def _non_indirect_coord_syms(coords: list[Expr]) -> set[Symbol]:
+    """Extract coordinate symbols, skipping the runtime-chosen row dimension."""
+    syms: set[Symbol] = set()
+    for coord in coords:
+        if hasattr(coord, "has") and coord.has(IndirectAccess):
+            continue
+        syms |= coord.free_symbols
+    return syms
+
+
+def shared_indirect_data_syms(op: ComputedBuffer) -> set[Symbol]:
+    """Find data dimensions of shared tables that must not be split.
+
+    These are the column/stick dimensions of tables shared across cores (gather
+    value tables or scatter destinations). We can't split these dimensions
+    because the table needs to stay at the same base address on every core.
+    Splitting a data dimension would require different base addresses per core,
+    breaking the shared access pattern. Returns empty for regular operations.
     """
     syms: set[Symbol] = set()
-    for td in collect_indirect_value_tds(op):
-        for coord in td.device_coords:
-            if hasattr(coord, "has") and coord.has(IndirectAccess):
-                continue
-            syms |= coord.free_symbols
+    for td in collect_shared_indirect_tds(op):
+        syms |= _non_indirect_coord_syms(td.device_coords)
     return syms
+
+
+def indirect_store_entry_syms(op: ComputedBuffer) -> set[Symbol]:
+    """Find which dimensions of a scatter can be safely parallelized.
+
+    For scatter operations, we can split along the index-entry dimension (giving
+    each core different source rows to write). The destination stays shared with
+    its row chosen at runtime. This is safe because each core writes to different
+    entries.
+    """
+    from torch._inductor.ir import Scatter
+
+    if not isinstance(op.data, Scatter) or op.data.scatter_mode is not None:
+        return set()
+    if not indirect_store_subs_from_op(op):
+        return set()
+    return set(iteration_space_from_op(op)) - shared_indirect_data_syms(op)
 
 
 def _first_non_indirect_read_index(rw, default):
@@ -871,16 +924,20 @@ def _default_split(
     max_cores: int,
     symbol_meta: SymbolMeta,
     forbidden_split_syms: set[Symbol] | None = None,
+    force_output_syms: set[Symbol] | None = None,
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
-    """Distribute max_cores by priority on top of span_reduction's commits.
+    """Distribute remaining cores across dimensions by priority.
 
-    Returns the chosen splits and the (output, reduction) priority dims the
-    caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
+    Takes the splits already committed by span reduction and fills in the rest
+    by splitting output dimensions first, then reduction dimensions. Returns the
+    final split decisions and priority lists for logging.
 
-    forbidden_split_syms: iteration symbols that must never be split (e.g. the
-    data dims of a shared indirect-access value tensor). They are removed from
-    both the output and reduction priority lists so the distributor leaves them
-    at split=1.
+    forbidden_split_syms: Dimensions that must stay unsplit (like data dimensions
+    of shared indirect tables). These are removed from consideration entirely.
+
+    force_output_syms: Dimensions to treat as high-priority output dimensions
+    even if they don't appear directly in the output coordinates (like a scatter's
+    index-entry dimension). These get promoted to the front of the output list.
     """
     # TODO: The final dim committed by span_reduction_pass holds the minimum
     #       split that gets the span under the limit, so it may have headroom
@@ -894,6 +951,15 @@ def _default_split(
     output_dims, reduction_dims = prioritize_dimensions(
         output_td, it_space_remaining, symbol_meta
     )
+
+    if force_output_syms:
+        # For scatter, the index-entry dimension doesn't show up in the
+        # destination coordinates (row is runtime-chosen), so it gets classified
+        # as a reduction dimension. Move it to output priority so we actually
+        # split it for parallelism.
+        promoted = [d for d in reduction_dims if d in force_output_syms]
+        reduction_dims = [d for d in reduction_dims if d not in force_output_syms]
+        output_dims = promoted + output_dims
 
     if forbidden_split_syms:
         output_dims = [d for d in output_dims if d not in forbidden_split_syms]
@@ -924,16 +990,17 @@ def work_distribution_pass(
     args: list[SchedNodeArg],
     max_cores: int,
 ) -> None:
-    """Optional per-op pass: distribute remaining cores to maximize parallelism.
+    """Distribute remaining cores across the operation's dimensions.
 
-    Reads op.op_it_space_splits written by span_reduction_pass (if any) to
-    recover the already-committed splits, then fills remaining cores by priority.
+    Reads any splits already committed by span reduction, then allocates the
+    remaining cores by splitting output dimensions first, then reduction
+    dimensions.
     """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
-    # Indirect (gather) value reads are filtered out of `args`; pull them in
-    # separately so the per-core span warning accounts for the shared value
-    # tensor. They are never split (see indirect_value_data_syms).
+    # Gather value tables are filtered out of args, so add them back for memory
+    # checks. (Scatter destinations are already in output_td.) Shared tables are
+    # never split across cores.
     value_tds = collect_indirect_value_tds(op)
     all_tds = input_tds + [output_td] + value_tds
 
@@ -999,7 +1066,8 @@ def work_distribution_pass(
         committed_splits,
         max_cores,
         symbol_meta,
-        forbidden_split_syms=indirect_value_data_syms(op),
+        forbidden_split_syms=shared_indirect_data_syms(op),
+        force_output_syms=indirect_store_entry_syms(op),
     )
 
     apply_splits(op, splits, output_td)
