@@ -46,7 +46,6 @@ from indirect_access_common import (  # noqa: E402
     bundle_jsons_from_captured,
     capture_op_specs,
     capture_sdsc_calls,
-    classify_compile,
     flatten_op_specs,
     generate_sdsc_jsons,
     indirect_access_target_names,
@@ -80,7 +79,7 @@ class TestGather(IndirectAccessTestCase):
         return x, i
 
     # -- core x[i].exp(): op-spec structure + detection (one compile) ------
-    def test_gather_exp_op_spec(self):
+    def test_gather_with_exp(self):
         """x[i].exp(): GATHER op spec with IndirectAccess on an input, a named
         index arg matching the IndirectAccess target, one output, a well-formed
         iteration space and TensorArg metadata, and the index is detected."""
@@ -212,6 +211,15 @@ class TestGather(IndirectAccessTestCase):
         x, i = self._xi(P=1)
         self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
+    def test_embedding_lookup(self):
+        """LLM embedding lookup: table[token_ids] with vocab-scale shapes and int64 ids."""
+        V, D, B, S = 32000, 512, 2, 128
+        table = torch.rand(V, D, dtype=torch.float16).to("spyre")
+        token_ids = torch.randint(0, V, (B, S), dtype=torch.int64).to("spyre")
+        self.name_dims(table, {"V": V, "D": D})
+        self.name_dims(token_ids, {"B": B, "S": S})
+        self.check(lambda t, i: t[i], table, token_ids, expect=GATHER_OP_SPEC)
+
     def test_advanced_indexing_with_tanh(self):
         x, i = self._xi(P=32)
         self.check(lambda x, i: x[i].tanh(), x, i, expect=GATHER_OP_SPEC, op="tanh")
@@ -271,6 +279,42 @@ class TestGather(IndirectAccessTestCase):
         self.name_dims(x, {"A": A, "B": B, "C": C})
         self.name_dims(idx, {"P": P})
         self.check(lambda x, i: x[i], x, idx, expect=GATHER_OP_SPEC)
+
+    def test_moe(self):
+        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
+        E, D, F, B, S = 8, 512, 2048, 2, 128
+        expert_w = torch.rand(E, D, F, dtype=torch.float16).to("spyre")
+        expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
+        self.name_dims(expert_w, {"E": E, "D": D, "F": F})
+        self.name_dims(expert_ids, {"B": B, "S": S})
+        self.check(lambda w, i: w[i], expert_w, expert_ids, expect=GATHER_OP_SPEC)
+
+    def test_paged_kv(self):
+        """Paged KV-cache gather: keys[slot_idxs] with 3D cache and 2D int64 slot index."""
+        cache, H, Dh, B, Lk = 32768, 8, 128, 2, 256
+        keys = torch.rand(cache, H, Dh, dtype=torch.float16).to("spyre")
+        slot_idxs = torch.randint(0, cache, (B, Lk), dtype=torch.int64).to("spyre")
+        self.name_dims(keys, {"cache": cache, "H": H, "Dh": Dh})
+        self.name_dims(slot_idxs, {"B": B, "Lk": Lk})
+        self.check(lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC)
+
+    @unittest.expectedFailure
+    def test_gather_after_reshape(self):
+        """x.reshape(12, 256)[i] -- gather on a reshaped tensor."""
+        x = torch.rand(3, 1024, dtype=torch.float16).to("spyre")
+        i = torch.tensor((1, 2), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"rows": 3, "cols": 1024})
+        self.name_dims(i, {"P": 2})
+        self.check(lambda x, i: x.reshape(12, 256)[i], x, i, expect=GATHER_OP_SPEC)
+
+    @unittest.expectedFailure
+    def test_gather_after_reshape_1d(self):
+        """t.reshape(16, 256)[idx] -- gather on a 1D tensor reshaped to 2D (page table)."""
+        t = torch.arange(4096, dtype=torch.float16).to("spyre")
+        idx = torch.tensor((7, 3), dtype=torch.int32).to("spyre")
+        self.name_dims(t, {"N": 4096})
+        self.name_dims(idx, {"P": 2})
+        self.check(lambda t, i: t.reshape(16, 256)[i], t, idx, expect=GATHER_OP_SPEC)
 
     def test_gather_then_scalar_mul(self):
         """x[i] * 2.0 -- gather fused with a scalar binary op."""
@@ -333,12 +377,11 @@ class TestGather(IndirectAccessTestCase):
         The gather still compiles (GATHER_OP_SPEC) and 'sin' is not a Spyre op.
         The Spyre-side gather must still lower to a valid indirect SDSC bundle."""
         x, i = self._xi(P=32)
-        label, op_specs = classify_compile(lambda x, i: x[i].sin(), x, i)
-        self.assertEqual(label, GATHER_OP_SPEC)
-        self.assertNotIn("sin", [s.op for s in op_specs])
-
         with capture_op_specs() as captured:
             torch.compile(lambda x, i: x[i].sin())(x, i)
+        op_specs = flatten_op_specs(captured)
+        self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
+        self.assertNotIn("sin", [s.op for s in op_specs])
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
 
     # -- SDSC generation field checks (one compile, all fields) -----------
