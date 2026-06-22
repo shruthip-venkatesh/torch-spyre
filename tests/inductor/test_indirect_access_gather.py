@@ -23,8 +23,13 @@ Every gather scenario now carries through to SDSC generation: check() (and the
 capture-based tests via bundle_jsons_from_captured) validate the indirect-access
 encoding of the produced bundle, not just that op specs were generated.
 
-TestGatherE2E (opt-in via SPYRE_RUN_E2E=1) runs the real backend end-to-end and
-warns that the device result diverges from the CPU reference.
+There is one test per scenario -- no separate e2e variants. Each scenario
+validates the capture path and then runs the kernel on the real backend,
+validating the result and warning that the device values diverge from the CPU
+reference (the backend does not yet implement indirect gather). Scenarios route
+their compile through _stage_and_e2e (stage check + e2e run); capture-based
+tests call run_e2e directly after their own assertions. The three structural
+tests (sdsc_fields, sdsc_handoff, python_bundle_generation) stay capture-only.
 
 Status (validated on hardware build): gather reaches op-spec and SDSC
 generation; the deeptools backend still rejects the bundle.
@@ -84,6 +89,9 @@ class TestGather(IndirectAccessTestCase):
         index arg matching the IndirectAccess target, one output, a well-formed
         iteration space and TensorArg metadata, and the index is detected."""
         x, i = self._xi(P=3, two_d=True)
+        # Stage check first (and all the detailed op-spec assertions below) so
+        # they always run; the e2e at the end xfails on the expected
+        # device-side divergence/abort, which would otherwise stop the test.
         r = self.check(
             lambda x, i: x[i].exp(),
             x,
@@ -121,6 +129,8 @@ class TestGather(IndirectAccessTestCase):
                 self.assertIsNotNone(a.stride_map, "stride_map should be populated")
                 self.assertEqual(len(a.device_coordinates), len(a.device_size))
 
+        run_e2e(self, lambda x, i: x[i].exp(), x, i)
+
     def test_gather_bare_index(self):
         """x[i] (no unary) produces an identity/restickify copy op.
         Arg ordering is: index first, value, then output."""
@@ -146,6 +156,7 @@ class TestGather(IndirectAccessTestCase):
         # Carry the same scenario through to SDSC and validate the indirect
         # encoding of the copy op (not just that op specs were produced).
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
+        run_e2e(self, lambda x, i: x[i], x, i)
 
     def test_gather_supported_unaries(self):
         """A gather fused with each supported unary keeps the gather signature.
@@ -161,6 +172,10 @@ class TestGather(IndirectAccessTestCase):
             "sigmoid": torch.sigmoid,
             "relu": torch.relu,
         }
+        # Validate every unary's stage encoding first (all subtests run), then
+        # run one representative end-to-end. They share the same gather
+        # structure, and run_e2e xfails on the expected device-side divergence,
+        # which would otherwise stop the loop before later unaries are checked.
         for label, fn in unaries.items():
             with self.subTest(unary=label):
                 torch._dynamo.reset()
@@ -180,6 +195,12 @@ class TestGather(IndirectAccessTestCase):
                 self.assert_indirect_sdsc_fields(
                     bundle_jsons_from_captured(captured), "gather"
                 )
+        torch._dynamo.reset()
+        x = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(idx, {"P": P})
+        run_e2e(self, lambda x, i: torch.exp(x[i]), x, idx)
 
     def test_gather_chained_unaries(self):
         """x[i].exp().tanh(): both unaries stay on Spyre, gather keeps its indirect access."""
@@ -193,23 +214,24 @@ class TestGather(IndirectAccessTestCase):
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
         # The fused chain must still emit a valid indirect-access SDSC bundle.
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
+        run_e2e(self, lambda x, i: x[i].exp().tanh(), x, i)
 
     # -- classification of torch gather ops -------------------------------
     def test_advanced_indexing(self):
         x, i = self._xi(P=32)
-        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
     def test_advanced_indexing_int64_index(self):
         x, i = self._xi(P=32, dtype=torch.int64)
-        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
     def test_advanced_indexing_2d_index(self):
         x, i = self._xi(P=3, two_d=True)
-        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
     def test_advanced_indexing_single_row(self):
         x, i = self._xi(P=1)
-        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
     def test_embedding_lookup(self):
         """LLM embedding lookup: table[token_ids] with vocab-scale shapes and int64 ids."""
@@ -218,25 +240,29 @@ class TestGather(IndirectAccessTestCase):
         token_ids = torch.randint(0, V, (B, S), dtype=torch.int64).to("spyre")
         self.name_dims(table, {"V": V, "D": D})
         self.name_dims(token_ids, {"B": B, "S": S})
-        self.check(lambda t, i: t[i], table, token_ids, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda t, i: t[i], table, token_ids, expect=GATHER_OP_SPEC)
 
     def test_advanced_indexing_with_tanh(self):
         x, i = self._xi(P=32)
-        self.check(lambda x, i: x[i].tanh(), x, i, expect=GATHER_OP_SPEC, op="tanh")
+        self._stage_and_e2e(
+            lambda x, i: x[i].tanh(), x, i, expect=GATHER_OP_SPEC, op="tanh"
+        )
 
     def test_advanced_indexing_with_abs(self):
         x, i = self._xi(P=32)
-        self.check(lambda x, i: x[i].abs(), x, i, expect=GATHER_OP_SPEC, op="abs")
+        self._stage_and_e2e(
+            lambda x, i: x[i].abs(), x, i, expect=GATHER_OP_SPEC, op="abs"
+        )
 
     def test_index_select(self):
         x, i = self._xi(P=32)
-        self.check(
+        self._stage_and_e2e(
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
 
     def test_index_select_with_exp(self):
         x, i = self._xi(P=32)
-        self.check(
+        self._stage_and_e2e(
             lambda x, i: torch.index_select(x, 0, i).exp(),
             x,
             i,
@@ -246,18 +272,22 @@ class TestGather(IndirectAccessTestCase):
 
     def test_index_select_larger_index(self):
         x, i = self._xi(P=96)
-        self.check(
+        self._stage_and_e2e(
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
 
     def test_torch_gather(self):
-        """torch.gather(x, 0, index) with a same-rank [M,K] index tensor."""
+        """torch.gather(x, 0, index) with a same-rank [M,K] index tensor.
+
+        Indices address dim 0, so they must be < M (not < N) -- otherwise the
+        CPU reference itself raises out-of-bounds once the kernel actually runs.
+        """
         M, N, K = 128, 256, 64
         x = torch.rand(M, N, dtype=torch.float16).to("spyre")
-        index = torch.randint(0, N, (M, K), dtype=torch.int64).to("spyre")
+        index = torch.randint(0, M, (M, K), dtype=torch.int64).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(index, {"M": M, "K": K})
-        self.check(
+        self._stage_and_e2e(
             lambda x, index: torch.gather(x, 0, index), x, index, expect=GATHER_OP_SPEC
         )
 
@@ -268,7 +298,9 @@ class TestGather(IndirectAccessTestCase):
         idx = torch.randint(0, V, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(weight, {"V": V, "E": E})
         self.name_dims(idx, {"P": P})
-        self.check(lambda w, i: torch.embedding(w, i), weight, idx, expect=NO_SPYRE_OP)
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=NO_SPYRE_OP
+        )
 
     # -- additional real gather scenarios ---------------------------------
     def test_gather_3d_data(self):
@@ -278,7 +310,7 @@ class TestGather(IndirectAccessTestCase):
         idx = torch.randint(0, A, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"A": A, "B": B, "C": C})
         self.name_dims(idx, {"P": P})
-        self.check(lambda x, i: x[i], x, idx, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x[i], x, idx, expect=GATHER_OP_SPEC)
 
     def test_moe(self):
         """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
@@ -287,7 +319,9 @@ class TestGather(IndirectAccessTestCase):
         expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
         self.name_dims(expert_w, {"E": E, "D": D, "F": F})
         self.name_dims(expert_ids, {"B": B, "S": S})
-        self.check(lambda w, i: w[i], expert_w, expert_ids, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda w, i: w[i], expert_w, expert_ids, expect=GATHER_OP_SPEC
+        )
 
     def test_paged_kv(self):
         """Paged KV-cache gather: keys[slot_idxs] with 3D cache and 2D int64 slot index."""
@@ -296,7 +330,7 @@ class TestGather(IndirectAccessTestCase):
         slot_idxs = torch.randint(0, cache, (B, Lk), dtype=torch.int64).to("spyre")
         self.name_dims(keys, {"cache": cache, "H": H, "Dh": Dh})
         self.name_dims(slot_idxs, {"B": B, "Lk": Lk})
-        self.check(lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC)
 
     @unittest.expectedFailure
     def test_gather_after_reshape(self):
@@ -305,7 +339,9 @@ class TestGather(IndirectAccessTestCase):
         i = torch.tensor((1, 2), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"rows": 3, "cols": 1024})
         self.name_dims(i, {"P": 2})
-        self.check(lambda x, i: x.reshape(12, 256)[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda x, i: x.reshape(12, 256)[i], x, i, expect=GATHER_OP_SPEC
+        )
 
     @unittest.expectedFailure
     def test_gather_after_reshape_1d(self):
@@ -314,17 +350,19 @@ class TestGather(IndirectAccessTestCase):
         idx = torch.tensor((7, 3), dtype=torch.int32).to("spyre")
         self.name_dims(t, {"N": 4096})
         self.name_dims(idx, {"P": 2})
-        self.check(lambda t, i: t.reshape(16, 256)[i], t, idx, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(
+            lambda t, i: t.reshape(16, 256)[i], t, idx, expect=GATHER_OP_SPEC
+        )
 
     def test_gather_then_scalar_mul(self):
         """x[i] * 2.0 -- gather fused with a scalar binary op."""
         x, i = self._xi(P=32)
-        self.check(lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC)
 
     def test_gather_then_scalar_add(self):
         """x[i] + 1.0 -- gather fused with a scalar add."""
         x, i = self._xi(P=32)
-        self.check(lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC)
 
     def test_gather_two_indices_added(self):
         """x[i] + x[j] -- two independent gathers feeding a binary op."""
@@ -335,12 +373,12 @@ class TestGather(IndirectAccessTestCase):
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(i, {"P": P})
         self.name_dims(j, {"P": P})
-        self.check(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
 
     def test_gather_then_sum_reduction(self):
         """x[i].sum(dim=1) -- a reduction over gathered rows."""
         x, i = self._xi(P=32)
-        self.check(lambda x, i: x[i].sum(dim=1), x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x[i].sum(dim=1), x, i, expect=GATHER_OP_SPEC)
 
     def test_functional_embedding(self):
         """torch.nn.functional.embedding(idx, weight) -- like torch.embedding."""
@@ -349,7 +387,7 @@ class TestGather(IndirectAccessTestCase):
         idx = torch.randint(0, V, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(weight, {"V": V, "E": E})
         self.name_dims(idx, {"P": P})
-        self.check(
+        self._stage_and_e2e(
             lambda i, w: torch.nn.functional.embedding(i, w),
             idx,
             weight,
@@ -363,8 +401,15 @@ class TestGather(IndirectAccessTestCase):
         M, N = 128, 256
         x = torch.rand(M, N, dtype=torch.float16).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
-        r = self.check(
-            lambda x: x.exp(), x, expect=DIRECT_OP_SPEC, op="exp", detected=False
+        # x.exp() is a supported direct op, so its e2e result must match the CPU
+        # reference (expect_close=True) -- unlike the indirect gathers.
+        r = self._stage_and_e2e(
+            lambda x: x.exp(),
+            x,
+            expect=DIRECT_OP_SPEC,
+            op="exp",
+            detected=False,
+            expect_close=True,
         )
         self.assertFalse(any(op_spec_has_indirect_access(s) for s in r.op_specs))
         self.assertFalse(
@@ -383,6 +428,7 @@ class TestGather(IndirectAccessTestCase):
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
         self.assertNotIn("sin", [s.op for s in op_specs])
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
+        run_e2e(self, lambda x, i: x[i].sin(), x, i)
 
     # -- SDSC generation field checks (one compile, all fields) -----------
     def _gen_sdsc(self):
@@ -516,47 +562,6 @@ class TestGather(IndirectAccessTestCase):
         with patch(_LAUNCH_KERNEL):
             with self.assertRaises(InductorError):
                 torch.compile(lambda x, i: x[i].exp())(x, i)
-
-
-@unittest.skipUnless(
-    os.environ.get("SPYRE_RUN_E2E") == "1",
-    "E2E gather runs the real backend (dxp_standalone + on-device launch), which "
-    "requires Spyre hardware and is expected to diverge from / abort on the CPU "
-    "reference; opt in with SPYRE_RUN_E2E=1.",
-)
-class TestGatherE2E(IndirectAccessTestCase):
-    """End-to-end gather runs on the real backend (no mocking).
-
-    Mirrors the standalone tests/indirect_access/gather.py script: compile and
-    run on device, then compare against the CPU reference. The Spyre backend
-    does not yet implement indirect gather correctly, so run_e2e warns (rather
-    than fails) on the value divergence while still asserting the pipeline ran
-    end-to-end and returned a correctly shaped/typed tensor.
-    """
-
-    def _named_xi(self, P=3, two_d=False, M=128, N=256, Q=192):
-        """Device (x, i) gather operands with named dims, like TestGather._xi."""
-        x = torch.rand(M, N, dtype=torch.float16).to("spyre")
-        shape = (P, Q) if two_d else (P,)
-        i = torch.randint(0, M, shape, dtype=torch.int32).to("spyre")
-        self.name_dims(x, {"M": M, "N": N})
-        self.name_dims(i, {"P": P, "Q": Q} if two_d else {"P": P})
-        return x, i
-
-    def test_gather_exp_e2e_diverges(self):
-        """x[i].exp() end-to-end: warns that the device result diverges."""
-        x, i = self._named_xi(P=3, two_d=True)
-        run_e2e(self, lambda x, i: x[i].exp(), x, i)
-
-    def test_gather_bare_e2e_diverges(self):
-        """x[i] (bare gather copy) end-to-end."""
-        x, i = self._named_xi(P=32)
-        run_e2e(self, lambda x, i: x[i], x, i)
-
-    def test_index_select_e2e_diverges(self):
-        """torch.index_select(x, 0, i) end-to-end."""
-        x, i = self._named_xi(P=32)
-        run_e2e(self, lambda x, i: torch.index_select(x, 0, i), x, i)
 
 
 if __name__ == "__main__":
