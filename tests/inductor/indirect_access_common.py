@@ -48,6 +48,7 @@ reaches this path today; the name is generic so scatter can reuse it later.
 
 import contextlib
 import dataclasses
+import math
 from subprocess import CalledProcessError
 from unittest.mock import patch
 
@@ -58,6 +59,7 @@ from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.test_case import TestCase as InductorTestCase
 
 import torch_spyre._inductor.propagate_named_dims as _pnd
+from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor.op_spec import (
     IndirectAccess,
     LoopSpec,
@@ -69,6 +71,41 @@ from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
 declare_tensor_dim = _pnd.declare_tensor_dim
 name_tensor_dims = _pnd.name_tensor_dims
+
+
+# ---------------------------------------------------------------------------
+# Device-layout helpers
+# ---------------------------------------------------------------------------
+def canonical_device_layout(shape, dtype) -> SpyreTensorLayout:
+    """Build the canonical generic-stick `SpyreTensorLayout` explicitly
+    Example (fp16, stick=64):
+        shape (12, 1024)      -> device_size [12, 16, 64],    stride_map [1024, 64, 1]
+        shape (12, 4, 1024)   -> device_size [12, 4, 16, 64], stride_map [4096, 1024, 64, 1]
+    """
+    shape = [int(s) for s in shape]
+    eps = SpyreTensorLayout(shape, dtype).elems_per_stick()
+    *lead, last = shape
+    stick_count = (last + eps - 1) // eps
+    device_size = [*lead, stick_count, eps]
+    stride_map = [math.prod(shape[k + 1 :]) for k in range(len(lead))] + [eps, 1]
+    return SpyreTensorLayout(
+        device_size=device_size,
+        stride_map=stride_map,
+        device_dtype=get_device_dtype(dtype),
+    )
+
+
+def pinned_to_spyre(tensor: torch.Tensor) -> torch.Tensor:
+    """Move a contiguous tensor to "spyre" with its canonical layout pinned
+    explicitly (via `device_layout=`), instead of the implicit `.to("spyre")`.
+
+    Used for the value (data) tensor of a gather, matching the manual `stl`
+    pattern in the example scripts; index tensors stay on a plain `.to("spyre")`.
+    """
+    return tensor.to(
+        "spyre",
+        device_layout=canonical_device_layout(tensor.shape, tensor.dtype),
+    )
 
 
 # ---------------------------------------------------------------------------
