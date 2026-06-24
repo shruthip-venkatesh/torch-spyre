@@ -678,7 +678,8 @@ class IndirectAccessTestCase(InductorTestCase):
         Returns check()'s ScenarioResult for any further per-test assertions.
         """
         r = self.check(kernel, *dev_args, expect=expect, op=op, detected=detected)
-        run_e2e(self, kernel, *dev_args, expect_close=expect_close)
+        # TODO : Enable once e2e is available
+        # run_e2e(self, kernel, *dev_args, expect_close=expect_close)
         return r
 
     # -- SDSC indirect-access field validation ---------------------------

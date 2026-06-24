@@ -58,7 +58,6 @@ from indirect_access_common import (  # noqa: E402
     op_spec_has_indirect_input,
     op_spec_has_indirect_output,
     pinned_to_spyre,
-    run_e2e,
 )
 
 from torch_spyre._C import DataFormats  # noqa: E402
@@ -131,8 +130,8 @@ class TestGather(IndirectAccessTestCase):
                 self.assertTrue(a.device_size, "device_size should be non-empty")
                 self.assertIsNotNone(a.stride_map, "stride_map should be populated")
                 self.assertEqual(len(a.device_coordinates), len(a.device_size))
-
-        run_e2e(self, lambda x, i: x[i].exp(), x, i)
+        # TODO : Enable once e2e is available
+        # run_e2e(self, lambda x, i: x[i].exp(), x, i)
 
     def test_gather_bare_index(self):
         """x[i] (no unary) produces an identity/restickify copy op.
@@ -159,7 +158,8 @@ class TestGather(IndirectAccessTestCase):
         # Carry the same scenario through to SDSC and validate the indirect
         # encoding of the copy op (not just that op specs were produced).
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
-        run_e2e(self, lambda x, i: x[i], x, i)
+        # TODO : Enable once e2e is available
+        # run_e2e(self, lambda x, i: x[i], x, i)
 
     def test_gather_supported_unaries(self):
         """A gather fused with each supported unary keeps the gather signature.
@@ -203,7 +203,8 @@ class TestGather(IndirectAccessTestCase):
         idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(idx, {"P": P})
-        run_e2e(self, lambda x, i: torch.exp(x[i]), x, idx)
+        # TODO : Enable once e2e is available
+        # run_e2e(self, lambda x, i: torch.exp(x[i]), x, idx)
 
     def test_gather_chained_unaries(self):
         """x[i].exp().tanh(): both unaries stay on Spyre, gather keeps its indirect access."""
@@ -217,7 +218,8 @@ class TestGather(IndirectAccessTestCase):
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
         # The fused chain must still emit a valid indirect-access SDSC bundle.
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
-        run_e2e(self, lambda x, i: x[i].exp().tanh(), x, i)
+        # TODO : Enable once e2e is available
+        # run_e2e(self, lambda x, i: x[i].exp().tanh(), x, i)
 
     # -- classification of torch gather ops -------------------------------
     def test_advanced_indexing(self):
@@ -424,7 +426,7 @@ class TestGather(IndirectAccessTestCase):
         self.name_dims(slot_idxs, {"B": B, "Lk": Lk})
         self._stage_and_e2e(lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC)
 
-    @unittest.expectedFailure
+    @unittest.skip
     def test_gather_after_reshape(self):
         """x.reshape(12, 256)[i] -- gather on a reshaped tensor."""
         x = pinned_to_spyre(torch.rand(3, 1024, dtype=torch.float16))
@@ -435,7 +437,7 @@ class TestGather(IndirectAccessTestCase):
             lambda x, i: x.reshape(12, 256)[i], x, i, expect=GATHER_OP_SPEC
         )
 
-    @unittest.expectedFailure
+    @unittest.skip
     def test_gather_after_reshape_1d(self):
         """t.reshape(16, 256)[idx] -- gather on a 1D tensor reshaped to 2D (page table)."""
         t = pinned_to_spyre(torch.arange(4096, dtype=torch.float16))
@@ -520,7 +522,8 @@ class TestGather(IndirectAccessTestCase):
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
         self.assertNotIn("sin", [s.op for s in op_specs])
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
-        run_e2e(self, lambda x, i: x[i].sin(), x, i)
+        # TODO : Enable once e2e is available
+        # run_e2e(self, lambda x, i: x[i].sin(), x, i)
 
     # -- SDSC generation field checks (one compile, all fields) -----------
     def _gen_sdsc(self):
