@@ -257,6 +257,33 @@ def _get_device_dim_order(
         for sym in expr.free_symbols:
             if sym not in dim_order:
                 dim_order.append(sym)
+
+    # For indirect-access tensors (e.g. a row gather), the last coordinate
+    # contains an index-buffer symbol like `buf18` rather than a real layout
+    # dimension. If we use that as stick_dim, the emitted descriptor has
+    # stickDimOrder_=['buf18'] while layoutDimOrder_ has no entry for it, and
+    # dxp_standalone crashes with dimMap.at('buf18').
+    #
+    # Fix: walk the device coordinates in reverse and use the first one that is
+    # *not* indirect as stick_dim. This picks the source tensor's own embed/stick
+    # dimension, which is always present in layoutDimOrder_.
+    if (
+        op_spec is not None
+        and is_indirect_value_tensor(arg)
+        and hasattr(last_coord, "has")
+        and last_coord.has(IndirectAccess)
+    ):
+        for coord in reversed(arg.device_coordinates):
+            c = coord.subs(symbol_mapping) if hasattr(coord, "subs") else coord
+            if hasattr(c, "has") and c.has(IndirectAccess):
+                continue
+            free_syms = (
+                sorted(c.free_symbols, key=str) if hasattr(c, "free_symbols") else []
+            )
+            if free_syms:
+                stick_dim = free_syms[0]
+                break
+
     return dim_order, stick_dim
 
 
@@ -373,6 +400,47 @@ def _collect_index_tensor_layouts(
     return index_tensor_layouts, index_active_dims
 
 
+def _wrap_bare_index_symbols(op_spec: OpSpec) -> None:
+    """Ensure every index-buffer reference in device_coordinates is wrapped as
+    IndirectAccess(name) rather than a bare Symbol(name).
+
+    Some codegen paths (e.g. when the index is split across a stick boundary as
+    floor(idx/64) and Mod(idx, 64)) leave the reference as a plain symbol. All
+    downstream detection helpers (is_index_tensor, is_indirect_value_tensor) and
+    the layout logic look for IndirectAccess nodes specifically, so we normalise
+    before any of that runs.
+
+    A symbol is only wrapped when its name matches another arg's name — this
+    ensures real iteration variables like c0, mb, out, z0 are never touched.
+    Mutates op_spec.args in place.
+    """
+    arg_names = {
+        getattr(arg, "name", None) for arg in op_spec.args if getattr(arg, "name", None)
+    }
+    if not arg_names:
+        return
+    for arg in op_spec.args:
+        self_name = getattr(arg, "name", None)
+        new_coords = []
+        changed = False
+        for coord in arg.device_coordinates:
+            subs = (
+                {
+                    s: IndirectAccess(s)
+                    for s in coord.free_symbols
+                    if s.name in arg_names and s.name != self_name
+                }
+                if hasattr(coord, "free_symbols")
+                else {}
+            )
+            if subs:
+                coord = coord.subs(subs)
+                changed = True
+            new_coords.append(coord)
+        if changed:
+            arg.device_coordinates = new_coords
+
+
 def _create_sdsc_tensors(
     op_spec: OpSpec,
     symbol_mapping: dict,
@@ -384,6 +452,11 @@ def _create_sdsc_tensors(
     dims = list(iteration_space.keys())
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
+
+    # Make sure all index-buffer references in device_coordinates use the
+    # IndirectAccess wrapper before any detection or layout logic runs.
+    # See _wrap_bare_index_symbols for details.
+    _wrap_bare_index_symbols(op_spec)
 
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
@@ -458,7 +531,11 @@ def _create_sdsc_tensors(
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
             dev_dim_size = arg.device_size[-stride_idx - 2]
-            it_dim_size = iteration_space[dim]
+            # Indirect-access dims are keyed by the index buffer name (e.g. buf7),
+            # not by an iteration variable, so they are absent from iteration_space.
+            # Fall back to dev_dim_size for those dims — the value is only used
+            # by the offset check further below, which skips indirect coords anyway.
+            it_dim_size = iteration_space.get(dim, dev_dim_size)
             if dim == stick_dim:
                 stick_size = arg.device_dtype.elems_per_stick()
                 dev_dim_size *= stick_size

@@ -595,22 +595,49 @@ def _multi_arg_pointwise_layouts(
     """
 
     indirect_index_names = indirect_index_dep_names(op)
-    # Collect all unique non-zero stick expressions from input layouts
+
+    def _is_indirect_arg(arg: PropArg) -> bool:
+        """Return True if this arg is part of a gather/scatter access.
+
+        Two kinds of args are excluded from the pointwise stick projection:
+          * the index buffer (its values drive the indirect load), and
+          * the data source read through that index (dep.is_indirect()).
+
+        Both have data-dependent access patterns. Projecting the output
+        dim_order onto them would assume pointwise alignment, which is wrong
+        when they have a different shape — e.g. the flat 1-D source buffer
+        in the masked_scatter decomposition writing into an N-D output.
+        """
+        return arg.dep.name in indirect_index_names or (
+            isinstance(arg.dep, MemoryDep) and arg.dep.is_indirect()
+        )
+
+    # Collect the set of stick expressions across all non-indirect inputs.
+    # Index tensors and gather sources are excluded — their access pattern is
+    # data-dependent at runtime and cannot provide a static stick expression.
     stick_exprs = {
         stick_expr
         for arg in args
         for stl in arg.layouts
-        if arg.dep.name not in indirect_index_names
+        if not _is_indirect_arg(arg)
         and (stick_expr := device_coordinates(stl, arg.dep)[-1]) != 0
     }
 
-    # If the indexing and device element size are identical
-    # across all inputs and the output we can just propagate the device layout.
+    # If all inputs and the output have identical indexing and device element
+    # size, we can reuse the device layout directly. Any indirect arg
+    # (index tensor or gather source) immediately disqualifies this path.
+    has_indirect_args = any(
+        arg.dep.name in indirect_index_names or arg.dep.is_indirect() for arg in args
+    )
     in_coords = [host_coordinates(arg.layout, arg.dep) for arg in args]
     out_coords = host_coordinates(output, output_dep)
     can_use_same_layout = True
 
-    if len(stick_exprs) > 1 or any(len(arg.layouts) > 1 for arg in args):
+    if (
+        has_indirect_args
+        or len(stick_exprs) > 1
+        or any(len(arg.layouts) > 1 for arg in args)
+    ):
         can_use_same_layout = False
     else:
         for arg, arg_coors in zip(args, in_coords):
@@ -629,11 +656,22 @@ def _multi_arg_pointwise_layouts(
 
     def _is_supported_layout(dim_order):
         for arg in args:
-            # Project output dim_order to input, dropping leading dims missing due to broadcast.
+            # Skip index tensors and gather sources — they cannot be validated
+            # with a regular STL because their access patterns are data-dependent.
+            if arg.dep.name in indirect_index_names or arg.dep.is_indirect():
+                continue
+            # Project the output dim_order onto this input, dropping leading
+            # dims that don't exist in the input due to broadcasting.
             rank_diff = len(output.size) - len(arg.layout.size)
             projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+            # If the projected dim_order has a different length than the input
+            # size, we can't build a valid STL (SpyreTensorLayout requires them
+            # to match). This happens when the input is read through a reshape
+            # view that changes rank. Skip it — it doesn't constrain the output.
+            if len(projected_dim_order) != len(c_in_size):
+                continue
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order
             )
@@ -659,7 +697,20 @@ def _multi_arg_pointwise_layouts(
             )
         )
     elif not stick_exprs:
-        _try_stick_dim(-1)
+        # No stick candidates from non-indirect inputs. When all inputs are
+        # indirect (e.g. a gather), the output itself is written densely — only
+        # the read is indirect. Try dense stick layouts on the output's own dims
+        # so downstream consumers can read it without needing a restickify.
+        # Fall back to the sparse (-1) layout if no dense dim works. When there
+        # are no indirect args at all, preserve the original sparse behavior.
+        if any(_is_indirect_arg(arg) for arg in args):
+            for alt_stick_dim in reversed(range(len(output.size))):
+                # TODO: support dims not divisible by stick_size via padding (#1756)
+                if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+                    continue
+                _try_stick_dim(alt_stick_dim)
+        if not results:
+            _try_stick_dim(-1)
     else:
         offset_free_stick_exprs = {
             e for e in stick_exprs if is_stick_expr_offset_free(e, stick_size)
@@ -687,7 +738,16 @@ def _multi_arg_pointwise_layouts(
             f"Multi-arg pointwise ({op.get_name()}): producing {len(results)} candidate output layouts."
         )
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
+    # Don't include gather sources in the restickify cost function — their
+    # layout is handled by the indirect-access path, not by a restickify.
+    # Index buffers are included as normal: they are read densely and can
+    # be restickified like any other input.
+    cost_args = [
+        arg
+        for arg in args
+        if not (isinstance(arg.dep, MemoryDep) and arg.dep.is_indirect())
+    ]
+    op.restick_cost_fn = AllSameNode.from_args(cost_args, results, output_dep, op)
     return results
 
 

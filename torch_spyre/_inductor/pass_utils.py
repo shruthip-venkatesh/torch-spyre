@@ -876,6 +876,10 @@ def compute_restickify_needed(
     """
     if op is not None and in_dep.name in indirect_index_dep_names(op):
         return False, None
+    # Tensors accessed via a runtime index (gather sources) have their stick
+    # alignment handled by the indirect-access hardware path — never restickify.
+    if in_dep.is_indirect():
+        return False, None
     idc = device_coordinates(in_stl, in_dep)
     out_idc = device_coordinates(out_stl, out_dep)
     assert idc, "device_coordinates returned empty list for input"

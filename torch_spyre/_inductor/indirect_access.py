@@ -116,18 +116,6 @@ def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
     return -1
 
 
-def _get_index_tensor_device_size_at(
-    index_arg: TensorArg,
-    stride_idx: int,
-) -> int | None:
-    """Return index_arg.device_size at the same stride position, or None if
-    out of range."""
-    pos = -stride_idx - 2
-    if abs(pos) <= len(index_arg.device_size):
-        return index_arg.device_size[pos]
-    return None
-
-
 def compute_indirect_max_dim_sizes(
     tensor_idx: int,
     dim: Symbol,
@@ -159,17 +147,17 @@ def compute_indirect_max_dim_sizes(
     if is_indirect_value_tensor(arg):
         if dim == stick_dim:
             return -1
-        index_arg = get_index_tensor_for_value(op_spec, arg)
-        if index_arg is None:
-            return -1
-        indirect_dims = get_indirect_dim_symbols(arg, index_arg, symbol_mapping)
-        if dim not in indirect_dims:
-            return -1
-        idx_size = _get_index_tensor_device_size_at(index_arg, stride_idx)
-        if idx_size is None:
-            return -1
-        if idx_size < original_dev_dim_size:
-            return 1
+        # Return 1 only for dimensions whose own coordinate is an IndirectAccess
+        # expression — i.e. the dimension that is literally looked up via the
+        # index buffer. Pass-through / data dims stay at -1.
+        #
+        # Using get_indirect_dim_symbols() here would be too broad: it flags any
+        # dim that shares a symbol with the index tensor
+        pos = -stride_idx - 2
+        if abs(pos) <= len(arg.device_coordinates):
+            dim_coord = arg.device_coordinates[pos]
+            if hasattr(dim_coord, "has") and dim_coord.has(IndirectAccess):
+                return 1
         return -1
 
     elif tensor_idx in index_tensor_indices:

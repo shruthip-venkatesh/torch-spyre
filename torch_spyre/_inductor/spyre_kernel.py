@@ -534,6 +534,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or arg.device_dtype == DataFormats.SEN169_FP16
+                or arg.device_dtype == DataFormats.IEEE_INT32
                 or (
                     op in SPYRE_FP8_OPS
                     and arg.device_dtype
@@ -718,7 +719,16 @@ class SpyreKernel(Kernel[CSEVariable]):
                 ]
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
-            if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
+            if self.indirect_vars:
+                # This is a gather — the value tensor is read via a runtime
+                # index, not by iterating over its dimensions directly. Its stick
+                # coordinate contains an index-buffer symbol (e.g. Mod(buf7, 64))
+                # whose free symbols differ from the output stick, which would
+                # make the comparison below incorrectly classify it as a
+                # restickify. Treat it as an identity; the index is passed
+                # separately in the op's index data structure.
+                op = IDENTITY_OP
+            elif all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
                 # Broadcast: scalar input expanding to non-scalar output.
                 op = IDENTITY_OP
             elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:

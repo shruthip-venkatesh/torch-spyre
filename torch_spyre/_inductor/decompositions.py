@@ -904,6 +904,90 @@ def spyre_quantize_fp8_with_scale(
     return torch.ops.spyre.qfp8ch(x_clamped)
 
 
+def _masked_scatter_impl(
+    self: torch.Tensor, mask: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    """Shared implementation for masked_scatter and masked_scatter_.
+
+    Spyre's gather hardware moves whole sticks at a time — the index selects a
+    row and the full 64-wide tile is copied unchanged. A direct `source[idx]`
+    would be a scalar gather (each output position pulls one value from a source
+    stick), which the hardware cannot express.
+
+    Instead we reshape the problem into a row gather:
+
+      1. cumsum(mask) - 1 assigns each element its 0-based position in source.
+         Masked-out positions get -1, clamped to 0 to stay in bounds (they are
+         discarded later by the where).
+      2. Expand every source scalar into a full row: source -> [num_true, STICK],
+         with all STICK columns holding the same value.
+      3. Gather whole rows: source_rows[idx] -> [numel, STICK]. The index only
+         addresses rows; the stick dimension is carried along unchanged — exactly
+         the row/stick gather the hardware supports.
+      4. Reduce the stick with amax. All columns are identical so the max is
+         lossless, and a stick-dim reduction is natively supported.
+      5. where(mask, gathered, self) writes gathered values at True positions.
+
+    Trade-off: ~STICK x memory bandwidth on the gather. Acceptable for typical
+    masked_scatter sizes.
+
+    Broadcasts `self` and `mask` to the same shape before operating,
+    matching upstream PyTorch semantics.
+    """
+    # fp16 stick width; sized for the default Spyre dtype this op runs in.
+    STICK = 64
+
+    self, mask = torch.broadcast_tensors(self, mask)
+    mask_flat = mask.reshape(-1)
+    # cumsum - 1 gives -1 for positions before the first True. Clamp to 0 so
+    # out-of-bounds indices don't crash the gather (those positions are thrown
+    # away by the final where anyway).
+    #
+    # We use maximum() instead of clamp(min=0) because clamp lowers to Spyre's
+    # `clip` op, which the scheduler cannot apply to integer indices and which
+    # silently caps at fp16-max (65504) — corrupting any index above that value.
+    # maximum() has no upper-bound side effect and keeps the tensor as integer.
+    src_idx = mask_flat.cumsum(0) - 1  # int64, -1 before the first True
+    idx_flat = torch.maximum(src_idx, torch.zeros_like(src_idx))
+
+    # Replicate each source value across a full stick (STICK copies), then
+    # gather whole rows. This way the gather index only selects rows and never
+    # touches the stick dimension directly.
+    #
+    # Use a broadcast-add instead of expand(...).contiguous() to build the rows.
+    # expand().contiguous() lowers to a ReStickifyOpHBM op that the hardware
+    # hangs on, so we avoid it.
+    #
+    # This relies on the layout pass keeping source_rows *untiled*
+    # (device shape [num_true, 1, STICK], stick on the embed dim). If the layout
+    # pass instead tiles the row dimension into chunks of 64, the gather can
+    # only reach the first 64 rows and silently returns garbage for the rest.
+    # See _multi_arg_pointwise_layouts: when the only stick candidate comes from
+    # a broadcast operand, the large data dimension must stay flat.
+    source_rows = source.reshape(-1, 1) + source.new_zeros(1, STICK)
+    gathered_rows = source_rows[idx_flat]  # [numel, STICK], rows = source[idx]
+
+    # Collapse the replicated stick (all lanes equal -> amax is exact).
+    gathered = gathered_rows.amax(dim=1).reshape(mask.shape)
+    return torch.where(mask, gathered, self)
+
+
+@register_spyre_decomposition([torch.ops.aten.masked_scatter.default])
+def spyre_masked_scatter(
+    self: torch.Tensor, mask: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    return _masked_scatter_impl(self, mask, source)
+
+
+@register_spyre_decomposition([torch.ops.aten.masked_scatter_.default])
+def spyre_masked_scatter_(
+    self: torch.Tensor, mask: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    result = _masked_scatter_impl(self, mask, source)
+    self.copy_(result)
+    return self
+
+
 ###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################
