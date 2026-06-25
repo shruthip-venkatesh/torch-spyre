@@ -128,7 +128,6 @@ class TestGather(IndirectAccessTestCase):
             for a in s.args:
                 self.assertIsInstance(a.device_dtype, DataFormats)
                 self.assertTrue(a.device_size, "device_size should be non-empty")
-                self.assertIsNotNone(a.stride_map, "stride_map should be populated")
                 self.assertEqual(len(a.device_coordinates), len(a.device_size))
         # TODO : Enable once e2e is available
         # run_e2e(self, lambda x, i: x[i].exp(), x, i)

@@ -73,7 +73,6 @@ def _tensor_arg(is_input, coords, name=None):
         device_size=[1, 128, 64],
         device_coordinates=coords,
         allocation={},
-        stride_map=[1, 1, 1],
         name=name,
     )
 
