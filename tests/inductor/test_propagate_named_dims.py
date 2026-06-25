@@ -773,7 +773,7 @@ def test_gather_advanced_indexing_2d():
         declarations={"M": _GM, "N": _GN, "P": _GP},
         annotations={x: ["M", "N"], i: ["P"]},
     )
-    assert "N" in result, f"inner data dim N should propagate; got {result}"
+    assert result == ["P", "N"], f"got {result}"
 
 
 def test_gather_advanced_indexing_with_exp():
@@ -791,7 +791,7 @@ def test_gather_advanced_indexing_with_exp():
         declarations={"M": _GM, "N": _GN, "P": _GP},
         annotations={x: ["M", "N"], i: ["P"]},
     )
-    assert "N" in result, f"inner data dim N should propagate; got {result}"
+    assert result == ["P", "N"], f"got {result}"
 
 
 def test_gather_3d_data():
@@ -809,9 +809,7 @@ def test_gather_3d_data():
         declarations={"A": _GA, "B": _GB, "C": _GC, "P": _GP},
         annotations={x: ["A", "B", "C"], i: ["P"]},
     )
-    assert {"B", "C"} <= set(result), (
-        f"inner data dims B,C should propagate; got {result}"
-    )
+    assert result == ["P", "B", "C"], f"got {result}"
 
 
 def test_index_select_2d():
@@ -828,4 +826,4 @@ def test_index_select_2d():
         declarations={"M": _GM, "N": _GN, "P": _GP},
         annotations={x: ["M", "N"], i: ["P"]},
     )
-    assert "N" in result, f"inner data dim N should propagate; got {result}"
+    assert result == ["P", "N"], f"got {result}"
