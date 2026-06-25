@@ -178,6 +178,15 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
         if len(loop_vars) == 1:
             # One loop var covers all fused names (e.g. a flat [A, B*D*E] read)
             result.setdefault(loop_vars[0], []).extend(names)
+        elif len(loop_vars) == 0:
+            # No loop var addresses this layout dim: it is selected by a
+            # data-dependent index (the gather/scatter index symbol, e.g.
+            # `tmp0`), not iterated by this dep.  The named dim belongs to
+            # the index, not the iteration space, so consume it and move on --
+            # there is no loop var to attach it to.  Without this, an indirect
+            # access falls into the size-1-fusion guard below and wrongly
+            # raises Unsupported.
+            continue
         elif len(loop_vars) > len(names):
             # More loop vars than named dims: a single named dim was split by reshape.
             raise Unsupported(
