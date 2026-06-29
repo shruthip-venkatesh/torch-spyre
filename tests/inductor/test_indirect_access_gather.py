@@ -24,12 +24,11 @@ capture-based tests via bundle_jsons_from_captured) validate the indirect-access
 encoding of the produced bundle, not just that op specs were generated.
 
 There is one test per scenario -- no separate e2e variants. Each scenario
-validates the capture path and then runs the kernel on the real backend,
-validating the result and warning that the device values diverge from the CPU
-reference (the backend does not yet implement indirect gather). Scenarios route
-their compile through _stage_and_e2e (stage check + e2e run); capture-based
-tests call run_e2e directly after their own assertions. The three structural
-tests (sdsc_fields, sdsc_handoff, python_bundle_generation) stay capture-only.
+validates the capture path. Scenarios route their compile through
+_stage_and_e2e; the e2e run is not yet wired up (TODO: enable once the backend
+supports indirect access). Capture-based tests call run_e2e directly after
+their own assertions. The three structural tests (sdsc_fields, sdsc_handoff,
+python_bundle_generation) stay capture-only.
 
 """
 
@@ -40,7 +39,7 @@ from unittest.mock import patch
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
-from indirect_access_common import (  # noqa: E402
+from test_indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     GATHER_OP_SPEC,
     NO_SPYRE_OP,

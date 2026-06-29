@@ -220,8 +220,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_indirect_access_gather_config.yaml
           - name: Indirect Access Scatter
             config: torch_spyre_tests/inductor/test_indirect_access_scatter_config.yaml
-          - name: Indirect Access Internals
-            config: torch_spyre_tests/inductor/test_indirect_access_internals_config.yaml
+          - name: Indirect Access Common
+            config: torch_spyre_tests/inductor/test_indirect_access_common_config.yaml
           # ---- Tensor tests ----
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
