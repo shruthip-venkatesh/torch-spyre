@@ -23,6 +23,8 @@ Every gather scenario now carries through to SDSC generation: check() (and the
 capture-based tests via bundle_jsons_from_captured) validate the indirect-access
 encoding of the produced bundle, not just that op specs were generated.
 
+All gather scenarios run with SENCORES=1.
+
 There is one test per scenario -- no separate e2e variants. Each scenario
 validates the capture path and then runs the kernel on the real backend,
 validating the result and warning that the device values diverge from the CPU
@@ -60,10 +62,12 @@ from indirect_access_common import (  # noqa: E402
 )
 
 from torch_spyre._C import DataFormats  # noqa: E402
+from torch_spyre._inductor import config  # noqa: E402
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
 
 
+@config.patch({"sencores": 1})
 class TestGather(IndirectAccessTestCase):
     """torch gather-family ops: one compile + all-stage checks per scenario."""
 

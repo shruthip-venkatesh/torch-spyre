@@ -17,9 +17,9 @@
 This file isn't named test_* so pytest won't run it directly. The test files
 import helpers from here, organized one file per op family:
 
-  * test_gather.py             -- gather ops (x[i], index_select, torch.gather)
-  * test_scatter.py            -- scatter ops (out[i]=src, scatter_, index_copy)
-  * test_indirect_internals.py -- device-free unit tests for the harness/helpers
+  * test_indirect_access_gather.py    -- gather ops (x[i], index_select, torch.gather)
+  * test_indirect_access_scatter.py   -- scatter ops (out[i]=src, scatter_, index_copy)
+  * test_indirect_access_internals.py -- device-free unit tests for the harness/helpers
 
 How it works: each scenario compiles once and is checked across every stage --
 detection, OpSpec structure, SDSC fields -- in one place, via run_scenario
@@ -48,7 +48,11 @@ reaches this path today; the name is generic so scatter can reuse it later.
 
 import contextlib
 import dataclasses
+import glob
+import json
 import math
+import os
+import tempfile
 from subprocess import CalledProcessError
 from unittest.mock import patch
 
@@ -287,10 +291,6 @@ def generate_sdsc_jsons(kernel, *dev_args) -> dict:
     bundled into its own subdirectory so per-kernel sdsc_N.json files never
     collide. Raises if compilation fails before reaching sdsc (e.g. scatter,
     which crashes in work division first)."""
-    import glob
-    import json
-    import os
-    import tempfile
 
     from torch_spyre._inductor.codegen.bundle import generate_bundle
 
@@ -477,10 +477,6 @@ def bundle_jsons_from_captured(captured) -> dict:
     the captured spec lists and it returns the parsed `sdsc_*.json` bundle so
     the indirect-access fields can be asserted (see
     `IndirectAccessTestCase.assert_indirect_sdsc_fields`)."""
-    import glob
-    import json
-    import os
-    import tempfile
 
     from torch_spyre._inductor.codegen.bundle import generate_bundle
 
@@ -665,20 +661,18 @@ class IndirectAccessTestCase(InductorTestCase):
     def _stage_and_e2e(
         self, kernel, *dev_args, expect, op=None, detected=None, expect_close=None
     ):
-        """Validate every capture-path stage with check(), then run the kernel
-        end-to-end and validate the result against the CPU reference.
+        """Validate every capture-path stage with check(), then run end-to-end.
 
-        Shared by the gather and scatter op-family tests. The e2e run always
-        happens (real backend: dxp_standalone + on-device launch); run_e2e
-        reports an expected failure (pytest.xfail) on the divergence/abort the
-        backend currently produces for indirect access, while the capture-path
-        checks above stay strict. Pass expect_close=True for ops whose result
-        must match (e.g. a supported direct op).
+        Shared by the gather and scatter op-family tests. Currently only the
+        capture-path stages run; the e2e leg (real backend: dxp_standalone +
+        on-device launch via run_e2e) is wired up but disabled until e2e
+        support lands. Pass expect_close=True for ops whose result must match
+        the CPU reference (e.g. a supported direct op) once e2e is enabled.
 
         Returns check()'s ScenarioResult for any further per-test assertions.
         """
         r = self.check(kernel, *dev_args, expect=expect, op=op, detected=detected)
-        # TODO : Enable once e2e is available
+        # TODO: Enable once e2e is available; expect_close is reserved for that path.
         # run_e2e(self, kernel, *dev_args, expect_close=expect_close)
         return r
 

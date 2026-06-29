@@ -15,7 +15,7 @@
 """Device-free unit tests for the indirect-access harness and helpers.
 
 These need no compilation, no Spyre device -- they exercise the primitives the
-op-family tests (test_gather.py / test_scatter.py) are built on:
+op-family tests (test_indirect_access_gather.py / test_indirect_access_scatter.py) are built on:
 
   * the IndirectAccess sympy atom,
   * the detection helpers on synthetic OpSpecs,
