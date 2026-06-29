@@ -39,7 +39,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_indirect_access_common import (  # noqa: E402
+from indirect_access_common import (  # noqa: E402
     CRASHED,
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
