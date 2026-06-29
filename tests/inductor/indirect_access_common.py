@@ -512,7 +512,7 @@ class ScenarioResult:
     label: str  # classification outcome (GATHER_OP_SPEC, CRASHED, ...)
     op_specs: list  # real OpSpecs handed to sdsc
     entries: list  # OpSpec + UnimplementedOp leaves
-    detected_index_names: set  # union of indirect_index_dep_names results
+    detected_index_names: set  # union of indirect_info_from_op name results
     sdsc_jsons: dict  # SDSC json built from the captured op specs
     exc: Exception | None  # exception if compilation raised
 
@@ -520,7 +520,7 @@ class ScenarioResult:
 def run_scenario(kernel, *dev_args, build_sdsc: bool = True) -> ScenarioResult:
     """Compile a kernel once and gather evidence from every stage:
 
-      * detection   -- what indirect_index_dep_names flagged during layout
+      * detection   -- what indirect_info_from_op flagged during layout
                        propagation
       * op specs    -- captured at the sdsc handoff (never reaches the backend)
       * label       -- the classification outcome
@@ -531,16 +531,16 @@ def run_scenario(kernel, *dev_args, build_sdsc: bool = True) -> ScenarioResult:
     import torch_spyre._inductor.propagate_layouts as _pl
 
     seen: list[set] = []
-    real = _pl.indirect_index_dep_names
+    real = _pl.indirect_info_from_op
 
     def _spy(op):
-        names = real(op)
+        names, access_subs, sizes = real(op)
         seen.append(set(names))
-        return names
+        return names, access_subs, sizes
 
     exc: Exception | None = None
     with (
-        patch.object(_pl, "indirect_index_dep_names", _spy),
+        patch.object(_pl, "indirect_info_from_op", _spy),
         capture_op_specs() as captured,
     ):
         try:

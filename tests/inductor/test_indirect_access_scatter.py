@@ -115,7 +115,7 @@ class TestScatter(IndirectAccessTestCase):
     def test_scatter_with_exp(self):
         """y.scatter_(0, index, src.exp()) -- fused unary, exp runs on Spyre.
 
-        Also pins the detection gap: indirect_index_dep_names flags gather
+        Also pins the detection gap: indirect_info_from_op flags gather
         loads but not scatter stores (the output is recognized later in
         superdsc via is_output_tensor), so detected=False here.
         """

@@ -35,7 +35,6 @@ tests (sdsc_fields, sdsc_handoff, python_bundle_generation) stay capture-only.
 
 import os
 import sys
-import unittest
 from unittest.mock import patch
 
 import torch
@@ -425,7 +424,6 @@ class TestGather(IndirectAccessTestCase):
         self.name_dims(slot_idxs, {"B": B, "Lk": Lk})
         self._stage_and_e2e(lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC)
 
-    @unittest.skip
     def test_gather_after_reshape(self):
         """x.reshape(12, 256)[i] -- gather on a reshaped tensor."""
         x = pinned_to_spyre(torch.rand(3, 1024, dtype=torch.float16))
@@ -436,7 +434,6 @@ class TestGather(IndirectAccessTestCase):
             lambda x, i: x.reshape(12, 256)[i], x, i, expect=GATHER_OP_SPEC
         )
 
-    @unittest.skip
     def test_gather_after_reshape_1d(self):
         """t.reshape(16, 256)[idx] -- gather on a 1D tensor reshaped to 2D (page table)."""
         t = pinned_to_spyre(torch.arange(4096, dtype=torch.float16))
