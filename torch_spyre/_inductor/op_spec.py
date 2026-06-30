@@ -18,9 +18,23 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Sequence
 
-from sympy import Symbol, Expr
+from sympy import Symbol, Expr, Function
 from torch_spyre._C import DataFormats
 import torch
+
+
+class IndirectAccess(Function):
+    """Sympy function: IndirectAccess(tensor_name) — runtime index read from that tensor at the current iteration point.
+
+    Used in TensorArg.device_coordinates to encode indirect access: as a coordinate of an
+    input arg (gather) or an output arg (scatter).
+    IndexedBase was not used because sympify('arg1_1[i]') fails: the parser reconstructs
+    arg1_1 as a Symbol, and Symbol.__getitem__ raises TypeError.
+    """
+
+    @classmethod
+    def eval(cls, name):  # noqa: ARG003
+        return None  # keep unevaluated
 
 
 @dataclasses.dataclass
@@ -44,8 +58,8 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
-    stride_map: list[int] | None = None
     per_tile_fixed: bool = False
+    name: str | None = None
 
 
 @dataclasses.dataclass
@@ -71,6 +85,12 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[Symbol] = dataclasses.field(default_factory=list)
+    # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
+    # Populated by compute_symbolic_bounds during
+    # create_op_spec; empty for concrete dims.
+    symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
