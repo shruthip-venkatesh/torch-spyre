@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Union
 import torch
 from pydantic import BaseModel, field_validator, model_validator  # type: ignore
 
-from oot_test_constants import (
+from .oot_test_constants import (
     _VALID_DTYPE_STRINGS,
     _VALID_INIT_STRATEGIES,
     _VALID_TEST_MODES,
@@ -23,8 +23,8 @@ from oot_test_constants import (
     MODE_XFAIL,
     REL_PATH_TOKENS,
 )
-from oot_test_matching import parse_dtype
-from oot_test_utilities import (
+from .oot_test_matching import parse_dtype
+from .oot_test_utilities import (
     _eval_py_literal,
     _resolve_dtype_str,
     _resolve_tensor_path,
@@ -736,6 +736,7 @@ class TestEntry(BaseModel):
     names: List[str]
     mode: str = MODE_MANDATORY_SUCCESS
     tags: List[str] = []
+    labels: List[str] = []
     edits: TestEdits = TestEdits()
 
     @field_validator("names", mode="before")
@@ -1008,10 +1009,11 @@ class GlobalConfig(BaseModel):
 
 
 class TestsBlock(BaseModel):
-    """Holds the inner YAML keys: files and global."""
+    """Holds the inner YAML keys: files, global, and suite-level metadata."""
 
     files: List[FileEntry]
     global_config: GlobalConfig = GlobalConfig()
+    labels: List[str] = ["full"]
 
     @model_validator(mode="before")
     @classmethod
