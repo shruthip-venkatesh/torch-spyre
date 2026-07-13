@@ -182,19 +182,19 @@ def compute_indirect_max_dim_sizes(
     if is_indirect_value_tensor(arg):
         if dim == stick_dim:
             return -1
-        index_arg = get_index_tensor_for_value(op_spec, arg)
-        if index_arg is None:
-            return -1
-        indirect_dims = get_indirect_dim_symbols(arg, index_arg, symbol_mapping)
-        if dim not in indirect_dims:
-            return -1
-        idx_size = _get_index_tensor_device_size_at(index_arg, stride_idx)
-        if idx_size is None:
-            return -1
-        active_dims = _get_index_active_dims_for_value(index_arg, symbol_mapping)
-        if len(active_dims) > 1 and dim != active_dims[-1]:
-            return idx_size
-        return 1
+        # Mark only the dimension that is *itself* addressed indirectly -- i.e.
+        # this dim's own coordinate is an IndirectAccess expression. Data /
+        # pass-through dims (coordinate is a plain iteration variable) stay -1.
+        #
+        # Checking membership in get_indirect_dim_symbols() instead would flag
+        # every dim whose symbol appears anywhere in the index tensor, which
+        # over-marks (e.g. it set both `out` and `mb` to 1 for masked_scatter).
+        pos = -stride_idx - 2
+        if abs(pos) <= len(arg.device_coordinates):
+            dim_coord = arg.device_coordinates[pos]
+            if hasattr(dim_coord, "has") and dim_coord.has(IndirectAccess):
+                return 1
+        return -1
 
     elif tensor_idx in index_tensor_indices:
         return -1

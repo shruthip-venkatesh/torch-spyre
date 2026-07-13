@@ -261,33 +261,6 @@ def _get_device_dim_order(
         for sym in expr.free_symbols:
             if sym not in dim_order:
                 dim_order.append(sym)
-
-    # For indirect-access tensors (e.g. a row gather), the last coordinate
-    # contains an index-buffer symbol like `buf18` rather than a real layout
-    # dimension. If we use that as stick_dim, the emitted descriptor has
-    # stickDimOrder_=['buf18'] while layoutDimOrder_ has no entry for it, and
-    # dxp_standalone crashes with dimMap.at('buf18').
-    #
-    # Fix: walk the device coordinates in reverse and use the first one that is
-    # *not* indirect as stick_dim. This picks the source tensor's own embed/stick
-    # dimension, which is always present in layoutDimOrder_.
-    if (
-        op_spec is not None
-        and is_indirect_value_tensor(arg)
-        and hasattr(last_coord, "has")
-        and last_coord.has(IndirectAccess)
-    ):
-        for coord in reversed(arg.device_coordinates):
-            c = coord.subs(symbol_mapping) if hasattr(coord, "subs") else coord
-            if hasattr(c, "has") and c.has(IndirectAccess):
-                continue
-            free_syms = (
-                sorted(c.free_symbols, key=str) if hasattr(c, "free_symbols") else []
-            )
-            if free_syms:
-                stick_dim = free_syms[0]
-                break
-
     return dim_order, stick_dim
 
 
@@ -405,21 +378,24 @@ def _collect_index_tensor_layouts(
 
 
 def _wrap_bare_index_symbols(op_spec: OpSpec) -> None:
-    """Ensure every index-buffer reference in device_coordinates is wrapped as
-    IndirectAccess(name) rather than a bare Symbol(name).
+    """Rewrite bare index-buffer symbols in coordinates as IndirectAccess nodes.
 
-    Some codegen paths (e.g. when the index is split across a stick boundary as
-    floor(idx/64) and Mod(idx, 64)) leave the reference as a plain symbol. All
-    downstream detection helpers (is_index_tensor, is_indirect_value_tensor) and
-    the layout logic look for IndirectAccess nodes specifically, so we normalise
-    before any of that runs.
+    A gather encodes the indirect read by referencing the index buffer inside the
+    value tensor's coordinates. The canonical encoding is IndirectAccess(name),
+    but some codegen paths leave it as a bare Symbol(name) (e.g. when the index
+    is split across the stick boundary as floor(name/stick), Mod(name, stick)).
+    Detection (is_index_tensor / is_indirect_value_tensor) and the downstream
+    layout logic only recognize IndirectAccess atoms, so normalize here.
 
-    A symbol is only wrapped when its name matches another arg's name — this
-    ensures real iteration variables like c0, mb, out, z0 are never touched.
-    Mutates op_spec.args in place.
+    A coordinate symbol is treated as an index reference only when its name
+    matches some *other* arg's name (i.e. it names a sibling buffer), so genuine
+    iteration variables (c0, mb, out, z0, ...) are never wrapped. Mutates
+    op_spec.args in place.
     """
     arg_names = {
-        getattr(arg, "name", None) for arg in op_spec.args if getattr(arg, "name", None)
+        getattr(arg, "name", None)
+        for arg in op_spec.args
+        if getattr(arg, "name", None)
     }
     if not arg_names:
         return
@@ -457,9 +433,12 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
-    # Make sure all index-buffer references in device_coordinates use the
-    # IndirectAccess wrapper before any detection or layout logic runs.
-    # See _wrap_bare_index_symbols for details.
+    # Normalize indirect access: some gather codegen paths leave the index buffer
+    # referenced as a bare Symbol(name) inside another tensor's coordinates (e.g.
+    # floor(buf7/64), Mod(buf7, 64)) instead of IndirectAccess(name). The indirect
+    # detection and the downstream layout logic all key off IndirectAccess nodes,
+    # so wrap any bare symbol whose name matches another arg's name. This is the
+    # canonical form (also what indirect_access_subs_from_kernel produces).
     _wrap_bare_index_symbols(op_spec)
 
     # Detect indirect access from device_coordinates: index tensors are those
@@ -535,10 +514,14 @@ def _create_sdsc_tensors(
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
             dev_dim_size = arg.device_size[-stride_idx - 2]
-            # Indirect-access dims are keyed by the index buffer name (e.g. buf7),
-            # not by an iteration variable, so they are absent from iteration_space.
-            # Fall back to dev_dim_size for those dims — the value is only used
-            # by the offset check further below, which skips indirect coords anyway.
+            # The indirect-access dim of a gather (e.g. `buf7`, an IndirectAccess
+            # into the source) is keyed by the index buffer name, not by an
+            # iteration variable, so it is absent from iteration_space. When the
+            # dim is the (indirectly-addressed) stick, the stick formula below
+            # rebuilds it_dim_size to a full stick; otherwise it_dim_size is only
+            # consumed under the `not IndirectAccess` guard at the offset check,
+            # which is false for an indirect coord. Defaulting to dev_dim_size is
+            # therefore a no-op for non-indirect uses.
             it_dim_size = iteration_space.get(dim, dev_dim_size)
             if dim == stick_dim:
                 stick_size = arg.device_dtype.elems_per_stick()
@@ -576,6 +559,23 @@ def _create_sdsc_tensors(
             max_dim_sizes[mb_sym] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
+        # 1D-source gather: the value tensor's stick coordinate is
+        # Mod(IndirectAccess(idx), N), so its stick resolves to the index buffer
+        # name rather than an iteration dim. Emitting that as the layout's
+        # stickDimOrder makes it inconsistent with layoutDimOrder -- DeepTools
+        # builds a dim map from layoutDimOrder and does map.at(stickDimOrder),
+        # aborting (std::out_of_range) on the unknown index-buffer symbol.
+        # Re-anchor the layout stick to the tensor's last real iteration dim.
+        # This only rewrites the layout label; the raw stick_dim used above for
+        # maxDimSizes / the dim==stick_dim checks is unchanged, so the indirect
+        # addressing (maxDimSize=1 on the value dim) is preserved.
+        if (
+            has_indirect_access
+            and effective_stick is not None
+            and effective_stick not in dim_order
+            and dim_order
+        ):
+            effective_stick = dim_order[-1]
         layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
 
         if has_indirect_access:

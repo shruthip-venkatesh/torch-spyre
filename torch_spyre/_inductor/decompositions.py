@@ -940,6 +940,52 @@ def where_scalar_self_decomp(condition, self, other):
     return torch.ops.aten.where.self(condition, self_t, other)
 
 
+@register_spyre_decomposition([torch.ops.aten.masked_scatter.default])
+def spyre_masked_scatter(
+    self: torch.Tensor,
+    mask: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """Decomposition of ``aten.masked_scatter`` tuned for Spyre's gather codegen.
+
+    The upstream Inductor decomposition (enabled via
+    ``BackendFeature.MASKED_SCATTER_WITH_INDEX``) does a 1D ``where`` that reads
+    ``self`` flattened from ND, then ``view``s back to ND. That 1D op reading an
+    ND buffer breaks Spyre's rank-sensitive layout/scheduling passes.
+
+    Two shape facts drive this form:
+
+    * The ``where`` is kept in the native ND shape, so every pointwise input is
+      rank-aligned with the output (no 1D-op-over-ND-buffer).
+    * The gather is kept **1D**: a 1D index into a 1D source producing a 1D
+      result. Spyre's SDSC indirect-access codegen models the index as a single
+      indexing dimension ("mb"); a multi-dim index over a 1D source would not
+      map onto the source's device layout. The 1D gather output is then
+      ``reshape``d up to ND -- a view whose rank matches the consuming ``where``.
+
+    The flat ``cumsum`` (each element's position in ``source`` = prefix-count of
+    True mask entries minus one) runs on the ``cumsum`` CPU-fallback boundary.
+    ``masked_scatter`` semantics follow the broadcasted shape of ``self`` and
+    ``mask`` (matching upstream).
+    """
+    self, mask = torch.broadcast_tensors(self, mask)
+    mask_flat = mask.reshape(-1)
+    # 1D index into source: each True lane reads source[cumsum-1]. Lanes before
+    # the first True have cumsum-1 == -1 (out of bounds). Rather than clamp them
+    # (Spyre has no usable ``clip`` op mapping: int32 clip is rejected by
+    # DeepTools, fp16 cannot hold indices above 2048), zero out every
+    # non-selected lane by multiplying by the mask.
+    # False lanes then read index 0 (in bounds, and discarded by the where);
+    # True lanes keep their real index. The arithmetic is done in fp32 -- Spyre
+    # supports sub/mul there but not on int32, and fp16 loses large indices --
+    # then cast to int only for the gather.
+    pos = mask_flat.cumsum(0).to(torch.float32) - 1.0
+    idx_flat = (pos * mask_flat.to(torch.float32)).to(torch.int64)
+    # 1D gather (1D index, 1D source), then reshape the result up to ND.
+    gathered = source.reshape(-1)[idx_flat].reshape(mask.shape)
+    return torch.where(mask, gathered, self)
+
+
 @register_spyre_decomposition([torch.ops.aten.where.Scalar])
 def where_scalar_decomp(condition, self, other):
     # Must use dtype float16 for spyre backend where3
@@ -970,90 +1016,6 @@ def spyre_quantize_fp8_with_scale(
     x_scaled = input * inv_scale
     x_clamped = torch.ops.spyre.clamp(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX)
     return torch.ops.spyre.qfp8ch(x_clamped)
-
-
-def _masked_scatter_impl(
-    self: torch.Tensor, mask: torch.Tensor, source: torch.Tensor
-) -> torch.Tensor:
-    """Shared implementation for masked_scatter and masked_scatter_.
-
-    Spyre's gather hardware moves whole sticks at a time — the index selects a
-    row and the full 64-wide tile is copied unchanged. A direct `source[idx]`
-    would be a scalar gather (each output position pulls one value from a source
-    stick), which the hardware cannot express.
-
-    Instead we reshape the problem into a row gather:
-
-      1. cumsum(mask) - 1 assigns each element its 0-based position in source.
-         Masked-out positions get -1, clamped to 0 to stay in bounds (they are
-         discarded later by the where).
-      2. Expand every source scalar into a full row: source -> [num_true, STICK],
-         with all STICK columns holding the same value.
-      3. Gather whole rows: source_rows[idx] -> [numel, STICK]. The index only
-         addresses rows; the stick dimension is carried along unchanged — exactly
-         the row/stick gather the hardware supports.
-      4. Reduce the stick with amax. All columns are identical so the max is
-         lossless, and a stick-dim reduction is natively supported.
-      5. where(mask, gathered, self) writes gathered values at True positions.
-
-    Trade-off: ~STICK x memory bandwidth on the gather. Acceptable for typical
-    masked_scatter sizes.
-
-    Broadcasts `self` and `mask` to the same shape before operating,
-    matching upstream PyTorch semantics.
-    """
-    # fp16 stick width; sized for the default Spyre dtype this op runs in.
-    STICK = 64
-
-    self, mask = torch.broadcast_tensors(self, mask)
-    mask_flat = mask.reshape(-1)
-    # cumsum - 1 gives -1 for positions before the first True. Clamp to 0 so
-    # out-of-bounds indices don't crash the gather (those positions are thrown
-    # away by the final where anyway).
-    #
-    # We use maximum() instead of clamp(min=0) because clamp lowers to Spyre's
-    # `clip` op, which the scheduler cannot apply to integer indices and which
-    # silently caps at fp16-max (65504) — corrupting any index above that value.
-    # maximum() has no upper-bound side effect and keeps the tensor as integer.
-    src_idx = mask_flat.cumsum(0) - 1  # int64, -1 before the first True
-    idx_flat = torch.maximum(src_idx, torch.zeros_like(src_idx))
-
-    # Replicate each source value across a full stick (STICK copies), then
-    # gather whole rows. This way the gather index only selects rows and never
-    # touches the stick dimension directly.
-    #
-    # Use a broadcast-add instead of expand(...).contiguous() to build the rows.
-    # expand().contiguous() lowers to a ReStickifyOpHBM op that the hardware
-    # hangs on, so we avoid it.
-    #
-    # This relies on the layout pass keeping source_rows *untiled*
-    # (device shape [num_true, 1, STICK], stick on the embed dim). If the layout
-    # pass instead tiles the row dimension into chunks of 64, the gather can
-    # only reach the first 64 rows and silently returns garbage for the rest.
-    # See _multi_arg_pointwise_layouts: when the only stick candidate comes from
-    # a broadcast operand, the large data dimension must stay flat.
-    source_rows = source.reshape(-1, 1) + source.new_zeros(1, STICK)
-    gathered_rows = source_rows[idx_flat]  # [numel, STICK], rows = source[idx]
-
-    # Collapse the replicated stick (all lanes equal -> amax is exact).
-    gathered = gathered_rows.amax(dim=1).reshape(mask.shape)
-    return torch.where(mask, gathered, self)
-
-
-@register_spyre_decomposition([torch.ops.aten.masked_scatter.default])
-def spyre_masked_scatter(
-    self: torch.Tensor, mask: torch.Tensor, source: torch.Tensor
-) -> torch.Tensor:
-    return _masked_scatter_impl(self, mask, source)
-
-
-@register_spyre_decomposition([torch.ops.aten.masked_scatter_.default])
-def spyre_masked_scatter_(
-    self: torch.Tensor, mask: torch.Tensor, source: torch.Tensor
-) -> torch.Tensor:
-    result = _masked_scatter_impl(self, mask, source)
-    self.copy_(result)
-    return self
 
 
 @register_spyre_decomposition([torch.ops.aten.prod.dim_int])

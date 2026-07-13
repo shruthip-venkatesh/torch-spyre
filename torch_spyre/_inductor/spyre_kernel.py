@@ -554,12 +554,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                 or DtypeOpTable.is_dtype_op(op)
                 or (op in SPYRE_FP32_OPS and arg.device_dtype == DataFormats.IEEE_FP32)
                 or arg.device_dtype == DataFormats.SEN169_FP16
-                or arg.device_dtype == DataFormats.IEEE_INT32
                 or (
                     op in SPYRE_FP8_OPS
                     and arg.device_dtype
                     in [DataFormats.SEN143_FP8, DataFormats.SEN152_FP8]
                 )
+                or arg.device_dtype == DataFormats.IEEE_INT32
             ):
                 raise Unsupported(f"{op} on {arg.device_dtype}")
 
@@ -816,8 +816,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
             if self.indirect_vars:
-                # This is a gather — the value tensor is read via a runtime
-                # index, not by iterating over its dimensions directly. Its stick
+                # Gather: a data-dependent (indirect) read into the value tensor
+                # is an identity copy, not a restickify. The value tensor's stick
                 # coordinate contains an index-buffer symbol (e.g. Mod(buf7, 64))
                 # whose free symbols differ from the output stick, which would
                 # make the comparison below incorrectly classify it as a
