@@ -87,18 +87,23 @@ def get_indirect_stride_idx(arg: TensorArg) -> int | None:
 
 def get_indirect_dim_symbols(
     value_arg: TensorArg, index_arg: TensorArg, symbol_mapping: dict
-) -> set[Symbol]:
-    """Extract all free symbols from the index tensor's device coordinates.
+) -> list[Symbol]:
+    """Extract free symbols from the index tensor's device coordinates.
 
-    Returns the set of symbols that should be in the value tensor's dim_order
-    for the indirect dimension.
+    Iterates right-to-left through coordinates (excluding stick), collecting
+    free symbols in the order they appear.
     """
-    all_symbols: set[Symbol] = set()
-    for coord in index_arg.device_coordinates:
+    seen: set[Symbol] = set()
+    ordered: list[Symbol] = []
+    for i in range(len(index_arg.device_coordinates) - 2, -1, -1):
+        coord = index_arg.device_coordinates[i]
         if hasattr(coord, "free_symbols"):
             expr = coord.subs(symbol_mapping)
-            all_symbols.update(expr.free_symbols)
-    return all_symbols
+            for sym in expr.free_symbols:
+                if sym not in seen:
+                    seen.add(sym)
+                    ordered.append(sym)
+    return ordered
 
 
 def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
@@ -114,6 +119,35 @@ def get_value_tensor_idx_for_index(op_spec: OpSpec, index_arg_idx: int) -> int:
         if index_name in get_index_load_names(arg):
             return j
     return -1
+
+
+def _get_index_tensor_device_size_at(
+    index_arg: TensorArg,
+    stride_idx: int,
+) -> int | None:
+    """Return index_arg.device_size at the same stride position, or None if
+    out of range."""
+    pos = -stride_idx - 2
+    if abs(pos) <= len(index_arg.device_size):
+        return index_arg.device_size[pos]
+    return None
+
+
+def _get_index_active_dims_for_value(
+    index_arg: "TensorArg",
+    symbol_mapping: dict,
+) -> list[Symbol]:
+    """Return the ordered list of free symbols (active dims) in index_arg's coords."""
+    seen: set[Symbol] = set()
+    active: list[Symbol] = []
+    for coord in index_arg.device_coordinates:
+        if not hasattr(coord, "free_symbols"):
+            continue
+        for sym in coord.subs(symbol_mapping).free_symbols:
+            if sym not in seen:
+                seen.add(sym)
+                active.append(sym)
+    return active
 
 
 def compute_indirect_max_dim_sizes(
@@ -133,8 +167,9 @@ def compute_indirect_max_dim_sizes(
     Value tensor:
       - stick dim → -1 (always dynamic)
       - dimension not in index tensor → -1 (data dimension, full range)
-      - dimension in index tensor, same size as value → -1 (dynamic)
-      - dimension in index tensor, index smaller → 1 (indirect dimension)
+      - dimension in index tensor, multi-dim index, not the last active dim →
+        idx_size (bounded by the index tensor's size along that axis)
+      - dimension in index tensor, last (or only) active dim → 1 (indirect)
 
     Index tensor:
       - always -1
@@ -147,18 +182,19 @@ def compute_indirect_max_dim_sizes(
     if is_indirect_value_tensor(arg):
         if dim == stick_dim:
             return -1
-        # Return 1 only for dimensions whose own coordinate is an IndirectAccess
-        # expression — i.e. the dimension that is literally looked up via the
-        # index buffer. Pass-through / data dims stay at -1.
-        #
-        # Using get_indirect_dim_symbols() here would be too broad: it flags any
-        # dim that shares a symbol with the index tensor
-        pos = -stride_idx - 2
-        if abs(pos) <= len(arg.device_coordinates):
-            dim_coord = arg.device_coordinates[pos]
-            if hasattr(dim_coord, "has") and dim_coord.has(IndirectAccess):
-                return 1
-        return -1
+        index_arg = get_index_tensor_for_value(op_spec, arg)
+        if index_arg is None:
+            return -1
+        indirect_dims = get_indirect_dim_symbols(arg, index_arg, symbol_mapping)
+        if dim not in indirect_dims:
+            return -1
+        idx_size = _get_index_tensor_device_size_at(index_arg, stride_idx)
+        if idx_size is None:
+            return -1
+        active_dims = _get_index_active_dims_for_value(index_arg, symbol_mapping)
+        if len(active_dims) > 1 and dim != active_dims[-1]:
+            return idx_size
+        return 1
 
     elif tensor_idx in index_tensor_indices:
         return -1
