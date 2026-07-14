@@ -565,6 +565,13 @@ def _create_sdsc_tensors(
                 arg_index=arg.arg_index,
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
+                # shared_base is True for:
+                #   gather  — the value table input (its row dim carries IndirectAccess
+                #             in device_coords, so is_indirect_value_tensor returns True)
+                #   scatter — the destination output (work_division._build_output_td
+                #             injects IndirectAccess into its coords, so
+                #             is_indirect_value_tensor also returns True here, keeping
+                #             the destination at a shared base address across all cores)
                 shared_base=has_indirect_access and is_indirect_value_tensor(arg),
             )
         )

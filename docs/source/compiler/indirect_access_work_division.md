@@ -275,6 +275,8 @@ spatial (non-stick) index dimension splits directly. A small index (the scatter
 
 ## Validation
 
+### Gather / scatter multicore scenarios
+
 `examples/gather_multicore_exp.py` (gather) and `examples/scatter_multicore_exp.py`
 (scatter) each run three scenarios at the shapes above, isolating one behavior by
 changing only the table contents:
@@ -292,6 +294,30 @@ always correct and hides the data-dim defect; `column_addressing` and
 ```bash
 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/gather_multicore_exp.py
 TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/scatter_multicore_exp.py
+```
+
+### Paged-attention examples
+
+Two additional examples demonstrate indirect access in the paged-attention pattern
+that motivated this feature:
+
+* **`examples/paged_attention_compute.py`** — 1-D indirect access: a single
+  gather reads KV-cache rows selected by a 1-D slot-index tensor. Runs the CPU
+  reference and the Spyre compiled path side-by-side and validates the outputs.
+
+* **`examples/paged_attention_kernel.py`** — full paged attention with combined
+  gather (KV read) and scatter (KV write): populates a paged KV cache with
+  scatter (`cache[slot_ids] = new_kv`), reads it back with gather
+  (`kv = cache[slot_ids]`), and runs the attention computation. Validates each
+  stage against the CPU reference.
+
+Note: these workloads have a small block-table index and wide KV rows, so they
+exercise the correctness fix but typically run on 1–2 cores (see
+[Limitations](#limitations-and-future-work)).
+
+```bash
+TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=8 python examples/paged_attention_compute.py
+TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=8 python examples/paged_attention_kernel.py
 ```
 
 ## Limitations and future work
@@ -331,7 +357,9 @@ TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 SENCORES=32 python examples/scatter_multico
 | `_inductor/codegen/superdsc.py` | `SDSCArgs.shared_base`, set for any `IndirectAccess`-carrying tensor (gather value, scatter destination) |
 | `_inductor/codegen/compute_ops.py` | `core_idx_to_slice_offset` honours `shared_base` |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
-| `examples/gather_multicore_exp.py`, `examples/scatter_multicore_exp.py` | three-scenario validation examples |
+| `examples/gather_multicore_exp.py`, `examples/scatter_multicore_exp.py` | three-scenario multicore validation examples |
+| `examples/paged_attention_compute.py` | paged-attention 1-D gather example (CPU + Spyre, validates outputs) |
+| `examples/paged_attention_kernel.py` | full paged-attention gather + scatter example (KV write, read, attention) |
 
 ## See also
 

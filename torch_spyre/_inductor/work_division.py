@@ -418,6 +418,7 @@ def must_split_vars(
     stick_vars: dict[Symbol, int],
     max_cores: int,
     symbol_meta: SymbolMeta,
+    forbidden_split_syms: "set[Symbol] | None" = None,
 ) -> dict[Symbol, int]:
     """Return the minimum splits per iteration variable to keep each tensor's
     memory span within MAX_SPAN_BYTES.
@@ -468,6 +469,7 @@ def must_split_vars(
                 v
                 for v in coord.free_symbols
                 if _effective_size(v, it_space_orig, symbol_meta) > 1
+                and (forbidden_split_syms is None or v not in forbidden_split_syms)
             ]
             if not split_vars:
                 continue
@@ -979,6 +981,14 @@ def span_reduction_pass(
 
     Writes results to op.op_it_space_splits. If no span violation exists,
     op.op_it_space_splits is left unset (apply_splits is a no-op for splits <= 1).
+
+    For indirect-access ops (gather / scatter), shared-table data dimensions
+    (K, N of the value table or the scatter destination) are excluded from the
+    split candidate set via `forbidden_split_syms`. Splitting those dims would
+    give every core a different base address into the shared table, producing
+    wrong results. If reducing the span requires splitting a forbidden dim the
+    pass proceeds with the best available split on the remaining dims;
+    work_distribution_pass may then place fewer cores to compensate.
     """
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
@@ -992,8 +1002,19 @@ def span_reduction_pass(
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
         it_space, all_tds, symbol_meta
     )
+    # Shared indirect tables (gather value tables, scatter destinations) must
+    # never be split along their data dimensions — all cores must see the same
+    # base address. Pass the forbidden set into must_split_vars so span
+    # reduction never commits a split that would break shared-table addressing.
+    forbidden = shared_indirect_data_syms(op) or None
     min_splits = must_split_vars(
-        all_tds, it_space, it_space_adjusted, stick_vars, max_cores, symbol_meta
+        all_tds,
+        it_space,
+        it_space_adjusted,
+        stick_vars,
+        max_cores,
+        symbol_meta,
+        forbidden_split_syms=forbidden,
     )
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
