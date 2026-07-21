@@ -21,7 +21,9 @@ from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
-from .pass_utils import copy_fx_custom_meta
+from .pass_utils import copy_fx_custom_meta, indirect_info_from_op
+from .errors import Unsupported
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -226,6 +228,85 @@ def insert_restickify(graph: GraphLowering) -> None:
             )
 
 
+def indirect_dim_position(d_coords: list) -> int | None:
+    """Device-dim position carrying the data-dependent (gather) index, if any.
+
+    Indirect loads index through a ``tmpN`` symbol produced by an earlier load;
+    every other coordinate is built from the iteration vars ``dN``.
+    """
+    for i, c in enumerate(d_coords):
+        for s in getattr(c, "free_symbols", ()):
+            if str(s).startswith("tmp"):
+                return i
+    return None
+
+
+def indirect_source_required_stl(
+    stl: SpyreTensorLayout, idx_pos: int
+) -> SpyreTensorLayout:
+    """Return a layout with the indexed dim (`idx_pos`) rotated to the front.
+
+    e.g. [80, 266, 64] / [64, 5120, 1]  --idx_pos=1-->  [266, 80, 64] / [5120, 64, 1]
+    """
+    size = list(stl.device_size)
+    strides = list(stl.stride_map)
+    order = [idx_pos] + [i for i in range(len(size)) if i != idx_pos]
+    return SpyreTensorLayout(
+        device_size=[size[i] for i in order],
+        stride_map=[strides[i] for i in order],
+        device_dtype=stl.device_dtype,
+    )
+
+
+def _schedule_indirect_source_restickify(
+    op: Operation, graph: GraphLowering, plan: dict
+) -> None:
+    """Schedule a restickify on a gather's data source to rotate its indexed dim outermost.
+
+    Layout propagation leaves indirect value args on the generic layout (indexed
+    dim not outermost). The gather then reads only the first stick of each row
+    correctly and strides wrong for the rest. Leading dims of size 1 are a no-op
+    and are skipped.
+    """
+    from .propagate_layouts import device_coordinates
+
+    if not isinstance(op, ComputedBuffer):
+        return
+    try:
+        ind_names, _, ind_sizes = indirect_info_from_op(op)
+    except Unsupported:
+        return
+    if not ind_names:
+        return
+
+    for dep in op.get_read_writes().reads:
+        if dep.name in ind_names or not isinstance(dep, MemoryDep):
+            continue
+        if not dep.is_indirect():
+            continue
+        buf = graph.get_buffer(dep.name)
+        in_layout = buf.get_layout()
+        if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
+            in_layout = in_layout.real_layout()
+        in_stl = getattr(in_layout, "device_layout", None)
+        if in_stl is None:
+            continue
+        try:
+            d_coords = device_coordinates(in_stl, dep, ind_sizes)
+        except Unsupported:
+            continue
+        idx_pos = indirect_dim_position(d_coords)
+        if idx_pos is None or all(d == 1 for d in list(in_stl.device_size)[:idx_pos]):
+            continue
+        required = indirect_source_required_stl(in_stl, idx_pos)
+        logger.info(
+            f"Injecting indirect-source restickify on {op.get_name()} input "
+            f"{dep.name}: {list(in_stl.device_size)} -> "
+            f"{list(required.device_size)} (indexed dim to front)"
+        )
+        _record_restickify(op, dep.name, _fixed_tiled(in_layout, required), plan)
+
+
 def finalize_layouts(graph: GraphLowering) -> None:
     """Convert committed STLs (set by the optimizer) to FixedTiledLayouts and build
     graph.restickify_plan for insert_restickify.
@@ -270,6 +351,11 @@ def finalize_layouts(graph: GraphLowering) -> None:
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, stl)
+
+        # A gather source needs its indexed dim outermost. This is independent of
+        # the pointwise stick costing below (indirect args are excluded there), so
+        # it runs for every op, cost_fn or not.
+        _schedule_indirect_source_restickify(op, graph, plan)
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
