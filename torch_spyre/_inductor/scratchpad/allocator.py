@@ -271,6 +271,16 @@ class ScratchpadAllocator:
             if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
                 self.reject_reasons[output_name] = "extern kernel user"
                 continue
+            # An ExternKernel that *passes through* the buffer's live range
+            # (producer ... consumer) without accessing it still invalidates LX
+            # residency: extern ops launch as separate kernels (often CPU
+            # fallbacks) and LX is core-local scratch that does not survive the
+            # round-trip. The "extern kernel user" check above only catches an
+            # extern op that reads/writes the buffer; this catches one that
+            # merely executes between producer and consumer.
+            if _extern_kernel_in_live_range(graph, uses):
+                self.reject_reasons[output_name] = "extern kernel in live range"
+                continue
             if output_name in graph_output_names and not cloning_allowed:
                 self.reject_reasons[output_name] = "graph output (no clone)"
                 continue  # we can only allocate graph outputs if we're allowed to clone
@@ -504,6 +514,35 @@ def _op_short_name(op: Any) -> str:
         if name is not None:
             break
     return name if name is not None else "None"
+
+
+def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
+    """Whether an ExternKernel executes *inside* a buffer's live range.
+
+    LX is core-local scratch and does not survive an extern-op launch: extern
+    ops run as their own kernel, often a CPU fallback with a host round-trip.
+    A buffer pinned to LX across one is written by the producing kernel, then
+    read back as garbage by the consumer -- silently, with no error.
+
+    This is distinct from the "extern kernel user" check, which only catches an
+    extern op that *reads* the buffer. Here the extern op merely happens to be
+    scheduled between producer and consumer, so it never appears in ``uses`` as
+    an access, e.g.::
+
+        op4  sub    -> writes buf4 (pinned lx=0)
+        op5  extern -- bool->fp32 CPU fallback, unrelated to buf4
+        op7  mul    -> reads buf4  ==> reads garbage
+
+    ``uses`` is the sorted access list from ``calculate_liveness`` (writes and
+    reads), so the endpoints are the producer and last consumer; both are
+    already covered by the user check, hence the exclusive range.
+    """
+    if len(uses) <= 1:
+        return False
+    return any(
+        isinstance(graph.operations[i], ExternKernel)
+        for i in range(uses[0] + 1, uses[-1])
+    )
 
 
 def _lx_planning_size() -> int:
@@ -1610,6 +1649,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             return "read by restickify (cross-frame barrier)"
         if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
             return "extern kernel user"
+        # Same rationale as in ScratchpadAllocator: an ExternKernel scheduled
+        # *between* producer and consumer (but not accessing the buffer) still
+        # corrupts LX residency because LX does not survive the extern launch.
+        if _extern_kernel_in_live_range(graph, uses):
+            return "extern kernel in live range"
         if name in mutated_buffers:
             return "mutation target"
         # A graph output normally can't reside (the value must land back in HBM),
