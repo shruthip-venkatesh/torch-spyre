@@ -14,15 +14,16 @@
 
 import logging
 from collections import defaultdict
+import sympy
 
 import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .pass_utils import copy_fx_custom_meta, indirect_info_from_op
-from .errors import Unsupported
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -228,25 +229,34 @@ def insert_restickify(graph: GraphLowering) -> None:
             )
 
 
-def indirect_dim_position(d_coords: list) -> int | None:
+def _indirect_dim_position(
+    d_coords: list, indirect_syms: "frozenset[sympy.Symbol]"
+) -> int | None:
     """Device-dim position carrying the data-dependent (gather) index, if any.
 
-    Indirect loads index through a ``tmpN`` symbol produced by an earlier load;
-    every other coordinate is built from the iteration vars ``dN``.
+    `indirect_syms` are the symbols Inductor created for indirect loads --
+    the keys of indirect_info_from_op's `access_subs`, recovered by
+    `_IndirectIndexFinder` intercepting `ops.indirect_indexing()` calls
+    during `inner_fn`. Every other symbol in a coordinate is a loop-iteration
+    variable, so a coordinate containing one of these is the indirectly
+    addressed dim.
     """
+    if not indirect_syms:
+        return None
     for i, c in enumerate(d_coords):
-        for s in getattr(c, "free_symbols", ()):
-            if str(s).startswith("tmp"):
-                return i
+        if getattr(c, "free_symbols", frozenset()) & indirect_syms:
+            return i
     return None
 
 
-def indirect_source_required_stl(
+def _indirect_source_required_stl(
     stl: SpyreTensorLayout, idx_pos: int
 ) -> SpyreTensorLayout:
     """Return a layout with the indexed dim (`idx_pos`) rotated to the front.
 
     e.g. [80, 266, 64] / [64, 5120, 1]  --idx_pos=1-->  [266, 80, 64] / [5120, 64, 1]
+
+    Precondition: 0 <= idx_pos < len(stl.device_size).
     """
     size = list(stl.device_size)
     strides = list(stl.stride_map)
@@ -260,25 +270,33 @@ def indirect_source_required_stl(
 
 def _schedule_indirect_source_restickify(
     op: Operation, graph: GraphLowering, plan: dict
-) -> None:
+) -> set[str]:
     """Schedule a restickify on a gather's data source to rotate its indexed dim outermost.
 
     Layout propagation leaves indirect value args on the generic layout (indexed
     dim not outermost). The gather then reads only the first stick of each row
     correctly and strides wrong for the rest. Leading dims of size 1 are a no-op
     and are skipped.
+
+    Returns the set of dep names for which a restickify was recorded.  The
+    caller passes this to the cost_fn loop so it can skip those deps and avoid
+    scheduling a second (conflicting) restickify on the same buffer.
     """
     from .propagate_layouts import device_coordinates
 
     if not isinstance(op, ComputedBuffer):
-        return
+        return set()
     try:
-        ind_names, _, ind_sizes = indirect_info_from_op(op)
+        ind_names, access_subs, ind_sizes = indirect_info_from_op(op)
     except Unsupported:
-        return
+        return set()
     if not ind_names:
-        return
+        return set()
+    # Authoritative set of gather index symbols. A scatter-only op has index
+    # buffer names but no gather symbols, so this is empty and it is skipped.
+    indirect_syms = frozenset(access_subs)
 
+    scheduled: set[str] = set()
     for dep in op.get_read_writes().reads:
         if dep.name in ind_names or not isinstance(dep, MemoryDep):
             continue
@@ -295,16 +313,23 @@ def _schedule_indirect_source_restickify(
             d_coords = device_coordinates(in_stl, dep, ind_sizes)
         except Unsupported:
             continue
-        idx_pos = indirect_dim_position(d_coords)
+        idx_pos = _indirect_dim_position(d_coords, indirect_syms)
+        # idx_pos == 0: indexed dim is already outermost — no rotation needed.
+        # idx_pos > 0 but all preceding dims are size 1: rotation is a no-op
+        # (e.g. device_size=[1, N, 64] with idx_pos=1 is effectively [N, 64]).
+        # all() on an empty slice (idx_pos == 0) returns True, so this single
+        # guard handles both cases correctly.
         if idx_pos is None or all(d == 1 for d in list(in_stl.device_size)[:idx_pos]):
             continue
-        required = indirect_source_required_stl(in_stl, idx_pos)
+        required = _indirect_source_required_stl(in_stl, idx_pos)
         logger.info(
             f"Injecting indirect-source restickify on {op.get_name()} input "
             f"{dep.name}: {list(in_stl.device_size)} -> "
             f"{list(required.device_size)} (indexed dim to front)"
         )
         _record_restickify(op, dep.name, _fixed_tiled(in_layout, required), plan)
+        scheduled.add(dep.name)
+    return scheduled
 
 
 def finalize_layouts(graph: GraphLowering) -> None:
@@ -352,16 +377,22 @@ def finalize_layouts(graph: GraphLowering) -> None:
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, stl)
 
-        # A gather source needs its indexed dim outermost. This is independent of
-        # the pointwise stick costing below (indirect args are excluded there), so
-        # it runs for every op, cost_fn or not.
-        _schedule_indirect_source_restickify(op, graph, plan)
+        # A gather source needs its indexed dim outermost.  This runs for every
+        # op (cost_fn or not) and returns the set of dep names it already
+        # scheduled.  The cost_fn loop below skips those names to avoid
+        # recording a second, conflicting restickify on the same buffer.
+        indirect_restickified = _schedule_indirect_source_restickify(op, graph, plan)
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
         if not cost_fn:
             continue
         for edge, target_stl in cost_fn.required_input_stls(committed):
+            if edge.dep.name in indirect_restickified:
+                # Already handled by _schedule_indirect_source_restickify above;
+                # emitting a second entry for the same buffer would chain two
+                # back-to-back restickifies producing an incorrect layout.
+                continue
             input_buf = graph.get_buffer(edge.dep.name)
             in_layout = input_buf.get_layout()
             if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
