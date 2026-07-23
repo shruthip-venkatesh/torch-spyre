@@ -711,6 +711,12 @@ class IndirectAccessTestCase(InductorTestCase):
         if sdsc and r.label in (GATHER_OP_SPEC, SCATTER_OP_SPEC):
             kind = "gather" if r.label == GATHER_OP_SPEC else "scatter"
             self.assert_indirect_sdsc_fields(r.sdsc_jsons, kind)
+        # Every gather scenario asserts, by default, that the gather-source
+        # relayout landed the indexed dim outermost -- so a regression surfaces
+        # on any gather test, not just the few that opt in. Gated to gather:
+        # scatter writes indirectly to its *output* and has no source to rotate.
+        if r.label == GATHER_OP_SPEC:
+            self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
         return r
 
     # -- one driver: validate every stage, then run on the real backend ---

@@ -177,6 +177,7 @@ class _GatherScenarios(IndirectAccessTestCase):
         self.assertTrue(spec.args[0].is_input, "index arg should be an input")
         self.assertFalse(spec.args[-1].is_input, "last arg should be the output")
         self.assertEqual(len([a for a in spec.args if not a.is_input]), 1)
+        self.assert_indirect_source_indexed_dim_outermost(op_specs)
         # Carry the same scenario through to SDSC and validate the indirect
         # encoding of the copy op (not just that op specs were produced).
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
@@ -215,6 +216,7 @@ class _GatherScenarios(IndirectAccessTestCase):
                     any(op_spec_has_indirect_input(s) for s in op_specs),
                     f"{label}: gather signature lost",
                 )
+                self.assert_indirect_source_indexed_dim_outermost(op_specs)
                 # Each supported unary must also lower to a well-formed
                 # indirect-access SDSC bundle, not just an op spec.
                 self.assert_indirect_sdsc_fields(
@@ -238,6 +240,7 @@ class _GatherScenarios(IndirectAccessTestCase):
         self.assertIn("exp", ops)
         self.assertIn("tanh", ops)
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
+        self.assert_indirect_source_indexed_dim_outermost(op_specs)
         # The fused chain must still emit a valid indirect-access SDSC bundle.
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
         # TODO : Enable once e2e is available
@@ -296,10 +299,9 @@ class _GatherScenarios(IndirectAccessTestCase):
 
     def test_index_select(self):
         x, i = self._xi(P=32)  # source [128, 256] -> 4 sticks per row
-        r = self._stage_and_e2e(
+        self._stage_and_e2e(
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
-        self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
 
     def test_index_select_with_exp(self):
         x, i = self._xi(P=32)
@@ -382,10 +384,9 @@ class _GatherScenarios(IndirectAccessTestCase):
 
     def test_index_select_3d(self):
         x, i = self._xi3d(P=32)  # source [64, 8, 64] -> row B*C = 512 = 8 sticks
-        r = self._stage_and_e2e(
+        self._stage_and_e2e(
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
-        self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
 
     def test_index_select_3d_with_exp(self):
         x, i = self._xi3d(P=32)
@@ -448,37 +449,38 @@ class _GatherScenarios(IndirectAccessTestCase):
         slot_idxs = torch.randint(0, cache, (B, Lk), dtype=torch.int64).to("spyre")
         self.name_dims(keys, {"cache": cache, "H": H, "Dh": Dh})
         self.name_dims(slot_idxs, {"B": B, "Lk": Lk})
-        r = self._stage_and_e2e(
-            lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC
-        )
         # Source row is H*Dh = 1024 elems = 16 sticks, so the indexed dim must be
-        # relaid out to outermost or the gather reads only the first stick.
-        self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
+        # relaid out to outermost or the gather reads only the first stick --
+        # check() asserts that (assert_indirect_source_indexed_dim_outermost).
+        self._stage_and_e2e(lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC)
 
     def test_gather_multistick_source_indexed_dim_outermost(self):
         """Gather whose source rows span several sticks: the source relayout must
         put the indexed dim outermost in the OpSpec device coordinates.
+
+        cols=256 is 4 sticks per row, so this exercises the multi-stick striding
+        that a 1-stick source cannot. Without the relayout the indexed dim sits
+        behind the stick-count dim and the gather reads only the first stick of
+        each row. check() asserts the indexed dim landed outermost.
         """
         x = self.to_spyre(torch.rand(20, 256, dtype=torch.float16))
         i = torch.tensor([0, 12, 3, 15, 7], dtype=torch.int32).to("spyre")
         self.name_dims(x, {"rows": 20, "cols": 256})
         self.name_dims(i, {"P": 5})
-        r = self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
-        self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
+        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
     def test_gather_singlestick_source_indexed_dim_outermost(self):
         """Control for the multi-stick case: a source whose row is exactly one
         stick (cols=64). The indexed dim is already outermost, so the relayout is
         a no-op -- this asserts the pass does not disturb the common single-stick
         gather (the shape test_gather_1d covers) while still landing the indexed
-        dim outermost.
+        dim outermost (check() asserts it).
         """
         x = self.to_spyre(torch.rand(20, 64, dtype=torch.float16))
         i = torch.tensor([0, 12, 3, 15, 7], dtype=torch.int32).to("spyre")
         self.name_dims(x, {"rows": 20, "cols": 64})
         self.name_dims(i, {"P": 5})
-        r = self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
-        self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
+        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
     def test_gather_after_reshape(self):
         """x.reshape(12, 256)[i] -- gather on a reshaped tensor."""
@@ -486,10 +488,9 @@ class _GatherScenarios(IndirectAccessTestCase):
         i = torch.tensor((1, 2), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"rows": 3, "cols": 1024})
         self.name_dims(i, {"P": 2})
-        r = self._stage_and_e2e(
+        self._stage_and_e2e(
             lambda x, i: x.reshape(12, 256)[i], x, i, expect=GATHER_OP_SPEC
         )
-        self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
 
     def test_gather_after_reshape_1d(self):
         """t.reshape(16, 256)[idx] -- gather on a 1D tensor reshaped to 2D (page table)."""
@@ -497,10 +498,9 @@ class _GatherScenarios(IndirectAccessTestCase):
         idx = torch.tensor((7, 3), dtype=torch.int32).to("spyre")
         self.name_dims(t, {"N": 4096})
         self.name_dims(idx, {"P": 2})
-        r = self._stage_and_e2e(
+        self._stage_and_e2e(
             lambda t, i: t.reshape(16, 256)[i], t, idx, expect=GATHER_OP_SPEC
         )
-        self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
 
     def test_gather_then_scalar_mul(self):
         """x[i] * 2.0 -- gather fused with a scalar binary op."""
@@ -575,6 +575,7 @@ class _GatherScenarios(IndirectAccessTestCase):
         op_specs = flatten_op_specs(captured)
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
         self.assertNotIn("sin", [s.op for s in op_specs])
+        self.assert_indirect_source_indexed_dim_outermost(op_specs)
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
         # TODO : Enable once e2e is available
         # run_e2e(self, lambda x, i: x[i].sin(), x, i)
@@ -690,8 +691,9 @@ class _GatherScenarios(IndirectAccessTestCase):
             any("sdsc" in name.lower() for name, _ in calls),
             f"expected an 'sdsc'-named kernel; got {[n for n, _ in calls]}",
         )
-        all_specs = [s for _, specs in calls for s in specs]
-        self.assertTrue(flatten_op_specs([all_specs]))
+        all_specs = flatten_op_specs([[s for _, specs in calls for s in specs]])
+        self.assertTrue(all_specs)
+        self.assert_indirect_source_indexed_dim_outermost(all_specs)
 
     def test_python_bundle_generation_succeeds(self):
         """Real generate_bundle runs end-to-end with the backend mocked.
