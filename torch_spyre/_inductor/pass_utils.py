@@ -1019,24 +1019,29 @@ def _indirect_source_dim_order_restickify(
     """Target layout that puts a gather source's indexed dim outermost, or None.
 
     ``access_subs`` maps each data-dependent index symbol to its IndirectAccess
-    (from ``indirect_info_from_op``). The device coordinate ``idc[i]`` that
-    contains one of these symbols is the indexed dim. If it sits behind a
-    non-degenerate dim, return a layout with it rotated to the front -- a pure
-    dim permutation (same sticks), so it lowers as a whole-stick move. Returns
-    None when there is no indexed dim, it is already outermost, or only size-1
-    dims precede it (rotation would be a no-op).
+    (from ``indirect_info_from_op``). The indexed dim is the device coordinate
+    that depends on the index *alone* -- e.g. ``floor(idx/k)`` or ``idx``. A
+    coordinate that mixes the index with an iteration variable (e.g.
+    ``4*Mod(idx,4) + floor(d1/64)``) is the stick-count dim the index bleeds into
+    under tiling, not the indexed dim itself; picking it would rotate the wrong
+    dim (and leave a reshape gather in the layout that fails to lower). The stick
+    coordinate (last) is never a rotation target.
+
+    If the indexed dim sits behind a non-degenerate dim, return a layout with it
+    rotated to the front -- a pure dim permutation (same sticks), so it lowers as
+    a whole-stick move. Returns None when there is no pure-index dim, it is
+    already outermost, or only size-1 dims precede it (rotation is a no-op).
     """
     indirect_syms = frozenset(access_subs)
     if not indirect_syms:
         return None
-    idx_pos = next(
-        (
-            i
-            for i, c in enumerate(idc)
-            if getattr(c, "free_symbols", frozenset()) & indirect_syms
-        ),
-        None,
-    )
+
+    def _is_pure_index(coord) -> bool:
+        fs = getattr(coord, "free_symbols", frozenset())
+        return bool(fs & indirect_syms) and not (fs - indirect_syms)
+
+    # Search all but the stick coordinate (idc[-1]); the stick is never rotated.
+    idx_pos = next((i for i, c in enumerate(idc[:-1]) if _is_pure_index(c)), None)
     if idx_pos is None or all(d == 1 for d in list(in_stl.device_size)[:idx_pos]):
         return None
     size, strides = list(in_stl.device_size), list(in_stl.stride_map)
