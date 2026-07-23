@@ -1037,7 +1037,7 @@ def _indirect_source_dim_order_restickify(
         return None
 
     def _is_pure_index(coord) -> bool:
-        fs = getattr(coord, "free_symbols", frozenset())
+        fs: frozenset = getattr(coord, "free_symbols", frozenset())
         return bool(fs & indirect_syms) and not (fs - indirect_syms)
 
     # Search all but the stick coordinate (idc[-1]); the stick is never rotated.
