@@ -45,7 +45,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     GATHER_OP_SPEC,
-    NO_SPYRE_OP,
     IndirectAccessTestCase,
     bundle_jsons_from_captured,
     capture_op_specs,
@@ -319,7 +318,7 @@ class TestGather(IndirectAccessTestCase):
         self.name_dims(weight, {"V": V, "E": E})
         self.name_dims(idx, {"P": P})
         self._stage_and_e2e(
-            lambda w, i: torch.embedding(w, i), weight, idx, expect=NO_SPYRE_OP
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=GATHER_OP_SPEC
         )
 
     # -- additional real gather scenarios ---------------------------------
@@ -485,7 +484,7 @@ class TestGather(IndirectAccessTestCase):
             lambda i, w: torch.nn.functional.embedding(i, w),
             idx,
             weight,
-            expect=NO_SPYRE_OP,
+            expect=GATHER_OP_SPEC,
         )
 
     # -- negative / control scenarios -------------------------------------
