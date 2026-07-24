@@ -52,6 +52,8 @@ from .pass_utils import (
     apply_splits_from_index_coeff,
     indirect_access_subs_from_op,
     indirect_store_subs_from_op,
+    indirect_store_sizes,
+    indirect_sizes_from_op,
     _fixed_read_layout,
     op_read_writes,
 )
@@ -647,9 +649,16 @@ def _build_output_td(op: ComputedBuffer) -> TensorDep:
     output_td = TensorDep(next(iter(op.get_read_writes().writes)), _resolve_layout(op))
     store_subs = indirect_store_subs_from_op(op)
     if store_subs:
-        output_td.device_coords = device_coordinates(
-            output_td.layout.device_layout, output_td.dep, store_subs
+        # device_coordinates needs the *integer* row extent for each indirect
+        # symbol, not the IndirectAccess marker map. Compute coordinates with
+        # the raw store symbol treated as a normal loop var, then xreplace
+        # store_subs to mark the runtime-chosen destination row — the same
+        # order used for the gather value table in collect_indirect_value_tds.
+        ind_sizes = indirect_store_sizes(output_td.dep, output_td.layout)
+        coords = device_coordinates(
+            output_td.layout.device_layout, output_td.dep, ind_sizes
         )
+        output_td.device_coords = [c.xreplace(store_subs) for c in coords]
     return output_td
 
 
@@ -674,6 +683,12 @@ def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
     subs = indirect_access_subs_from_op(op)
     if not subs:
         return []
+    # device_coordinates needs the *integer* index range for each indirect
+    # symbol (indirect_sizes), not the IndirectAccess marker map. Compute the
+    # coordinates with the raw indirect symbol treated as a normal loop var,
+    # then xreplace subs to mark the runtime-chosen row dimension — mirroring
+    # the align_tensors -> IndirectAccess-substitution order in simplify_op_spec.
+    ind_sizes = indirect_sizes_from_op(op)
     tds: list[TensorDep] = []
     for d in op.get_read_writes().reads:
         if isinstance(d, MemoryDep) and d.is_indirect():
@@ -681,7 +696,8 @@ def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
             td = TensorDep.__new__(TensorDep)
             td.dep = d
             td.layout = layout
-            td.device_coords = device_coordinates(layout.device_layout, d, subs)
+            coords = device_coordinates(layout.device_layout, d, ind_sizes)
+            td.device_coords = [c.xreplace(subs) for c in coords]
             tds.append(td)
     return tds
 

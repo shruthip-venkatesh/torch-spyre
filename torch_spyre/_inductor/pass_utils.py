@@ -570,6 +570,34 @@ def _build_indirect_store_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.E
     return result
 
 
+def indirect_store_sizes(
+    dep: MemoryDep, layout: "FixedTiledLayout"
+) -> "dict[sympy.Symbol, int]":
+    """Map each store-side indirect symbol to its destination row extent.
+
+    The indirect symbol selects a scatter-destination row; its valid range is
+    the destination's host extent along the scattered dimension, recovered by
+    matching the symbol's linear coefficient in the write index to a host
+    stride. device_coordinates() needs these integer ranges (not IndirectAccess
+    markers) to process the row symbol as an ordinary loop var; unlike gather,
+    there is no load-side indirect_indexing() call to recover the size from on
+    the store side, so we derive it from the layout instead.
+    """
+    host_size = [concretize_expr(s) for s in layout.size]
+    host_stride = [concretize_expr(s) for s in layout.stride]
+    sizes: dict[sympy.Symbol, int] = {}
+    index = dep.index
+    for sym in index.free_symbols:
+        if sym in dep.ranges:
+            continue
+        coeff = index.coeff(sym)
+        for dim, st in enumerate(host_stride):
+            if st == coeff:
+                sizes[sym] = host_size[dim]
+                break
+    return sizes
+
+
 def _wrap_indirect_subs(
     raw: dict[sympy.Symbol, sympy.Expr],
 ) -> "dict[sympy.Symbol, sympy.Expr]":
