@@ -23,7 +23,9 @@ Every gather scenario now carries through to SDSC generation: check() (and the
 capture-based tests via bundle_jsons_from_captured) validate the indirect-access
 encoding of the produced bundle, not just that op specs were generated.
 
-All gather scenarios run with SENCORES=1.
+Every gather scenario is generated once per SENCORES value (1, 2, 4, 8, 16, 32)
+by register_multicore_variants, so the same checks also exercise the multicore
+work-division planner. See MULTICORE_SENCORES in indirect_access_common.
 
 There is one test per scenario -- no separate e2e variants. Each scenario
 validates the capture path and then runs the kernel on the real backend,
@@ -40,13 +42,15 @@ import sys
 from unittest.mock import patch
 
 import torch
+from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     GATHER_OP_SPEC,
     NO_SPYRE_OP,
-    IndirectAccessTestCase,
+    IndirectAccessTestCase,  # noqa: F401  (used via register_multicore_variants)
+    register_multicore_variants,
     bundle_jsons_from_captured,
     capture_op_specs,
     capture_sdsc_calls,
@@ -62,14 +66,18 @@ from indirect_access_common import (  # noqa: E402
 )
 
 from torch_spyre._C import DataFormats  # noqa: E402
-from torch_spyre._inductor import config  # noqa: E402
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
 
 
-@config.patch({"sencores": 1})
-class TestGather(IndirectAccessTestCase):
-    """torch gather-family ops: one compile + all-stage checks per scenario."""
+class _GatherScenarios:
+    """torch gather-family ops: one compile + all-stage checks per scenario.
+
+    A plain mixin (not a TestCase, so it is not collected on its own). The
+    concrete, collectable classes ``TestGather_cores{1,2,4,8,16,32}`` are
+    generated at the bottom of the module by ``register_multicore_variants``,
+    each pinned to its SENCORES value via ``@config.patch``.
+    """
 
     def _xi(self, P=32, two_d=False, dtype=torch.int32, M=128, N=256, Q=192):
         """Named (x[M,N], idx) gather operands. two_d means idx[P,Q]."""
@@ -663,6 +671,74 @@ class TestGather(IndirectAccessTestCase):
         ):
             result = torch.compile(lambda x, i: x[i].exp())(x, i)
         self.assertIsNotNone(result, "gather compile returned nothing")
+
+    # -- Work-division scenarios -----------------------------------------
+    # Swept like every other scenario, so each TestGather_cores{N} variant
+    # checks the split map that N produces. The invariant for out = x[i]: the
+    # planner must split the index dim (c0) and never the value-table data dim
+    # (c1 = K) -- splitting K makes every core read address 0 of the shared
+    # table, silently returning wrong results. Shapes are chosen so the planner
+    # *would* prefer K (its largest output-coordinate dim) if the guard were
+    # absent. assert_indexed_dim_split() reads the current SENCORES and expects
+    # c0 to split by min(SENCORES, index_size // 32) with c1 pinned at 1.
+    #
+    # After the split-map check each scenario runs through the shared
+    # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
+    # executed the split-map compile) -- the same capture-path stage checks +
+    # e2e leg every other gather scenario uses -- so the multicore split is also
+    # exercised end-to-end. (Skipped at sencores=1 by assert_indexed_dim_split
+    # -- nothing to divide.)
+
+    @staticmethod
+    def _gather_fn(table, idx):
+        return table[idx]
+
+    def test_work_division_index_split_full(self):
+        """Index dim has 32 sticks (Q=1024), so it splits across all cores up to
+        32 while K=64 stays unsplit -- exercises the full 32-way split."""
+
+        def make():
+            x = torch.rand(128, 64, 1024, dtype=torch.float16).to("spyre")
+            i = (torch.arange(1024) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=1024, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_capped(self):
+        """Index dim has only 8 sticks (Q=256): when SENCORES exceeds 8 the split
+        caps at 8 and must never spill onto the forbidden K dim."""
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(256) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_unaligned_data_dim(self):
+        """An unaligned value-table data dim (K=48, not divisible by any core
+        count) stays unsplit at every SENCORES."""
+
+        def make():
+            x = torch.rand(128, 48, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(256) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=48)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+
+# Generate TestGather_cores1 .. TestGather_cores32, one per SENCORES value, so
+# every gather scenario is exercised across the multicore work-division planner.
+register_multicore_variants(_GatherScenarios, "TestGather", globals())
 
 
 if __name__ == "__main__":

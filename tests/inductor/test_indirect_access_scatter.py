@@ -26,7 +26,9 @@ The two forms that crash during compilation -- index_fill (rank-0 scalar
 Constant codegen) and masked_scatter (mask-based CPU fallback) -- stay
 capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
 
-All scatter scenarios run with SENCORES=1.
+Every scatter scenario is generated once per SENCORES value (1, 2, 4, 8, 16, 32)
+by register_multicore_variants, so the same checks also exercise the multicore
+work-division planner. See MULTICORE_SENCORES in indirect_access_common.
 
 Status (validated on hardware build): index-tensor scatters reach a real op
 spec with IndirectAccess on the output (SCATTER_OP_SPEC); the deeptools backend
@@ -37,21 +39,26 @@ import os
 import sys
 
 import torch
+from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
     CRASHED,
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
-    IndirectAccessTestCase,
+    IndirectAccessTestCase,  # noqa: F401  (used via register_multicore_variants)
+    register_multicore_variants,
 )
 
-from torch_spyre._inductor import config  # noqa: E402
 
+class _ScatterScenarios:
+    """torch scatter-family ops: one compile + all-stage checks per scenario.
 
-@config.patch({"sencores": 1})
-class TestScatter(IndirectAccessTestCase):
-    """torch scatter-family ops: one compile + all-stage checks per scenario."""
+    A plain mixin (not a TestCase, so it is not collected on its own). The
+    concrete, collectable classes ``TestScatter_cores{1,2,4,8,16,32}`` are
+    generated at the bottom of the module by ``register_multicore_variants``,
+    each pinned to its SENCORES value via ``@config.patch``.
+    """
 
     def _row_store(self, M=128, N=256, P=3, dtype=torch.int32):
         """Common row-store operands: out[M,N], src[P,N], 1-D idx[P], all named."""
@@ -245,6 +252,64 @@ class TestScatter(IndirectAccessTestCase):
             return torch.masked_scatter(out, mask, src)
 
         self.check(kernel, out, mask, src, expect=CRASHED)
+
+    # -- Work-division scenarios -----------------------------------------
+    # Swept like every other scenario, so each TestScatter_cores{N} variant
+    # checks the split map that N produces. The invariant for dest[i] = src: the
+    # planner must split the index-entry dim (c0) and never the destination data
+    # dim (c1 = K) -- splitting K makes every core write address 0 of the shared
+    # destination, silently returning wrong results. Shapes are chosen so the
+    # planner *would* prefer K if the guard were absent. assert_indexed_dim_split()
+    # reads the current SENCORES and expects c0 to split by
+    # min(SENCORES, index_size // 32) with c1 pinned at 1.
+    #
+    # After the split-map check each scenario runs through the shared
+    # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
+    # executed the split-map compile and the overwrite-scatter mutates its
+    # destination) -- the same capture-path stage checks + e2e leg every other
+    # scatter scenario uses -- so the multicore split is also exercised
+    # end-to-end. (Skipped at sencores=1 by assert_indexed_dim_split -- nothing
+    # to divide.)
+
+    @staticmethod
+    def _scatter_fn(dst, s, idx):
+        dst[idx] = s
+        return dst
+
+    def test_work_division_entry_split_full(self):
+        """Entry dim has 32 sticks (Q=1024), so it splits across all cores up to
+        32 while dest K=64 stays unsplit -- exercises the full 32-way split."""
+
+        def make():
+            src = torch.rand(1024, 64, 1024, dtype=torch.float16).to("spyre")
+            dest = torch.zeros(128, 64, 1024, dtype=torch.float16).to("spyre")
+            i = (torch.arange(1024) % 128).int().to("spyre")
+            return dest, src, i
+
+        fn = self._scatter_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=1024, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
+
+    def test_work_division_entry_split_capped(self):
+        """Entry dim has only 8 sticks (Q=256): when SENCORES exceeds 8 the split
+        caps at 8 and must never spill onto the forbidden dest K dim."""
+
+        def make():
+            src = torch.rand(256, 64, 256, dtype=torch.float16).to("spyre")
+            dest = torch.zeros(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(256) % 128).int().to("spyre")
+            return dest, src, i
+
+        fn = self._scatter_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
+
+
+# Generate TestScatter_cores1 .. TestScatter_cores32, one per SENCORES value, so
+# every scatter scenario is exercised across the multicore work-division planner.
+register_multicore_variants(_ScatterScenarios, "TestScatter", globals())
 
 
 if __name__ == "__main__":

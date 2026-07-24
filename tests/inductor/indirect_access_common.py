@@ -245,6 +245,12 @@ DIRECT_OP_SPEC = "op_spec_no_indirect"  # Generated OpSpec without indirect acce
 UNIMPLEMENTED = "unimplemented_op"  # Hit an UnimplementedOp
 NO_SPYRE_OP = "no_spyre_op_spec"  # Fell back to CPU
 
+# Core counts to sweep in the multicore variants of the indirect-access suites.
+# 1 keeps the original single-core coverage; the powers of two up to 32 exercise
+# the work-division planner (index-dim splitting, shared-table / scatter-row
+# never-split constraints) at every supported SENCORES value.
+MULTICORE_SENCORES = (1, 2, 4, 8, 16, 32)
+
 
 def _label_for(exc, op_specs, entries) -> str:
     """Map a compilation outcome to one of the classification constants."""
@@ -568,6 +574,42 @@ class IndirectAccessTestCase(InductorTestCase):
         # Recompile from scratch so our sdsc spy always sees the op specs.
         torch._dynamo.reset()
 
+    # -- Work-division split-map assertion -------------------------------
+    # An int32 index packs 32 elements per 128-byte stick, so an index/entry dim
+    # of size `S` exposes `S // 32` sticks — the ceiling on how many cores
+    # can split it.
+    INDEX_ELEMS_PER_STICK = 32
+
+    def assert_indexed_dim_split(self, code, index_size, data_size):
+        """Assert the work-division split map at the current SENCORES.
+
+        For a gather `out = x[i]` or overwrite-scatter `dest[i] = src`, the
+        planner MUST split the index/entry dim (c0) and MUST NOT split the
+        value-table / destination data dim (c1). This checks both against the
+        core count this (swept) variant runs under: c0 splits by
+        `min(sencores, index_size // 32)` and c1 always stays at 1. Skips at
+        sencores=1, where there is no work division to check.
+        """
+        from torch_spyre._inductor import config
+
+        n = config.sencores
+        if n == 1:
+            self.skipTest("no work division at sencores=1")
+        sticks = index_size // self.INDEX_ELEMS_PER_STICK
+        expected = min(n, sticks)
+        self.assertIn(
+            f"sympify('c0'): (sympify('{index_size}'), {expected})",
+            code,
+            f"index/entry dim {index_size} must split by {expected} at {n} cores "
+            f"(capped by {sticks} index sticks)",
+        )
+        self.assertIn(
+            f"sympify('c1'): (sympify('{data_size}'), 1)",
+            code,
+            f"data dim {data_size} must stay unsplit (split=1) at {n} cores; "
+            "splitting a shared table/destination dim silently corrupts results",
+        )
+
     # -- Dimension naming helpers ----------------------------------------
     def name_dims(self, tensor, dims: dict):
         """Declare and attach named dimensions to a tensor.
@@ -874,3 +916,37 @@ class IndirectAccessTestCase(InductorTestCase):
 
         self.assertTrue(saw_index, "no index_tensor nodes anywhere in the SDSC bundle")
         self.assertTrue(saw_value, "no value_tensor nodes anywhere in the SDSC bundle")
+
+
+def register_multicore_variants(
+    scenario_mixin,
+    base_name: str,
+    module_globals: dict,
+    counts=MULTICORE_SENCORES,
+):
+    """Register one concrete TestCase per core count from a scenario mixin.
+
+    `scenario_mixin` is a plain class (NOT a TestCase, so neither pytest nor
+    unittest collects it directly) that holds the `test_*` methods and their
+    helpers. For each `n` in `counts` this builds
+    `{base_name}_cores{n}` = `@config.patch({"sencores": n})` applied to a
+    class combining the mixin with `IndirectAccessTestCase`, so the whole
+    scenario set runs at every SENCORES value. The classes are inserted into
+    `module_globals` (pass the caller's `globals()`) for test discovery.
+
+    Returns the list of generated class names.
+    """
+    from torch_spyre._inductor import config
+
+    module_name = module_globals.get("__name__", scenario_mixin.__module__)
+    names: list[str] = []
+    for n in counts:
+        name = f"{base_name}_cores{n}"
+        cls = config.patch({"sencores": n})(
+            type(name, (scenario_mixin, IndirectAccessTestCase), {})
+        )
+        cls.__module__ = module_name
+        cls.__qualname__ = name
+        module_globals[name] = cls
+        names.append(name)
+    return names
