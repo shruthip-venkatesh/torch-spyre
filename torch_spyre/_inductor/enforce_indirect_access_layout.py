@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reorder non-stick dimensions to satisfy operation requirements.
+"""Enforce non-stick dimension ordering required by indirect-access ops.
 
 The three-pass restickify pipeline (propagate_layouts -> optimize_restickify ->
-insert_restickify) resolves stick-dimension layout constraints. Some operations
-impose additional requirements on non-stick dimension ordering based on their
-coordinate access patterns.
+insert_restickify) resolves stick-dimension layout constraints. Indirect-access
+ops (gather/scatter) impose an additional requirement on non-stick dimension
+ordering: the indexed dimension must be outermost in the value tensor's device
+layout, based on their coordinate access patterns.
 
 This pass runs after insert_restickify, once every op has a committed
-FixedTiledLayout. For operations with nonstick-dim-order requirements, it checks
-whether the value tensor's current dim_order matches; if not, either rewrites the
+FixedTiledLayout. For indirect-access ops, it checks whether the value tensor's
+current dim_order matches this requirement; if not, either rewrites the
 producer's output layout in place (if the producer is a ComputedBuffer and not a
-graph output) or inserts a spyre.restickify copy in the required layout. New
-requirement sources can be added by extending _get_nonstick_dim_order_requirements().
+graph output) or inserts a spyre.restickify copy in the required layout.
 """
 
 import sympy
@@ -42,7 +42,7 @@ from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess
 from .pass_utils import device_coordinates, indirect_info_from_op
 
-logger = get_inductor_logger("reorder_nonstick_dims")
+logger = get_inductor_logger("enforce_indirect_access_layout")
 
 
 def _real_layout(buf) -> FixedTiledLayout:
@@ -145,7 +145,7 @@ def _can_mutate_producer_in_place(value_buf, output_names: set[str]) -> bool:
 def _rewrite_producer_layout(value_buf, required_stl: SpyreTensorLayout) -> None:
     value_buf.layout = _fixed_tiled(value_buf.get_layout(), required_stl)
     logger.info(
-        "enforce_indirect_layout: rewrote producer %s layout in place -> %s",
+        "enforce_indirect_access_layout: rewrote producer %s layout in place -> %s",
         value_buf.get_name(),
         list(required_stl.stride_map),
     )
@@ -173,7 +173,7 @@ def _insert_relayout_copy(
         operations,
     )
     logger.info(
-        "enforce_indirect_layout: inserted relayout copy of %s before %s",
+        "enforce_indirect_access_layout: inserted relayout copy of %s before %s",
         arg_name,
         consumer_name,
     )
@@ -209,19 +209,18 @@ def _value_bufs_for_op(
     return value_bufs
 
 
-def _get_nonstick_dim_order_requirements(
+def _get_indirect_access_dim_order_requirements(
     op: ComputedBuffer,
 ) -> tuple[set[str], dict, dict[sympy.Symbol, int] | None] | None:
-    """Extract non-stick dimension ordering requirements from an operation.
+    """Extract non-stick dimension ordering requirements from an indirect-access op.
 
     Returns (dep_names, access_subs, sizes) if the op has requirements, else None.
-    Currently checks: indirect-access requirements (via indirect_info_from_op).
-    Future: extend to check other requirement sources.
     """
     dep_names, access_subs, sizes = indirect_info_from_op(op)
     if dep_names:
         logger.debug(
-            "reorder_nonstick_dims: op %s has nonstick-dim requirements from %d deps",
+            "enforce_indirect_access_layout: op %s has dim-order requirements "
+            "from %d deps",
             op.get_name(),
             len(dep_names),
         )
@@ -229,24 +228,20 @@ def _get_nonstick_dim_order_requirements(
     return None
 
 
-def reorder_nonstick_dims(graph: GraphLowering) -> None:
-    """Reorder non-stick dimensions to satisfy operation requirements.
+def enforce_indirect_access_layout(graph: GraphLowering) -> None:
+    """Reorder non-stick dimensions to satisfy indirect-access ops' requirements.
 
     Runs after insert_restickify: every op's layout is a committed
-    FixedTiledLayout at this point. For each operation with non-stick dim-order
-    requirements (currently: indirect-access ops), checks whether the value
-    tensor's current non-stick dim_order matches what's required; if not,
-    either rewrites the producer's layout in place (single-consumer,
-    non-mutation, non-graph-output case) or inserts a spyre.restickify copy
-    node ahead of the consumer.
-
-    Extensible: new requirement sources can be added by extending
-    _get_nonstick_dim_order_requirements().
+    FixedTiledLayout at this point. For each indirect-access op (gather/scatter),
+    checks whether the value tensor's current non-stick dim_order puts the
+    indexed dimension outermost as required; if not, either rewrites the
+    producer's layout in place (single-consumer, non-mutation, non-graph-output
+    case) or inserts a spyre.restickify copy node ahead of the consumer.
     """
     for original_op in list(graph.operations):
         if not isinstance(original_op, ComputedBuffer):
             continue
-        requirement = _get_nonstick_dim_order_requirements(original_op)
+        requirement = _get_indirect_access_dim_order_requirements(original_op)
         if not requirement:
             continue
         dep_names, access_subs, sizes = requirement

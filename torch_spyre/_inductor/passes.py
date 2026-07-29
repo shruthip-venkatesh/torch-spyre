@@ -65,7 +65,7 @@ from .insert_restickify import (
     insert_post_mutation_restickify,
     insert_restickify,
 )
-from .reorder_nonstick_dims import reorder_nonstick_dims
+from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .memory_planning import memory_planning
 from .work_division import (
     span_reduction,
@@ -331,7 +331,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
-            reorder_nonstick_dims,
+            enforce_indirect_access_layout,
             insert_post_mutation_restickify,
             insert_bmm_padding,
             #

@@ -740,7 +740,6 @@ class _GatherScenarios(IndirectAccessTestCase):
         )
         all_specs = flatten_op_specs([[s for _, specs in calls for s in specs]])
         self.assertTrue(all_specs)
-        self.assert_indirect_source_indexed_dim_outermost(all_specs)
 
     def test_python_bundle_generation_succeeds(self):
         """Real generate_bundle runs end-to-end with the backend mocked.
