@@ -33,12 +33,10 @@ their compile through _stage_and_e2e (stage check + e2e run); capture-based
 tests call run_e2e directly after their own assertions. The three structural
 tests (sdsc_fields, sdsc_handoff, python_bundle_generation) stay capture-only.
 
-Every scenario is run twice, once per source layout: the scenario body lives in
-_GatherScenarios and moves its value/source tensor via self.to_spyre, and the
-two concrete subclasses -- TestGatherPinnedLayout (canonical layout pinned via
-device_layout=) and TestGatherPlainLayout (plain .to("spyre")) -- bind that mover.
-So the full suite (stage checks and, when enabled, e2e) exercises the
-gather-source relayout pass both with and without a caller-supplied layout.
+The scenario body lives in _GatherScenarios and moves its value/source tensor
+via self.to_spyre (plain `.to("spyre")` layout, no explicit layout pin). The
+relayout pass must rotate the indexed dim outermost for multi-stick sources,
+proving the pass works independently.
 
 """
 
@@ -65,7 +63,6 @@ from indirect_access_common import (  # noqa: E402
     op_spec_has_indirect_access,
     op_spec_has_indirect_input,
     op_spec_has_indirect_output,
-    pinned_to_spyre,
     plain_to_spyre,
 )
 
@@ -80,16 +77,15 @@ class _GatherScenarios(IndirectAccessTestCase):
 
     This is the shared scenario body; it is *not* collected on its own
     (`__test__ = False`). Every scenario moves its gather value/source tensor
-    to "spyre" through `self.to_spyre` so the concrete subclasses below can run
-    the entire suite twice -- once with the canonical layout pinned explicitly
-    (`pinned_to_spyre`) and once with a plain `.to("spyre")`
-    (`plain_to_spyre`) -- exercising the gather-source relayout pass with and
-    without a caller-supplied layout. Index tensors always use a plain
+    to "spyre" with plain `.to("spyre")` (no explicit layout pin), exercising
+    the gather-source relayout pass: the compiler picks the generic layout,
+    multi-stick sources arrive with their indexed dim behind the stick-count dim,
+    and the pass must rotate it outermost. Index tensors always use a plain
     `.to("spyre")`.
     """
 
-    __test__ = False  # base scenario body; only the concrete subclasses run
-    to_spyre = staticmethod(pinned_to_spyre)  # overridden per subclass
+    __test__ = False  # base scenario body; only TestGather collects it
+    to_spyre = staticmethod(plain_to_spyre)
 
     def _xi(self, P=32, two_d=False, dtype=torch.int32, M=128, N=256, Q=192):
         """Named (x[M,N], idx) gather operands. two_d means idx[P,Q]."""
@@ -768,23 +764,11 @@ class _GatherScenarios(IndirectAccessTestCase):
 
 
 @config.patch({"sencores": 1})
-class TestGatherPinnedLayout(_GatherScenarios):
-    """Every gather scenario with the source's canonical layout pinned explicitly
-    (`device_layout=`). The relayout pass sees an already-canonical source, so
-    the indexed-dim rotation is a no-op -- the control for the plain-layout run.
-    """
-
-    __test__ = True
-    to_spyre = staticmethod(pinned_to_spyre)
-
-
-@config.patch({"sencores": 1})
-class TestGatherPlainLayout(_GatherScenarios):
+class TestGather(_GatherScenarios):
     """Every gather scenario with a plain `.to("spyre")` source (no explicit
     layout). The compiler picks the generic layout, so a multi-stick source
     arrives with its indexed dim behind the stick-count dim; the gather-source
-    relayout pass must rotate it outermost. This run is what proves the pass --
-    not a caller-supplied layout pin -- makes such gathers correct.
+    relayout pass must rotate it outermost.
     """
 
     __test__ = True

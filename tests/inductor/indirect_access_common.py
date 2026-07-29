@@ -99,28 +99,13 @@ def canonical_device_layout(shape, dtype) -> SpyreTensorLayout:
     )
 
 
-def pinned_to_spyre(tensor: torch.Tensor) -> torch.Tensor:
-    """Move a contiguous tensor to "spyre" with its canonical layout pinned
-    explicitly (via `device_layout=`), instead of the implicit `.to("spyre")`.
-
-    Used for the value (data) tensor of a gather, matching the manual `stl`
-    pattern in the example scripts; index tensors stay on a plain `.to("spyre")`.
-    """
-    return tensor.to(
-        "spyre",
-        device_layout=canonical_device_layout(tensor.shape, tensor.dtype),
-    )
-
-
 def plain_to_spyre(tensor: torch.Tensor) -> torch.Tensor:
-    """Move a tensor to "spyre" with the implicit default layout (a plain
-    `.to("spyre")`) -- the un-pinned counterpart of `pinned_to_spyre`.
+    """Move a tensor to "spyre" with the implicit default layout (plain `.to()`).
 
-    With no `device_layout=` the compiler picks the generic layout, so a
-    multi-stick gather source arrives with its indexed dim *behind* the
-    stick-count dim. Rotating it outermost is then the job of the gather-source
-    relayout pass, not the caller. Exercising this path proves the pass -- not a
-    manual layout pin -- is what makes such gathers correct.
+    With no explicit `device_layout=`, the compiler picks the generic layout.
+    For gather sources, this means a multi-stick row arrives with its indexed
+    dimension behind the stick-count dimension. The gather-source relayout pass
+    must rotate it outermost. Testing with this layout proves the pass works.
     """
     return tensor.to("spyre")
 
