@@ -912,11 +912,16 @@ def spyre_masked_scatter(
     # Collapse the broadcast dim: one bool per row.
     mask_row = mask[..., 0].reshape(rows)
     source_2d = source.reshape(-1, cols)
-    # Empty source is legal when the mask is all-False (True-count == 0).
-    # shape[0] is static, so this is a compile-time branch: no data-dependent
-    # control flow. where(mask, _, self) would always return self anyway.
-    if source_2d.shape[0] == 0:
-        return self.clone()
+    # The gather's largest possible index is (selected rows) - 1, and at most
+    # every row is selected, so source needs >= `rows` rows for every reachable
+    # index to be in bounds -- regardless of the (runtime, unknown-at-trace-time)
+    # mask.
+    if source_2d.shape[0] < rows:
+        raise Unsupported(
+            f"masked_scatter: source has {source_2d.shape[0]} row(s) but self has "
+            f"{rows} row(s); source must have at least as many rows as self so "
+            f"every selectable row has a valid source row."
+        )
     # Row i reads source row (prefix-count of selected rows - 1). Unselected
     # rows would get -1, so multiply by the mask to send them to row 0 instead
     # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
