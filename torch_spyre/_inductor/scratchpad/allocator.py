@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import bisect
 import logging
 import math
 import time
@@ -243,7 +242,6 @@ class ScratchpadAllocator:
         ncores: dict[str, int],
         ncores_reasons: dict[str, str],
         division_is_fixed: bool,
-        extern_indices: list[int],
     ) -> Optional[str]:
         """The first check ``name`` fails, or ``None`` if it clears them all.
 
@@ -283,17 +281,8 @@ class ScratchpadAllocator:
         restickify = self._restickify_barrier(graph, name, uses)
         if restickify is not None:
             return restickify
-        if any(_extern_in_range(extern_indices, u, u) for u in uses):
+        if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
             return "extern kernel user"
-        # An ExternKernel that *passes through* the buffer's live range
-        # (producer ... consumer) without accessing it still invalidates LX
-        # residency: extern ops launch as separate kernels (often CPU
-        # fallbacks) and LX is core-local scratch that does not survive the
-        # round-trip. The "extern kernel user" check above only catches an
-        # extern op that reads/writes the buffer; this catches one that
-        # merely executes between producer and consumer.
-        if _extern_in_range(extern_indices, uses[0] + 1, uses[-1] - 1):
-            return "extern kernel in live range"
         if name in graph_output_names:
             # A graph output normally can't reside (the value must land back in
             # HBM), but with boundary cloning on it is pinned via an output clone
@@ -326,7 +315,6 @@ class ScratchpadAllocator:
         ncores: Optional[dict[str, int]] = None,
         ncores_reasons: Optional[dict[str, str]] = None,
         division_is_fixed: bool,
-        extern_indices: list[int],
     ) -> Optional[str]:
         """The residency verdict for a *graph input*, which is pinned by cloning
         it into LX rather than by placing it directly.
@@ -337,12 +325,6 @@ class ScratchpadAllocator:
         once is already in HBM and would need one transfer to clone, so pinning
         it saves nothing -- which ``_read_count`` (first use excluded) states
         directly.
-
-        Like computed buffers, an input is barred whenever an ExternKernel
-        either *accesses* it or merely *executes inside its live range*.  LX is
-        core-local scratch that does not survive a kernel boundary; an extern op
-        launches as its own kernel (often a CPU fallback), so any LX clone live
-        across one would be read as garbage by subsequent consumers.
 
         ``ncores``/``ncores_reasons`` are consulted only on the placement path
         (``division_is_fixed``); the joint path defers the core division to the
@@ -359,10 +341,6 @@ class ScratchpadAllocator:
         restickify = self._restickify_barrier(graph, name, uses)
         if restickify is not None:
             return restickify
-        if any(_extern_in_range(extern_indices, u, u) for u in uses):
-            return "extern kernel user"
-        if _extern_in_range(extern_indices, uses[0] + 1, uses[-1] - 1):
-            return "extern kernel in live range"
         if division_is_fixed and (ncores or {}).get(name, -1) < 0:
             reason = (ncores_reasons or {}).get(name, "core div mismatch")
             return f"core div mismatch: {reason}"
@@ -409,7 +387,6 @@ class ScratchpadAllocator:
             ncores, ncores_reasons = get_ncores_for_buffers(graph)
         ncores = ncores or {}
         ncores_reasons = ncores_reasons or {}
-        extern_indices = _sorted_extern_indices(graph)
         return {
             name: self._buffer_residency_reason(
                 graph,
@@ -422,7 +399,6 @@ class ScratchpadAllocator:
                 ncores=ncores,
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=division_is_fixed,
-                extern_indices=extern_indices,
             )
             for name in names
         }
@@ -493,7 +469,6 @@ class ScratchpadAllocator:
         here rather than read off ``mem_usage`` (which covers ops only).
         """
         buffers: list[LifetimeBoundBuffer] = []
-        extern_indices = _sorted_extern_indices(graph)
         for output_name, info in mem_usage.items():
             uses = lifetimes.get(output_name, [])
             if not uses:
@@ -534,7 +509,6 @@ class ScratchpadAllocator:
                 ncores=ncores,
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=True,
-                extern_indices=extern_indices,
             )
             clone_size = self._input_footprint(graph, input_name, ncores)
             buffers.append(
@@ -859,30 +833,6 @@ def _op_short_name(op: Any) -> str:
         if name is not None:
             break
     return name if name is not None else "None"
-
-
-def _sorted_extern_indices(graph: GraphLowering) -> list[int]:
-    """Sorted list of operation indices that are ``ExternKernel`` nodes.
-
-    Computed once per graph and shared across all per-buffer residency checks
-    so that the O(ops) scan is paid only once instead of once per buffer.
-    """
-    return [i for i, op in enumerate(graph.operations) if isinstance(op, ExternKernel)]
-
-
-def _extern_in_range(extern_indices: list[int], lo: int, hi: int) -> bool:
-    """Whether ``extern_indices`` contains any index in ``[lo, hi]``.
-
-    Uses ``bisect`` for O(log E) lookup after the one-time O(ops) build in
-    :func:`_sorted_extern_indices`.  Returns ``False`` immediately when
-    ``extern_indices`` is empty or ``lo > hi`` (degenerate / single-use range).
-    """
-    if not extern_indices or lo > hi:
-        return False
-    # bisect_left gives the insertion point for lo; if that element <= hi
-    # then at least one extern kernel falls inside [lo, hi].
-    pos = bisect.bisect_left(extern_indices, lo)
-    return pos < len(extern_indices) and extern_indices[pos] <= hi
 
 
 DEFAULT_VARIANT_CAP = 6
@@ -1888,16 +1838,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         satisfies all its children. That constraint is enforced by requiring
         each child to match the parent, not by pre-rejecting here.
         """
-        extern_indices = _sorted_extern_indices(graph)
         return [
             name
             for name in graph.graph_input_names
             if self._input_residency_reason(
-                graph,
-                name,
-                lifetimes.get(name, []),
-                division_is_fixed=False,
-                extern_indices=extern_indices,
+                graph, name, lifetimes.get(name, []), division_is_fixed=False
             )
             is None
         ]
