@@ -852,24 +852,32 @@ def spyre_prod_dim_int(
     return acc
 
 
-def _row_mask_reject_reason(
+def _masked_scatter_reject_reason(
     self: torch.Tensor,
     mask: torch.Tensor,
     source: torch.Tensor,
 ) -> Optional[str]:
-    """Why `masked_scatter` is not row-level here, or None if it is."""
+    """Why ``masked_scatter`` cannot use the row-level path here, or ``None`` if it can.
+
+    Checks are ordered from cheapest/most general to most specific:
+      1. Rank guards (no device_layout access needed).
+      2. Exact shape equality (subsumes individual last-dim checks).
+      3. Degenerate column guard (cols <= 1 is not a meaningful row).
+      4. Source column alignment.
+      5. Broadcast-stride check (the structural row-level requirement).
+    """
     if self.dim() < 2 or source.dim() < 2 or mask.dim() != self.dim():
         return f"rank: self={self.dim()} mask={mask.dim()} source={source.dim()}"
-    cols = self.shape[-1]
-    # The last dim must be a real (non-degenerate) row shared by self and mask,
-    # and source rows must line up with it for the block-per-row equivalence.
-    if cols <= 1 or mask.shape[-1] != cols or source.shape[-1] != cols:
-        return (
-            f"last dim differs: self={cols} mask={mask.shape[-1]} "
-            f"source={source.shape[-1]}"
-        )
+    # Shape equality subsumes last-dim equality; check it first so the error
+    # message names the full shape rather than just one dimension.
     if tuple(mask.shape) != tuple(self.shape):
         return f"mask shape {tuple(mask.shape)} != self {tuple(self.shape)}"
+    cols = self.shape[-1]
+    # cols <= 1 is a degenerate row that offers no block-per-row equivalence.
+    if cols <= 1:
+        return f"degenerate last dim: cols={cols}"
+    if source.shape[-1] != cols:
+        return f"source last dim {source.shape[-1]} != self last dim {cols}"
     # stride(-1) == 0 is what makes the mask per-row rather than per-element.
     if mask.stride(-1) != 0:
         return f"mask is not broadcast in its last dim (stride {mask.stride()})"
@@ -898,7 +906,7 @@ def spyre_masked_scatter(
     element scatter the backend cannot lower. So the generic form is rejected
     here rather than emitting a gather that fails deeper in layout propagation.
     """
-    reason = _row_mask_reject_reason(self, mask, source)
+    reason = _masked_scatter_reject_reason(self, mask, source)
     if reason is not None:
         raise Unsupported(
             f"masked_scatter needs a mask broadcast along the last dim so it "
