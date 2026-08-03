@@ -920,16 +920,13 @@ def spyre_masked_scatter(
     # Collapse the broadcast dim: one bool per row.
     mask_row = mask[..., 0].reshape(rows)
     source_2d = source.reshape(-1, cols)
-    # The gather's largest possible index is (selected rows) - 1, and at most
-    # every row is selected, so source needs >= `rows` rows for every reachable
-    # index to be in bounds -- regardless of the (runtime, unknown-at-trace-time)
-    # mask.
-    if source_2d.shape[0] < rows:
-        raise Unsupported(
-            f"masked_scatter: source has {source_2d.shape[0]} row(s) but self has "
-            f"{rows} row(s); source must have at least as many rows as self so "
-            f"every selectable row has a valid source row."
-        )
+    # masked_scatter requires source.numel() >= mask.sum(). For a whole-row
+    # mask, source_2d needs at least as many rows as there are selected rows.
+    torch._assert_async(
+        mask_row.sum() <= source_2d.shape[0],
+        "masked_scatter: source is too short -- it has fewer rows than the "
+        "number of selected (True) mask rows.",
+    )
     # Row i reads source row (prefix-count of selected rows - 1). Unselected
     # rows would get -1, so multiply by the mask to send them to row 0 instead
     # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
