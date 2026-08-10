@@ -16,6 +16,7 @@
 
 #include "spyre_stream.h"
 
+#include <ATen/record_function.h>
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
@@ -32,6 +33,7 @@
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
+#include "spyre_error.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
 #include "spyre_tensor_impl.h"
@@ -145,7 +147,8 @@ bool SpyreStream::query() const {
 }
 
 void SpyreStream::synchronize() const {
-  c10::DeviceGuard guard(stream_.device());
+  RECORD_FUNCTION("host::synchronize", {});
+  c10::DeviceGuard device_guard(stream_.device());
 
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
             static_cast<int>(device().index()));
@@ -211,6 +214,11 @@ flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
   return it->second;
 }
 
+SpyreStreamError SpyreStream::getError() const {
+  return resolveRuntimeHandle()->needsShutdown() ? SpyreStreamError::Shutdown
+                                                 : SpyreStreamError::Success;
+}
+
 void SpyreStream::copyAsyncImpl(void* cpu_ptr,
                                 const flex::CompositeAddress* device_address,
                                 const DataConversionInfo* dci,
@@ -235,23 +243,28 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
+  RECORD_FUNCTION("launch::H2D", {});
   resolveRuntimeHandle()->launchOperationH2D(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
+  RECORD_FUNCTION("launch::D2H", {});
   resolveRuntimeHandle()->launchOperationD2H(params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
+  RECORD_FUNCTION("launch::Compute", {});
   resolveRuntimeHandle()->launchOperationCompute(params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
+  RECORD_FUNCTION("launch::HostCallback", {});
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
 void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
                             DataFormats dtype, bool use_dmai) const {
+  RECORD_FUNCTION("launch::Memset", {});
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
 }
 
@@ -503,6 +516,38 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
     sync_one_device(
         c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx));
   }
+}
+
+const char* SpyreStreamGetErrorString(SpyreStreamError error) noexcept {
+  switch (error) {
+    case SpyreStreamError::Success:
+      return "Success";
+    case SpyreStreamError::Shutdown:
+      return "Shutdown";
+    default:
+      return "Unknown";
+  }
+}
+
+SpyreStreamError SpyreStreamGetError(const SpyreStream& stream) {
+  return stream.getError();
+}
+
+SpyreDeviceState SpyreGetDeviceState() {
+  auto runtime = GlobalRuntime::get();
+  if (!runtime) {
+    return SpyreDeviceState::NotInitialized;
+  }
+  // NOTE: intentionally uses RuntimeContext::hasStreamError() (one locked
+  // iteration) instead of rolling up SpyreStreamGetError per stream. These
+  // agree only while both reduce to needsShutdown().
+  // TODO(#3365): once flex exposes typed per-stream codes, roll up via
+  // SpyreStreamGetError so the aggregate (and the pytest skip reason) can
+  // surface the actual fault class.
+  if (runtime->hasStreamError()) {
+    return SpyreDeviceState::StreamError;
+  }
+  return SpyreDeviceState::Ok;
 }
 
 }  // namespace spyre
