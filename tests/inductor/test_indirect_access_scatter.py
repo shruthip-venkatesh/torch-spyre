@@ -298,14 +298,167 @@ class TestScatter(IndirectAccessTestCase):
 
         self._assert_compiled_matches_cpu(kernel, y, src, idx)
 
+    # ===== index_add: gather + add + overwrite-scatter decomposition =====
+    # aten.index_add lowers (spyre_index_add in decompositions.py) to
+    # index_select (indirect gather) + add + index_put (indirect overwrite
+    # store). The final store is an indirect OUTPUT, so each scenario still
+    # classifies as SCATTER_OP_SPEC (_label_for checks indirect-output first).
+    # The RMW is exact only for indices with no duplicates; _row_store's index
+    # (torch.arange(P)) is unique, so these stay in that envelope.
+
+    def _row_store_3d(self, M=128, A=8, B=64, P=3, dtype=torch.int32):
+        """3-D row-store operands: out[M,A,B], src[P,A,B], 1-D idx[P] (unique)."""
+        out = torch.zeros(M, A, B, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, A, B, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=dtype).to("spyre")
+        self.name_dims(out, {"M": M, "A": A, "B": B})
+        self.name_dims(src, {"P": P, "A": A, "B": B})
+        self.name_dims(idx, {"P": P})
+        return out, src, idx
+
+    # NOTE: index_add lowers to gather (index_select) + add + overwrite-scatter
+    # (index_put), so the bundle is BOTH a gather and a scatter. It still
+    # classifies as SCATTER_OP_SPEC (terminal indirect-output store), but
+    # assert_indirect_sdsc_fields' scatter-only invariant ("every indirect value
+    # tensor is the output") does not hold -- the gather's value tensor is an
+    # input. Hence sdsc=False on these (classification + e2e still run).
+
     def test_index_add(self):
-        """out.index_add_(0, idx, src)"""
+        """out.index_add_(0, idx, src) -- canonical row scatter-add."""
         out, src, idx = self._row_store()
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_wide_feature(self):
+        """MoE-width feature dim (N=2816)."""
+        out, src, idx = self._row_store(N=2816)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_ragged_feature(self):
+        """Non-stick-aligned feature dim (N=63, not a multiple of 64)."""
+        out, src, idx = self._row_store(N=63)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_narrow_feature(self):
+        """Small feature dim (N=4), far below one stick."""
+        out, src, idx = self._row_store(N=4)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_single_index(self):
+        """P == 1: a single-row update (decode-step shape)."""
+        out, src, idx = self._row_store(P=1)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_many_updates(self):
+        """More update rows (P=32) into a 128-row destination."""
+        out, src, idx = self._row_store(M=128, P=32)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_int64_index(self):
+        """int64 index (downcast to int32 on device)."""
+        out, src, idx = self._row_store(dtype=torch.int64)
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_alpha(self):
+        """torch.index_add (functional) with a non-unit alpha scaling factor --
+        value check against the CPU reference (fp32, unique index [1,3,6]).
+        """
+        M, N, P = 8, 4, 3
+        index_cpu = torch.tensor([1, 3, 6], dtype=torch.int64)
+        for alpha in (0.5, 1.0, 2.0):
+            input_cpu = torch.rand(M, N, dtype=torch.float32)
+            source_cpu = torch.rand(P, N, dtype=torch.float32)
+
+            result = torch.index_add(
+                input_cpu.clone().to("spyre"),
+                0,
+                index_cpu.to("spyre"),
+                source_cpu.to("spyre"),
+                alpha=alpha,
+            ).cpu()
+
+            ref = torch.index_add(
+                input_cpu.clone(), 0, index_cpu, source_cpu, alpha=alpha
+            )
+            torch.testing.assert_close(
+                result, ref, atol=1e-4, rtol=1e-4, msg=f"alpha={alpha}"
+            )
+
+    def test_index_add_3d(self):
+        """3-D destination [M, A, B], scatter-add along dim 0."""
+        out, src, idx = self._row_store_3d()
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_duplicate_index(self):
+        """Duplicate indices (dim=0). index_add still lowers to a scatter op spec
+        -- duplicates are data-dependent, invisible to the compiler -- so the
+        capture path is identical to the unique case (SCATTER_OP_SPEC).
+
+        This pins classification ONLY, not values: gather+add+overwrite-scatter
+        is a read-modify-write, so colliding writes keep just the last one and
+        the VALUES are silently wrong for duplicates."""
+        M, N = 128, 256
+        out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(3, N, dtype=torch.float16).to("spyre")
+        idx = torch.tensor([0, 2, 0], dtype=torch.int32).to("spyre")  # 0 repeats
+        self.name_dims(out, {"M": M, "N": N})
+        self.name_dims(src, {"P": 3, "N": N})
+        self.name_dims(idx, {"P": 3})
+
+        def kernel(out, src, idx):
+            return out.index_add_(0, idx, src)
+
+        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+
+    def test_index_add_dim1_unsupported(self):
+        """index_add along dim=1 (column scatter-add) is unsupported. The gather
+        (index_select) leg puts the index-dependent coordinate on a non-outermost
+        device dim, and propagate_layouts finds no supported output layout
+        (indirect access requires the indexed dim outermost). The compile aborts,
+        surfaced here as CRASHED."""
+        M, N, P = 4, 8, 3
+        out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(M, P, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(out, {"M": M, "N": N})
+        self.name_dims(src, {"M": M, "P": P})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(out, src, idx):
+            return out.index_add_(1, idx, src)
+
+        self.check(kernel, out, src, idx, expect=CRASHED)
 
     def test_scatter_reduce(self):
         """out.scatter_reduce_(0, index, src, "sum")"""
