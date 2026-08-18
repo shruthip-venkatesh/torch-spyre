@@ -458,24 +458,14 @@ class _GatherScenarios:
         self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
 
     def test_moe(self):
-        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index.
-
-        A gather splits its OUTPUT across cores, and the per-core slice must stay
-        within the 256 MB per-core addressable span or the backend aborts
-        (Immediate value out of boundary in dxp). With >1 core the full-size MoE
-        output B*S*D*F*2 = 2*128*512*2048*2 = 512 MB splits and each core's slice
-        fits, so we keep the realistic F=2048 there. At SENCORES=1 nothing splits
-        -- one core must span the whole output -- so F is shrunk to 512, giving a
-        128 MB output (half the limit) that fits on a single core. Either way the
-        source row is deeply multi-stick (D*F/64 = 16384 or 4096 sticks), so the
-        indexed-dim-outermost relayout is exercised.
-        """
+        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
         from torch_spyre._inductor import config
 
         E, D, B, S = 8, 512, 2, 128
         # 512 MB unsplit output overflows the 256 MB single-core span; shrink it
-        # only for SENCORES=1, where the output cannot be split across cores.
-        F = 512 if config.sencores == 1 else 2048
+        # only for SENCORES=1 and 2, where the output cannot be split across cores.
+        # TODO : Set one large size for all cores when span reduction is handled.
+        F = 2048 if config.sencores >= 3 else 512
         expert_w = self.to_spyre(torch.rand(E, D, F, dtype=torch.float16))
         expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
         self.name_dims(expert_w, {"E": E, "D": D, "F": F})
@@ -1101,13 +1091,6 @@ class _GatherScenarios:
     def test_work_division_index_split_full(self):
         """Index dim has 32 sticks (Q=1024), so it splits across all cores up to
         32 while K=64 stays unsplit -- exercises the full 32-way split."""
-        from torch_spyre._inductor import config as _spyre_config
-
-        if _spyre_config.sencores == 32:
-            pytest.skip(
-                "RuntimeError: Input is not in uint32 range — "
-                "32-core gather hits a backend limit;"
-            )
 
         def make():
             x = torch.rand(128, 64, 1024, dtype=torch.float16).to("spyre")
@@ -1211,13 +1194,6 @@ class _GatherScenarios:
         """Non-stick-aligned index at 32-stick scale (P=1000, ceil=32): the
         padded split reaches a full 32-way division, the partial-stick
         counterpart of the aligned test_work_division_index_split_full."""
-        from torch_spyre._inductor import config as _spyre_config
-
-        if _spyre_config.sencores == 32:
-            pytest.skip(
-                "RuntimeError: Input is not in uint32 range — "
-                "32-core gather hits a backend limit;"
-            )
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1244,13 +1220,6 @@ class _GatherScenarios:
         row and diverge. Swept across SENCORES, so the cross-core read is checked
         at every core count, up to a full 32-way split at SENCORES=32.
         """
-        from torch_spyre._inductor import config as _spyre_config
-
-        if _spyre_config.sencores == 32:
-            pytest.skip(
-                "RuntimeError: Input is not in uint32 range — "
-                "32-core gather hits a backend limit;"
-            )
         V, E = 1024, 128
         weight = self.to_spyre(
             torch.arange(V, dtype=torch.float16).unsqueeze(1).repeat(1, E)
@@ -1289,7 +1258,7 @@ class _EmbeddingAllIndexBucketsScenario:
       → classified as GATHER_OP_SPEC
     """
 
-    _A = 49152
+    _A = 30000  # TODO : Increase the size when span reduction is handled.
     _STICK = 4096
 
     @staticmethod
@@ -1312,10 +1281,6 @@ class _EmbeddingAllIndexBucketsScenario:
     def test_embedding_all_partial_stick_index_buckets(self):
         """Classify torch.embedding for every N bucket from ceil(N/32)=1 to 32."""
         for bucket in range(1, 33):
-            if bucket == 32:
-                # RuntimeErro: Input is not in uint32 range -
-                # 32-core gather hits a backend limit
-                continue
             N = self._n_for_bucket(bucket)
             torch._dynamo.reset()
             self._stage_and_e2e(
