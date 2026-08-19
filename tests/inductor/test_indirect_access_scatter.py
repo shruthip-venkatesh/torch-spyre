@@ -37,7 +37,6 @@ diverges from / aborts on the bundle, surfaced here as xfail.
 import os
 import sys
 
-import pytest
 import torch
 from torch._inductor.utils import run_and_get_code
 
@@ -636,8 +635,20 @@ class _ScatterScenarios:
 
         self.check(kernel, inp, mask, src, expect=CRASHED)
 
+
+# Op-behaviour scenarios run once at the default 32 cores. They classify / lower
+# / run each op and do not depend on the core count, so sweeping them across every
+# SENCORES value added little coverage for a 7x test-count blowup.
+register_multicore_variants(_ScatterScenarios, "TestScatter", globals(), counts=(32,))
+
+
+class _ScatterMulticoreScenarios:
+    """Scatter scenarios whose BEHAVIOUR depends on the core count -- the
+    work-division split-map tests -- swept across SENCORES, unlike the
+    op-behaviour scenarios above (which run once at 32). See MULTICORE_SENCORES."""
+
     # -- Work-division scenarios -----------------------------------------
-    # Swept like every other scenario, so each TestScatter_cores{N} variant
+    # Swept across SENCORES, so each TestScatterMulticore_cores{N} variant
     # checks the split map that N produces. The invariant for dest[i] = src: the
     # planner must split the index-entry dim (c0) and never the destination data
     # dim (c1 = K) -- splitting K makes every core write address 0 of the shared
@@ -660,15 +671,12 @@ class _ScatterScenarios:
         return dst
 
     def test_work_division_entry_split_full(self):
-        """Entry dim has 32 sticks (Q=1024), so it splits across all cores up to
-        32 while dest K=64 stays unsplit -- exercises the full 32-way split."""
-        from torch_spyre._inductor import config as _spyre_config
-
-        if _spyre_config.sencores == 32:
-            pytest.skip(
-                "RuntimeError: Input is not in uint32 range — "
-                "32-core gather hits a backend limit;"
-            )
+        """Entry dim has 32 sticks (Q=1024): it would split a full 32 ways, but
+        the indirect uint32 address cap (INDIRECT_ACCESS_MAX_CORES) holds it below
+        that, so at SENCORES=32 core_split rounds it down to 16-way while dest
+        K=64 stays unsplit. Verifies the split map and that the cap keeps a
+        full-scale entry off the 32-way path the backend rejects (a per-core
+        address past 4 GB overflows its uint32 UINT32_TO_16* encoding)."""
 
         def make():
             src = torch.rand(1024, 64, 1024, dtype=torch.float16).to("spyre")
@@ -697,9 +705,11 @@ class _ScatterScenarios:
         self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
 
 
-# Generate TestScatter_cores1 .. TestScatter_cores32, one per SENCORES value, so
-# every scatter scenario is exercised across the multicore work-division planner.
-register_multicore_variants(_ScatterScenarios, "TestScatter", globals())
+# Scenarios whose BEHAVIOUR varies with the core count -- the work-division
+# split-map tests -- are swept across all SENCORES values.
+register_multicore_variants(
+    _ScatterMulticoreScenarios, "TestScatterMulticore", globals()
+)
 
 
 if __name__ == "__main__":

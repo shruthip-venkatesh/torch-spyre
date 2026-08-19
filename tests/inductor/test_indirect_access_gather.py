@@ -457,23 +457,6 @@ class _GatherScenarios:
         self.name_dims(j, {"P": 32})
         self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
 
-    def test_moe(self):
-        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
-        from torch_spyre._inductor import config
-
-        E, D, B, S = 8, 512, 2, 128
-        # 512 MB unsplit output overflows the 256 MB single-core span; shrink it
-        # only for SENCORES=1 and 2, where the output cannot be split across cores.
-        # TODO : Set one large size for all cores when span reduction is handled.
-        F = 2048 if config.sencores >= 3 else 512
-        expert_w = self.to_spyre(torch.rand(E, D, F, dtype=torch.float16))
-        expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
-        self.name_dims(expert_w, {"E": E, "D": D, "F": F})
-        self.name_dims(expert_ids, {"B": B, "S": S})
-        self._stage_and_e2e(
-            lambda w, i: w[i], expert_w, expert_ids, expect=GATHER_OP_SPEC
-        )
-
     def test_paged_kv(self):
         """Paged KV-cache gather: keys[slot_idxs] with 3D cache and 2D int64 slot index."""
         cache, H, Dh, B, Lk = 32768, 8, 128, 2, 256
@@ -1067,8 +1050,41 @@ class _GatherScenarios:
 
         self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
 
+
+# Op-behaviour scenarios run once at the default 32 cores. They classify / lower
+# / run each op and do not depend on the core count, so sweeping all ~90 of them
+# across every SENCORES value added little coverage for a 7x test-count blowup.
+register_multicore_variants(_GatherScenarios, "TestGather", globals(), counts=(32,))
+
+
+class _GatherMulticoreScenarios:
+    """Gather scenarios whose BEHAVIOUR depends on the core count -- swept across
+    SENCORES, unlike the op-behaviour scenarios above (which run once at 32). The
+    work-division split-map tests assert core_split at each count; the cross-core
+    test checks shared-table correctness under a real multi-core split; and
+    test_moe changes its shape by core count. See MULTICORE_SENCORES."""
+
+    to_spyre = staticmethod(plain_to_spyre)
+
+    def test_moe(self):
+        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
+        from torch_spyre._inductor import config
+
+        E, D, B, S = 8, 512, 2, 128
+        # 512 MB unsplit output overflows the 256 MB single-core span; shrink it
+        # only for SENCORES=1 and 2, where the output cannot be split across cores.
+        # TODO : Set one large size for all cores when span reduction is handled.
+        F = 2048 if config.sencores >= 3 else 512
+        expert_w = self.to_spyre(torch.rand(E, D, F, dtype=torch.float16))
+        expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
+        self.name_dims(expert_w, {"E": E, "D": D, "F": F})
+        self.name_dims(expert_ids, {"B": B, "S": S})
+        self._stage_and_e2e(
+            lambda w, i: w[i], expert_w, expert_ids, expect=GATHER_OP_SPEC
+        )
+
     # -- Work-division scenarios -----------------------------------------
-    # Swept like every other scenario, so each TestGather_cores{N} variant
+    # Swept across SENCORES, so each TestGatherMulticore_cores{N} variant
     # checks the split map that N produces. The invariant for out = x[i]: the
     # planner must split the index dim (c0) and never the value-table data dim
     # (c1 = K) -- splitting K makes every core read address 0 of the shared
@@ -1089,8 +1105,11 @@ class _GatherScenarios:
         return table[idx]
 
     def test_work_division_index_split_full(self):
-        """Index dim has 32 sticks (Q=1024), so it splits across all cores up to
-        32 while K=64 stays unsplit -- exercises the full 32-way split."""
+        """Index dim has 32 sticks (Q=1024): it would split a full 32 ways, but
+        the indirect uint32 address cap (INDIRECT_ACCESS_MAX_CORES) holds it to
+        16-way at SENCORES=32 while K=64 stays unsplit -- verifying the split map
+        and that the cap keeps a full-scale index off the 32-way path the backend
+        rejects (a per-core address past 4 GB overflows uint32)."""
 
         def make():
             x = torch.rand(128, 64, 1024, dtype=torch.float16).to("spyre")
@@ -1191,9 +1210,10 @@ class _GatherScenarios:
         self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
 
     def test_work_division_index_split_partial_stick_full(self):
-        """Non-stick-aligned index at 32-stick scale (P=1000, ceil=32): the
-        padded split reaches a full 32-way division, the partial-stick
-        counterpart of the aligned test_work_division_index_split_full."""
+        """Non-stick-aligned index at 32-stick scale (P=1000, ceil=32): the padded
+        split would reach a full 32-way division, but the indirect uint32 address
+        cap holds it to 16-way at SENCORES=32 -- the partial-stick counterpart of
+        test_work_division_index_split_full."""
 
         def make():
             x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
@@ -1213,12 +1233,12 @@ class _GatherScenarios:
         The table is row-identifying (weight[r, :] == r, exact in fp16 for
         r < 2048), and the index maps output row i -> value row (i + V/2) % V:
         always a half-table hop, so under any multi-core split the fetched row
-        belongs to another core's slice (e.g. at SENCORES=32 core 4 reads core
-        20's region, and vice versa). The gather must match the CPU reference
+        belongs to another core's slice. The gather must match the CPU reference
         exactly (expect_close=True) -- if the shared value tensor's per-core base
         ever drifted with the work-division slice, a core would read a shifted
-        row and diverge. Swept across SENCORES, so the cross-core read is checked
-        at every core count, up to a full 32-way split at SENCORES=32.
+        row and diverge. Runs at 32 cores, where the indirect uint32 address cap
+        holds the split to 16-way (still cross-core: a V/2 hop lands 8 cores
+        away), exercising the shared-table property at a real multicore split.
         """
         V, E = 1024, 128
         weight = self.to_spyre(
@@ -1236,9 +1256,10 @@ class _GatherScenarios:
         )
 
 
-# Generate TestGather_cores1 .. TestGather_cores32, one per SENCORES value, so
-# every gather scenario is exercised across the multicore work-division planner.
-register_multicore_variants(_GatherScenarios, "TestGather", globals())
+# Scenarios whose BEHAVIOUR varies with the core count -- the work-division
+# split-map tests, the cross-core correctness test, and test_moe (core-dependent
+# shape) -- are swept across all SENCORES values.
+register_multicore_variants(_GatherMulticoreScenarios, "TestGatherMulticore", globals())
 
 
 # ---------------------------------------------------------------------------
