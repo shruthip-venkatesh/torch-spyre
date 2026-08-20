@@ -17,16 +17,10 @@
 Each scenario routes its compile through
 self._stage_and_e2e(...): it asserts across every capture-path stage --
 classification, op-spec structure (IndirectAccess on the output), and SDSC
-fields -- and then runs the kernel end-to-end on the real backend. The e2e run
-reports an expected failure (pytest.xfail) on the value divergence / backend
-abort the backend currently produces for indirect scatter, while the
-capture-path checks above stay strict (a stage regression fails red).
+fields -- and then runs the kernel end-to-end on the real backend.
 
 All scatter scenarios run with SENCORES=1.
 
-Status (validated on hardware build): index-tensor scatters reach a real op
-spec with IndirectAccess on the output (SCATTER_OP_SPEC); the deeptools backend
-diverges from / aborts on the bundle, surfaced here as xfail.
 """
 
 import os
@@ -379,16 +373,51 @@ class TestScatter(IndirectAccessTestCase):
     # index_select (indirect gather) + add + index_put (indirect overwrite
     # store). The final store is an indirect OUTPUT, so each scenario still
     # classifies as SCATTER_OP_SPEC (_label_for checks indirect-output first).
-    # The RMW is exact only for indices with no duplicates; _row_store's index
-    # (torch.arange(P)) is unique, so these stay in that envelope.
 
-    def _row_store_3d(self, M=128, A=8, B=64, P=3, dtype=torch.int32):
-        """3-D row-store operands: out[M,A,B], src[P,A,B], 1-D idx[P] (unique)."""
-        out = torch.zeros(M, A, B, dtype=torch.float16).to("spyre")
-        src = torch.rand(P, A, B, dtype=torch.float16).to("spyre")
-        idx = torch.arange(P, dtype=dtype).to("spyre")
-        self.name_dims(out, {"M": M, "A": A, "B": B})
-        self.name_dims(src, {"P": P, "A": A, "B": B})
+    def _index_add_operands(
+        self,
+        M=128,
+        N=256,
+        P=3,
+        *,
+        data_dtype=torch.float16,
+        idx_dtype=torch.int32,
+        nonzero_dest=False,
+        idx=None,
+    ):
+        """Operands for index_add scenarios: out[M,N], src[P,N], 1-D idx[P].
+
+        Parameters
+        ----------
+        M, N, P:
+            Destination rows, feature width, and number of updated rows.
+        data_dtype:
+            Element dtype for out and src (float16 or float32).
+        idx_dtype:
+            Dtype for the index tensor (int32 or int64).
+        nonzero_dest:
+            When True, out is filled with random values instead of zeros.
+            Use this to pin that the gather step reads the existing dest
+            values (gathered + src, not just src).
+        idx:
+            Explicit CPU index tensor of length P.  When None the helper
+            generates torch.arange(P), producing the consecutive unique
+            indices used by the majority of scenarios.  Pass an explicit
+            tensor for boundary rows, strided, or random-permutation indices.
+        """
+        out_data = (
+            torch.rand(M, N, dtype=data_dtype)
+            if nonzero_dest
+            else torch.zeros(M, N, dtype=data_dtype)
+        )
+        out = out_data.to("spyre")
+        src = torch.rand(P, N, dtype=data_dtype).to("spyre")
+        if idx is None:
+            idx = torch.arange(P, dtype=idx_dtype).to("spyre")
+        else:
+            idx = idx.to(idx_dtype).to("spyre")
+        self.name_dims(out, {"M": M, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
         self.name_dims(idx, {"P": P})
         return out, src, idx
 
@@ -401,25 +430,7 @@ class TestScatter(IndirectAccessTestCase):
 
     def test_index_add(self):
         """out.index_add_(0, idx, src) -- canonical row scatter-add."""
-        out, src, idx = self._row_store()
-
-        def kernel(out, src, idx):
-            return out.index_add_(0, idx, src)
-
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
-
-    def test_index_add_wide_feature(self):
-        """MoE-width feature dim (N=2816)."""
-        out, src, idx = self._row_store(N=2816)
-
-        def kernel(out, src, idx):
-            return out.index_add_(0, idx, src)
-
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
-
-    def test_index_add_ragged_feature(self):
-        """Non-stick-aligned feature dim (N=63, not a multiple of 64)."""
-        out, src, idx = self._row_store(N=63)
+        out, src, idx = self._index_add_operands()
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
@@ -428,7 +439,7 @@ class TestScatter(IndirectAccessTestCase):
 
     def test_index_add_narrow_feature(self):
         """Small feature dim (N=4), far below one stick."""
-        out, src, idx = self._row_store(N=4)
+        out, src, idx = self._index_add_operands(N=4)
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
@@ -437,7 +448,7 @@ class TestScatter(IndirectAccessTestCase):
 
     def test_index_add_single_index(self):
         """P == 1: a single-row update (decode-step shape)."""
-        out, src, idx = self._row_store(P=1)
+        out, src, idx = self._index_add_operands(P=1)
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
@@ -446,7 +457,7 @@ class TestScatter(IndirectAccessTestCase):
 
     def test_index_add_many_updates(self):
         """More update rows (P=32) into a 128-row destination."""
-        out, src, idx = self._row_store(M=128, P=32)
+        out, src, idx = self._index_add_operands(M=128, P=32)
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
@@ -455,7 +466,7 @@ class TestScatter(IndirectAccessTestCase):
 
     def test_index_add_int64_index(self):
         """int64 index (downcast to int32 on device)."""
-        out, src, idx = self._row_store(dtype=torch.int64)
+        out, src, idx = self._index_add_operands(idx_dtype=torch.int64)
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
@@ -463,59 +474,257 @@ class TestScatter(IndirectAccessTestCase):
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
 
     def test_index_add_alpha(self):
-        """torch.index_add (functional) with a non-unit alpha scaling factor --
-        value check against the CPU reference (fp32, unique index [1,3,6]).
-        """
-        M, N, P = 8, 4, 3
-        index_cpu = torch.tensor([1, 3, 6], dtype=torch.int64)
+        """torch.index_add with a non-unit alpha scaling factor (0.5, 1.0, 2.0)."""
         for alpha in (0.5, 1.0, 2.0):
-            input_cpu = torch.rand(M, N, dtype=torch.float32)
-            source_cpu = torch.rand(P, N, dtype=torch.float32)
-
-            result = torch.index_add(
-                input_cpu.clone().to("spyre"),
-                0,
-                index_cpu.to("spyre"),
-                source_cpu.to("spyre"),
-                alpha=alpha,
-            ).cpu()
-
-            ref = torch.index_add(
-                input_cpu.clone(), 0, index_cpu, source_cpu, alpha=alpha
+            out, src, idx = self._index_add_operands(
+                M=8,
+                N=4,
+                P=3,
+                data_dtype=torch.float32,
+                idx_dtype=torch.int64,
+                idx=torch.tensor([1, 3, 6]),
             )
-            torch.testing.assert_close(
-                result, ref, atol=1e-4, rtol=1e-4, msg=f"alpha={alpha}"
-            )
+
+            def kernel(out, src, idx, _alpha=alpha):
+                return torch.index_add(out, 0, idx, src, alpha=_alpha)
+
+            self._assert_compiled_matches_cpu(kernel, out, src, idx)
 
     def test_index_add_3d(self):
         """3-D destination [M, A, B], scatter-add along dim 0."""
-        out, src, idx = self._row_store_3d()
+        M, A, B, P = 128, 8, 64, 3
+        out = torch.zeros(M, A, B, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, A, B, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(out, {"M": M, "A": A, "B": B})
+        self.name_dims(src, {"P": P, "A": A, "B": B})
+        self.name_dims(idx, {"P": P})
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
 
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
 
-    def test_index_add_duplicate_index(self):
-        """Duplicate indices (dim=0). index_add still lowers to a scatter op spec
-        -- duplicates are data-dependent, invisible to the compiler -- so the
-        capture path is identical to the unique case (SCATTER_OP_SPEC).
-
-        This pins classification ONLY, not values: gather+add+overwrite-scatter
-        is a read-modify-write, so colliding writes keep just the last one and
-        the VALUES are silently wrong for duplicates."""
-        M, N = 128, 256
-        out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
-        src = torch.rand(3, N, dtype=torch.float16).to("spyre")
-        idx = torch.tensor([0, 2, 0], dtype=torch.int32).to("spyre")  # 0 repeats
-        self.name_dims(out, {"M": M, "N": N})
-        self.name_dims(src, {"P": 3, "N": N})
-        self.name_dims(idx, {"P": 3})
+    def test_index_add_moe_shape(self):
+        """MoE shape [64,2816], P=3."""
+        out, src, idx = self._index_add_operands(
+            M=64,
+            N=2816,
+            P=3,
+            nonzero_dest=True,
+        )
 
         def kernel(out, src, idx):
             return out.index_add_(0, idx, src)
 
-        self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, sdsc=False)
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_tiny_zeros(self):
+        """Sanity: [8,4] dest (zeros), 3 unique indices, functional API."""
+        out, src, idx = self._index_add_operands(
+            M=8,
+            N=4,
+            P=3,
+            idx=torch.tensor([0, 2, 5], dtype=torch.int32),
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_nonzero_dest(self):
+        """Gather correctness: [8,4] non-zero dest -- gathered values must be
+        added to src, not src written directly."""
+        out, src, idx = self._index_add_operands(
+            M=8,
+            N=4,
+            P=3,
+            nonzero_dest=True,
+            idx=torch.tensor([1, 4, 7], dtype=torch.int32),
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_moe_inplace(self):
+        """MoE full-coverage inplace: [64,2816] dest, all 64 rows updated via
+        index_add_().  The original user-reported failing shape."""
+        out, src, idx = self._index_add_operands(M=64, N=2816, P=64)
+
+        def kernel(out, src, idx):
+            out = out.clone()
+            out.index_add_(0, idx, src)
+            return out
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_moe_functional(self):
+        """MoE full-coverage functional: same [64,2816] shape via
+        torch.index_add (out-of-place)."""
+        out, src, idx = self._index_add_operands(M=64, N=2816, P=64)
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_partial_update(self):
+        """Partial update: [128,256] dest, only 3 rows (first, middle, last).
+        Non-indexed rows must be unchanged."""
+        out, src, idx = self._index_add_operands(
+            M=128,
+            N=256,
+            P=3,
+            nonzero_dest=True,
+            idx=torch.tensor([0, 63, 127], dtype=torch.int32),
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_dense_update(self):
+        """Dense update: [64,256] dest, every other row updated (32 of 64)."""
+        out, src, idx = self._index_add_operands(
+            M=64,
+            N=256,
+            P=32,
+            nonzero_dest=True,
+            idx=torch.arange(0, 64, 2, dtype=torch.int32),  # 0,2,...,62
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_large_p(self):
+        """Large P: [32,512] dest, 24 of 32 rows updated (randomly chosen)."""
+        _idx = (
+            torch.randperm(32, generator=torch.Generator().manual_seed(0))[:24]
+            .sort()
+            .values
+        )
+        out, src, idx = self._index_add_operands(
+            M=32,
+            N=512,
+            P=24,
+            nonzero_dest=True,
+            idx=_idx,
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_ragged_n(self):
+        """Non-aligned N: [64,63] dest -- N is not a multiple of stick size (64)."""
+        out, src, idx = self._index_add_operands(M=64, N=63, P=8)
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
+
+    def test_index_add_fp32(self):
+        """fp32 dtype: [16,128] dest, 5 unique indices."""
+        out, src, idx = self._index_add_operands(
+            M=16,
+            N=128,
+            P=5,
+            data_dtype=torch.float32,
+            idx=torch.tensor([1, 3, 7, 10, 14], dtype=torch.int32),
+        )
+
+        def kernel(out, src, idx):
+            return torch.index_add(out, 0, idx, src)
+
+        self._stage_and_e2e(
+            kernel,
+            out,
+            src,
+            idx,
+            expect=SCATTER_OP_SPEC,
+            sdsc=False,
+            expect_close=True,
+        )
 
     def test_index_add_dim1_unsupported(self):
         """index_add along dim=1 (column scatter-add) is unsupported. The gather

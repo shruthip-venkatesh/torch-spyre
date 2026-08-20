@@ -441,14 +441,12 @@ def _enforce_scatter_destination_layout(
     write coordinates, against the *target's* committed layout rather than
     the op's own.
 
-    Preferring a producer rewrite over a destination copy: if the mutation
-    target is itself a ComputedBuffer we can still rewrite in place (not a
-    graph output, not already a mutation), retargeting its layout to match
-    the scatter output's layout is free -- no new copy node -- and makes the
-    destination trivially compliant, since target and output share one
-    layout. Only fall back to inserting a copy-in/copy-back pair (via
-    _insert_mutation_relayout_copy) when that rewrite isn't available and the
-    destination's own layout doesn't already satisfy the requirement.
+    When the mutation target is a ComputedBuffer (not a graph output, not
+    already a mutation) and the target's layout differs from the scatter's
+    output layout, the target is rewritten in place -- free, no extra copy.
+    Otherwise the full compliance check runs against the target's layout: if
+    the indirect write dimension is not outermost, a copy-in / retarget /
+    copy-back sequence is inserted via _insert_mutation_relayout_copy.
     """
     write_dep = next(
         (d for d in scatter_op.get_read_writes().writes if isinstance(d, MemoryDep)),
@@ -544,14 +542,6 @@ def _enforce_scatter_destination_layout(
             scatter_op.get_name(),
             target_name,
             type(target_layout).__name__,
-        )
-        return
-
-    # Shortcut: if target and output have the same device layout, they're compliant.
-    if target_stl == output_stl:
-        logger.debug(
-            "scatter_destination_check: %s target and output layouts match, compliant",
-            scatter_op.get_name(),
         )
         return
 
