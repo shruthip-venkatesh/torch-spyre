@@ -20,6 +20,7 @@ from sympy import Expr, Integer, Symbol, divisors
 from .ir import (
     SpyreConstantFallback,
     SpyreEmptyFallback,
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
     BroadcastAsyncFallback,
     WaitWorkFallback,
@@ -1728,10 +1729,10 @@ def _iter_computed_buffers(operations: list[Operation]):
                 (
                     BroadcastAsyncFallback,
                     WaitWorkFallback,
+                    AllGatherAsyncFallback,
                     AllReduceAsyncFallback,
                 ),
             ):
-                # Work division not supported on collective kernels
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")
