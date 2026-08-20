@@ -225,30 +225,35 @@ The backend cannot step a sticked dimension across a stick boundary *within* a c
 so the entries past the boundary are read from the wrong device addresses.
 
 The fix pads the **gather output**'s entry-dim `device_size` up to the next stick
-multiple (`enforce_indirect_access_layout._pad_output_for_stick_aligned_split`,
-e.g. `40 → 64`), leaving the logical size unchanged. The physical allocation
-grows, so the per-core base becomes stick-aligned — matching the index tensor,
-whose device layout is already stick-padded — and the D2H copy extracts the
-logical rows from the larger allocation (its `physical_exceeds_logical` path). To
-keep the per-core base stride consistent, `superdsc` grows the SDSC iteration to
-the padded size **before** `_create_sdsc_tensors` computes strides; otherwise the
-base lands element-aligned (mid-stick) and the split still miscompiles.
+multiple (e.g. `40 → 64`), leaving the logical size unchanged.
+`pass_utils.padded_entry_output_stl` owns this — the single coordinate search
+(`_find_entry_output_dim`) plus the size math — and returns the grown device
+layout (or `None` when there is nothing to pad); the pre-scheduling pass
+`enforce_indirect_access_layout._pad_output_for_stick_aligned_split` just applies
+it. The physical allocation grows, so the per-core base becomes stick-aligned —
+matching the index tensor, whose device layout is already stick-padded — and the
+D2H copy extracts the logical rows from the larger allocation (its
+`physical_exceeds_logical` path). To keep the per-core base stride consistent,
+`superdsc` grows the SDSC iteration to the padded size **before**
+`_create_sdsc_tensors` computes strides; otherwise the base lands element-aligned
+(mid-stick) and the split still miscompiles.
 
 `indirect_forbidden_split_syms`
 ([pass_utils.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py))
-enforces the invariant, **forbid unless provably padded**:
-
-* it **forbids** a partial-last-stick entry dim by default — reading the index's
-  *unpadded* logical count (`d.ranges`), which the output padding never changes;
-* it **lifts** that forbiddance only when the output was grown to a whole stick,
-  detected via `indirect_entry_output_dim(op).out_extent % eps == 0`.
+enforces the invariant, **forbid unless provably padded**, as a single predicate:
+it forbids a partial-last-stick entry dim — reading the index's *unpadded*
+logical count (`d.ranges`), which the output padding never changes — **unless**
+`is_output_stick_aligned_for_entry(op)` confirms the output extent is already a
+whole multiple of the index `eps` (either naturally, or because the padding pass
+grew it).
 
 So a padded gather splits stick-aligned, while anything unpadded falls back to a
 single core rather than miscompiling. A **scatter cannot be padded**: its
-destination is written in place (a mutation layout the pass skips) and its entry
-row is data-dependent (an `IndirectAccess` coord), so `indirect_entry_output_dim`
-returns `None`, the forbiddance is never lifted, and a partial-stick scatter
-stays on a single core — correct-but-serial rather than miscompiling.
+destination is written in place (a mutation layout) and its entry row is
+data-dependent (an `IndirectAccess` coord), so `_find_entry_output_dim` finds no
+paddable entry, `is_output_stick_aligned_for_entry` returns `False`, the
+forbiddance is never lifted, and a partial-stick scatter stays on a single core —
+correct-but-serial rather than miscompiling.
 
 Stick-aligned counts (a multiple of 32) are unaffected: no padding, the
 forbiddance never fires, and they split exactly as before.
@@ -330,10 +335,10 @@ here) runs correct-but-serial.
 
 | File | Change |
 |---|---|
-| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index`, `indirect_entry_output_dim` + `IndirectEntryDim` (partial-stick, fix #5); the split-rule computation: `_shared_indirect_coords` (gather reads + scatter destination), `shared_indirect_data_syms`, `_non_indirect_coord_syms`, `indirect_forbidden_split_syms` (shared-table dims + partial-stick rule), `indirect_store_entry_syms` |
+| `_inductor/pass_utils.py` | `_build_indirect_load_subs`, `_build_indirect_store_subs`, `_wrap_indirect_subs`, `indirect_access_subs_from_op` (merges both), `indirect_store_subs_from_op`, `_first_non_indirect_read_index`; the partial-stick entry accessors (fix #5): `_find_entry_output_dim` (the single coordinate search), `is_output_stick_aligned_for_entry` (the guard's alignment predicate), `padded_entry_output_stl` (returns the grown output layout); the split-rule computation: `_shared_indirect_coords` (gather reads + scatter destination), `shared_indirect_data_syms`, `_non_indirect_coord_syms`, `indirect_forbidden_split_syms` (shared-table dims + partial-stick rule), `indirect_store_entry_syms` |
 | `_inductor/work_division_constraints.py` | `indirect_access_constraints` — registers the split rules as one op constraint; `ConstraintResult.forbidden` (hard, never-split) / `.force_output` fields, merged by `collect_work_division_constraints` and consumed by every split pass |
 | `_inductor/work_division.py` | consumes `constraint_result.forbidden` / `.force_output` (feeds `forbidden` into `must_split_vars`; `forbidden_split_syms` + `force_output_syms` in `_default_split`); `collect_indirect_value_tds` + `IndirectAccess` span guard; `_resolve_layout` |
-| `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — grows a partial-stick gather output's entry-dim `device_size` to a whole stick (fix #5) |
+| `_inductor/enforce_indirect_access_layout.py` | `_pad_output_for_stick_aligned_split` — applies the grown output layout from `pass_utils.padded_entry_output_stl` to a partial-stick gather output (fix #5) |
 | `_inductor/codegen/superdsc.py` | grow the SDSC index-entry iteration to the padded output size before `_create_sdsc_tensors` so the per-core base is stick-aligned (fix #5) |
 | `_inductor/spyre_kernel.py` | non-indirect read index in `create_op_spec` |
 
