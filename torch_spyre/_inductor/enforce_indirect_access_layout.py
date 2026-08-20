@@ -53,7 +53,7 @@ from .pass_utils import (
     _build_indirect_store_subs,
     device_coordinates,
     indirect_info_from_op,
-    indirect_entry_output_dim,
+    padded_entry_output_stl,
 )
 from . import config
 
@@ -67,10 +67,11 @@ def _pad_output_for_stick_aligned_split(op: ComputedBuffer) -> bool:
     When the entry count is a partial last stick (e.g. 40 over a 32-int32 index
     stick), the per-core base is stick-aligned for the index tensor but
     element-aligned for the shorter output, so the two disagree and the split
-    miscompiles. Growing the output's PHYSICAL device_size for that dim to the
-    same stick multiple aligns the output base too, and gives the later cores an
-    in-bounds place to write. The logical size is unchanged: the D2H copy
-    already extracts the logical view from the (larger) physical allocation.
+    miscompiles. ``padded_entry_output_stl`` returns the output layout grown so
+    that dim spans whole sticks (or None when there is nothing to pad); applying
+    it aligns the output base and gives the later cores an in-bounds place to
+    write. The logical size is unchanged: the D2H copy extracts the logical view
+    from the (larger) physical allocation.
 
     No-op on a single core, on an already stick-aligned count, or on an in-place
     (mutation) destination this pass cannot safely resize.
@@ -79,29 +80,10 @@ def _pad_output_for_stick_aligned_split(op: ComputedBuffer) -> bool:
         return False
     if isinstance(op.get_layout(), MutationLayoutSHOULDREMOVE):
         return False
-    entry = indirect_entry_output_dim(op)
-    if entry is None or entry.out_extent % entry.eps == 0:
+    padded_stl = padded_entry_output_stl(op)
+    if padded_stl is None:
         return False
-
-    out_layout = _real_layout(op)
-    out_stl = out_layout.device_layout
-    device_size = list(out_stl.device_size)
-    padded = ((entry.out_extent + entry.eps - 1) // entry.eps) * entry.eps
-    device_size[entry.out_pos] = padded
-    padded_stl = SpyreTensorLayout(
-        device_size=device_size,
-        stride_map=list(out_stl.stride_map),
-        device_dtype=out_stl.device_dtype,
-    )
-    op.layout = _fixed_tiled(out_layout, padded_stl)
-    logger.info(
-        "enforce_indirect_access_layout: padded output %s entry dim (pos %d) "
-        "%d -> %d for stick-aligned multi-core split",
-        op.get_name(),
-        entry.out_pos,
-        entry.out_extent,
-        padded,
-    )
+    op.layout = _fixed_tiled(_real_layout(op), padded_stl)
     return True
 
 

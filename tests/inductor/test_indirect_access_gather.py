@@ -1269,14 +1269,16 @@ register_multicore_variants(_GatherMulticoreScenarios, "TestGatherMulticore", gl
 # that exercises all 32 partial-stick buckets
 # ---------------------------------------------------------------------------
 class _EmbeddingAllIndexBucketsScenario:
-    """torch.embedding over all 32 partial-stick N buckets at sencores=32.
+    """torch.embedding over every partial-stick index-stick count at sencores=32.
 
-    Covers every possible ceil(N/32) value (1..32) in a single test method.
-    For each bucket b:
-      N = b*32 - offset  (offset ∈ [1,31] seeded from b)
+    The index is int32 (32 entries/stick), so ceil(N/32) is the number of index
+    sticks -- and at SENCORES=32 the entry dim splits core_split(sticks, 32) ==
+    sticks ways, i.e. the stick count is also the core count.
+    For each count s:
+      N = s*32 - offset  (offset ∈ [1,31] seeded from s)
       → N is non-stick-aligned, _pad_output_for_stick_aligned_split fires
       → entry dim and hidden dim are co-split to keep per-core span ≤ 256 MB
-      → classified as GATHER_OP_SPEC
+      → classified as GATHER_OP_SPEC, then validated end-to-end on the backend.
     """
 
     _A = 30000  # TODO : Increase the size when span reduction is handled.
@@ -1292,21 +1294,42 @@ class _EmbeddingAllIndexBucketsScenario:
         return weight, input_ids
 
     @staticmethod
-    def _n_for_bucket(bucket: int) -> int:
-        """Non-stick-aligned N in the bucket: N = bucket*32 - offset, offset ∈ [1,31]."""
+    def _n_for_index_sticks(sticks: int) -> int:
+        """Non-stick-aligned N spanning `sticks` index sticks: N = sticks*32 - offset."""
         rng = torch.Generator()
-        rng.manual_seed(bucket)
+        rng.manual_seed(sticks)
         offset = int(torch.randint(1, 32, (1,), generator=rng).item())
-        return bucket * 32 - offset
+        return sticks * 32 - offset
 
-    def test_embedding_all_partial_stick_index_buckets(self):
-        """Classify torch.embedding for every N bucket from ceil(N/32)=1 to 32."""
-        for bucket in range(1, 33):
-            N = self._n_for_bucket(bucket)
-            torch._dynamo.reset()
-            self._stage_and_e2e(
-                self._embedding_fn, *self._make(N), expect=GATHER_OP_SPEC
-            )
+    def _run_for_index_sticks(self, sticks: int):
+        N = self._n_for_index_sticks(sticks)
+        torch._dynamo.reset()
+        self._stage_and_e2e(self._embedding_fn, *self._make(N), expect=GATHER_OP_SPEC)
+
+
+def _make_index_sticks_test(sticks: int):
+    """One test method for a single partial-stick index-stick (== core) count."""
+
+    def test(self):
+        self._run_for_index_sticks(sticks)
+
+    # `sticks` index sticks == `sticks` cores at SENCORES=32 (core_split == sticks).
+    test.__name__ = test.__qualname__ = f"test_gather_{sticks:02d}_index_sticks"
+    test.__doc__ = (
+        f"Classify + e2e torch.embedding across {sticks} partial index stick(s) "
+        f"({sticks} cores at SENCORES=32)."
+    )
+    return test
+
+
+# Generate one collectible test method per index-stick count on the scenario
+# mixin BEFORE register_multicore_variants mixes it into the concrete TestCase,
+# so each stick count is an independent test rather than one serial 32-iteration
+# loop.
+for _sticks in range(1, 33):
+    _sticks_test = _make_index_sticks_test(_sticks)
+    setattr(_EmbeddingAllIndexBucketsScenario, _sticks_test.__name__, _sticks_test)
+del _sticks, _sticks_test
 
 
 register_multicore_variants(
